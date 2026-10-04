@@ -1,0 +1,4 @@
+interface:
+  display_name: "Colab ComfyUI"
+  short_description: "Run ComfyUI and H3 on Colab with Drive and web access"
+  default_prompt: "Use $colab-comfyui to run this project’s launcher with my selected access mode, verify Drive, rendering and browser access, and follow my requested cleanup scope."
