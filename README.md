@@ -8,7 +8,9 @@ python3 scripts/dashboard.py
 
 默认通过 `local-only` 服务与 SSH 转发，在本机 `http://127.0.0.1:8188` 访问。也可以显式选择 `--public` Cloudflare 临时公开网址，或 `--allowed-email` 邮箱登录；不会自动公开服务。SSH 模式需要专用密钥，创建密钥必须由你明确选择。
 
-这是独立的基础设施工具，不依赖 `video-render-lab` 的 Render API。2026-10-05 在新 G4 上实测：已有 Drive 缓存约 40.07 GB，复制并同步 SHA256 校验到本地用时 516.032 秒；同 VM 再次准备通过 receipt 元数据复用，用时 0.055 秒。确认四个模型均由本地磁盘加载，H3 音视频生成与输出验证通过，释放 G4 后独立从 Drive 取回的文件 hash 一致。TUI 完整启动与 `X` 释放也已实际操作。**同一 CPU 上 SSH 和临时公开入口均通过浏览器导入、Run 和图片预览；本轮 SSH 加载更快。邮箱模式登录及 Chrome 的客户端拦截仍未解决。** 浏览器测试使用无模型 PNG；H3 用 G4 API 验证。详见 [实测记录](docs/test-report.md) 与 [H3 调查](docs/colab-h3-research.md)。
+这是独立的基础设施工具，不依赖 `video-render-lab` 的 Render API。2026-10-05 已确认四个模型均从 VM 本地磁盘加载，H3 音视频生成、输出保存及释放 G4 后从 Drive 取回通过。最新整套 40.07 GB 计时：先复制、落盘再本地 SHA 共 439.911 秒，其中本地 SHA 26.875 秒；同机随后同步复制校验共 367.357 秒。固定执行顺序和暖缓存影响比较，不能承诺固定提速。前轮同 VM receipt 元数据复用为 0.055 秒。
+
+TUI 完整启动与 `X` 释放已有实测，新增彩色界面另有离线 Demo 和布局回归。**同一 CPU 上 SSH 和临时公开入口均通过 IAB 浏览器导入、Run 和图片预览；该轮 SSH 加载更快。后续用户日常 Chrome 手动打开 SSH 入口正常，受控 Chrome 标签仍被客户端拦截；邮箱模式登录尚未通过。** 浏览器测试使用无模型 PNG；H3 用 G4 API 验证。详见 [实测记录](docs/test-report.md) 与 [H3 调查](docs/colab-h3-research.md)。
 
 ## 准备
 
@@ -27,9 +29,21 @@ colab --auth=oauth2 sessions
 
 ## 终端界面
 
+界面采用暖橙强调色、青色模型卡片、状态颜色和字节进度条；宽屏左右分区，80×24 紧凑排列，`Tab` 可查看四个模型的完整文件名与进度。仍使用 Python 标准库，无需安装额外 TUI 依赖。
+
+先看离线界面，不分配 Colab、不访问凭据、不打开浏览器：
+
+```bash
+python3 scripts/dashboard.py --demo
+python3 scripts/dashboard.py --demo --demo-state ready
+python3 scripts/dashboard.py --demo --demo-state error
+```
+
+Demo 只允许 `Tab`、翻页和 `q` 等浏览操作，创建/启动/释放按键均禁用。彩色界面要求交互终端与 `TERM` 支持；`--no-color` 或 `NO_COLOR` 环境变量关闭配色。`TERM=dumb` 或 curses 初始化失败时退回无 ANSI 的文字交互，非交互 Demo 只打印一次快照。
+
 启动 `dashboard.py` 后，按 `n` 新建 G4，或按 `e` 选择一个已有会话。按 `c` 配置专用 Drive 目录、访问方式和本机 SSH 端口；默认目录是 `/content/drive/MyDrive/colab-comfyui-launcher-test`，可改为自己的专用目录。
 
-按 `f` 执行完整启动流程：确认配置、人工挂载 Drive、部署脚本、安装并等待完成、下载缺失的模型缓存、复制并校验到 VM、启动 ComfyUI；默认 `local-only` 模式随后启动 SSH 转发。界面显示安装阶段、每个模型的 download/copy/hash 字节进度、速率、耗时、服务状态和访问地址。授权提示保留在真实终端和浏览器中，不捕获验证码或认证链接。按 `o` 打开就绪的访问地址。
+按 `f` 执行完整启动流程：确认配置、人工挂载 Drive、部署脚本、安装并等待完成、下载缺失的模型缓存、复制并校验到 VM、启动 ComfyUI；默认 `local-only` 模式随后启动 SSH 转发。界面显示安装阶段、每个模型的 download/copy/hash 字节进度、速率、服务状态和访问地址。授权提示保留在真实终端和浏览器中，不捕获验证码或认证链接。按 `o` 打开就绪的访问地址。
 
 SSH 默认密钥路径是 `~/.ssh/colab_comfyui_launcher`。该密钥缺失时，配置会询问是否在 SSH 启动时创建；只有明确回答 `yes` 才创建专用无口令 Ed25519 密钥。已有密钥不会被覆盖；已有加密密钥不会被修改，后台转发不支持其交互口令输入。
 
@@ -167,7 +181,9 @@ python3 scripts/colabctl.py -s "$SESSION" status
 - 首次 `prepare` 把每个 Drive 文件复制到 VM `.partial`，在同一读取流中计算完整 SHA256，匹配后才发布本地文件，并写入两端的 verified receipt。旧缓存没有 receipt 时，也直接用这一遍复制流建立校验记录。
 - Drive receipt 绑定清单 repo/revision/path/size/SHA 与文件 size/mtime；本地 receipt 还绑定当前 boot ID、device/inode/mtime/ctime。同一 VM 的文件身份全部匹配时可跳过复制和内容读取。结果 `verification: verified_receipt_metadata` 表示之前完整校验与本次元数据匹配，**不是本次重新完整 SHA 校验**。
 - receipt 缺失或元数据变化时进行完整验证或拒绝；尺寸、SHA 错误的已有成品不会被覆盖。需要主动完整重查 Drive 时，给 `download` 或 `prepare` 添加 `--verify-cache`；对 `prepare` 而言这会增加一次完整 Drive 读取。
-- 新 VM 仍须读取、复制约 40.07 GB，并在复制时校验；本轮实测 516.032 秒。同 VM 完整身份匹配后的复用为 0.055 秒，不是重新读取 40 GB。此设计减少重复读取，不保证其他 Drive 吞吐或启动耗时。本地复制中断的 `.partial` 下次从头重复制，HTTP 下载续传是另一个步骤。
+- 新 VM 仍须读取、复制约 40.07 GB，并在复制时校验；前轮 prepare 实测 516.032 秒。同 VM 完整身份匹配后的复用为 0.055 秒，不是重新读取 40 GB。此设计减少重复读取，不保证其他 Drive 吞吐或启动耗时。本地复制中断的 `.partial` 下次从头重复制，HTTP 下载续传是另一个步骤。
+
+后续在另一新 G4 用相同 8 MiB chunk 做两种完整路径：先复制落盘 412.971 秒、随后本地完整 SHA 26.875 秒，总 439.911 秒；同机排第二的复制时同步 SHA 总 367.357 秒，四个模型均通过。未清缓存或反转整套顺序，复制阶段本身也有吞吐差异，不能把总差全部归因于省去 SHA 的读取。保留默认同步完整校验；详见 [计时口径和小文件补充](docs/test-report.md)。
 
 receipt 用于专用、自有缓存的复用，不是防同账号恶意修改的完整性保证。一次只让一个 runtime 写同一缓存；本机文件锁不能当成跨 VM 分布式锁。
 

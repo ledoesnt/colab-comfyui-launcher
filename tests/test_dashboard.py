@@ -1,10 +1,12 @@
 """Dashboard semantics using mocks only; never connect to a provider."""
 
 import importlib.util
+import io
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -16,6 +18,51 @@ spec = importlib.util.spec_from_file_location(
 dashboard = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = dashboard
 spec.loader.exec_module(dashboard)
+
+
+class GridScreen:
+    """Final terminal cells, including overwrites; assert every write is in bounds."""
+
+    def __init__(self, height=24, width=80):
+        self.height, self.width = height, width
+        self.erase()
+
+    def getmaxyx(self):
+        return self.height, self.width
+
+    def erase(self):
+        self.cells = [[" "] * self.width for _ in range(self.height)]
+        self.attributes = [[0] * self.width for _ in range(self.height)]
+
+    def addnstr(self, row, column, text, maximum, attribute=0):
+        if not 0 <= row < self.height:
+            raise AssertionError("Row is outside the terminal")
+        for character in text[:maximum]:
+            cells = (
+                0
+                if unicodedata.combining(character)
+                else (2 if unicodedata.east_asian_width(character) in ("W", "F") else 1)
+            )
+            if not 0 <= column <= self.width - cells:
+                raise AssertionError("Text is outside the terminal")
+            if cells:
+                self.cells[row][column] = character
+                self.attributes[row][column] = attribute
+                if cells == 2:
+                    self.cells[row][column + 1] = ""
+                column += cells
+
+    def refresh(self):
+        pass
+
+    @property
+    def text(self):
+        return "\n".join("".join(row) for row in self.cells)
+
+
+class TTYBuffer(io.StringIO):
+    def isatty(self):
+        return True
 
 
 class BackendTests(unittest.TestCase):
@@ -752,6 +799,265 @@ class DisplayTests(unittest.TestCase):
         ):
             dashboard.main(["--help"])
         self.assertEqual(raised.exception.code, 0)
+
+
+class VisualTests(unittest.TestCase):
+    def test_demo_model_sizes_match_current_manifest(self):
+        status = dashboard.DemoBackend().bridge(dashboard.Config(), "status")
+        files = status["model_prepare"]["progress"]["files"]
+        self.assertEqual(
+            [item["total_bytes"] for item in files],
+            [20_970_379_616, 15_687_142_551, 2_811_065_184, 605_254_808],
+        )
+        self.assertEqual(sum(item["total_bytes"] for item in files), 40_073_842_159)
+
+    def app(self, state="prepare"):
+        backend = dashboard.DemoBackend(state)
+        app = dashboard.Dashboard(dashboard.Config(session="demo-g4"), backend)
+        self.addCleanup(app.worker.close)
+        app.status = backend.bridge(app.config, "status")
+        app.ssh = backend.ssh(app.config, "status")
+        app.updated = time.monotonic()
+        app.message = "Offline demo; no commands are executed."
+        return app
+
+    def test_80x24_final_cells_keep_all_actions_status_and_progress_metrics(self):
+        app, screen = self.app(), GridScreen()
+        app._draw(screen)
+        for key, _ in dashboard.MENU:
+            self.assertIn(f"[{key}]", screen.text)
+        for text in (
+            "WORKSPACE",
+            "GPU",
+            "Drive MOUNTED",
+            "Install READY",
+            "Comfy OFF",
+            "HTTP OFF",
+            "Cloudflare OFF",
+            "SSH OFF",
+            "MODELS",
+            "43%",
+            "72.0MiB/s",
+            "DEMO / OFFLINE",
+            "q keep resources",
+            "X release VM",
+        ):
+            self.assertIn(text, screen.text)
+
+    def test_wide_cards_do_not_overlap_or_cover_the_footer(self):
+        height, width = 32, 120
+        rectangles = dashboard.card_layout(height, width, True)
+        occupied = set()
+        for rect in rectangles.values():
+            self.assertLessEqual(rect.row + rect.height, height - 2)
+            cells = {
+                (row, column)
+                for row in range(rect.row, rect.row + rect.height)
+                for column in range(rect.column, rect.column + rect.width)
+            }
+            self.assertTrue(occupied.isdisjoint(cells))
+            occupied.update(cells)
+        self.assertGreater(rectangles["models"].column, rectangles["overview"].column)
+        screen, app = GridScreen(height, width), self.app("ready")
+        app._draw(screen)
+        for key, _ in dashboard.MENU:
+            self.assertIn(f"[{key}]", screen.text)
+        self.assertIn("HTTP READY", screen.text)
+        self.assertIn("VRAM", screen.text)
+        self.assertIn("http://127.0.0.1:8188", screen.text)
+
+    def test_76_column_boundary_keeps_final_menu_and_cleanup_cells(self):
+        for height in (24, 32):
+            with self.subTest(height=height):
+                app, screen = self.app(), GridScreen(height, 76)
+                app._draw(screen)
+                for key, _ in dashboard.MENU:
+                    self.assertIn(f"[{key}]", screen.text)
+                self.assertIn("q keep resources", screen.text)
+                self.assertIn("X release VM", screen.text)
+                layout = dashboard.card_layout(height, 76, True)
+                if layout:
+                    actions = layout["actions"]
+                    columns = dashboard.action_columns(actions.width)
+                    self.assertGreaterEqual(
+                        (actions.height - 2) * columns, len(dashboard.MENU)
+                    )
+
+    def test_detail_view_shows_all_four_file_bars_at_80x24(self):
+        app, screen = self.app(), GridScreen()
+        app.show_menu = False
+        app._draw(screen)
+        for name in (
+            "minimax_h3_fl2va",
+            "qwen3vl_32b",
+            "minimax_h3_video",
+            "minimax_h3_audio",
+        ):
+            self.assertIn(name, screen.text)
+        self.assertIn("43%", screen.text)
+        self.assertIn("12%", screen.text)
+        self.assertIn("100%", screen.text)
+        self.assertIn("q keep resources", screen.text)
+        self.assertIn("X release VM", screen.text)
+
+    def test_narrow_screen_keeps_actions_and_error_separate_from_cleanup(self):
+        app, screen = self.app(), GridScreen(12, 40)
+        app.error = "Checksum failed; inspect the cache."
+        app._draw(screen)
+        for key, _ in dashboard.MENU:
+            self.assertIn(f"[{key}]", screen.text)
+        self.assertIn("Resize", screen.text)
+        self.assertIn("Checksum failed", screen.text)
+        self.assertIn("q keep", screen.text)
+        self.assertIn("X release", screen.text)
+        self.assertIn("[STALE]", screen.text)
+
+    def test_very_small_screen_never_writes_outside_bounds(self):
+        app, screen = self.app(), GridScreen(8, 20)
+        app._draw(screen)
+        self.assertIn("Resize", screen.text)
+        self.assertIn("q keep", screen.text)
+        self.assertIn("X release", screen.text)
+
+    def test_narrow_model_failure_and_unready_ssh_are_visible(self):
+        app, screen = self.app("error"), GridScreen(12, 40)
+        app.ssh = {"running": True, "http_ready": False}
+        app._draw(screen)
+        self.assertIn("P:FAIL", screen.text)
+        self.assertIn("checksum", screen.text)
+        self.assertIn("SSH STARTING", screen.text)
+
+    def test_public_endpoint_remains_copyable_in_small_card_layout(self):
+        app, screen = self.app("ready"), GridScreen()
+        app.demo = False
+        app.config.access = "public"
+        url = "https://unit-test-example-with-a-long-name.trycloudflare.com"
+        app.status.update(tunnel_alive=True, url=url)
+        app._draw(screen)
+        self.assertIn(url, screen.text)
+        self.assertIn("q keep resources", screen.text)
+
+    def test_long_unicode_fields_do_not_hide_status_or_freshness(self):
+        app, screen = self.app("ready"), GridScreen()
+        app.config.session = "very-long-session-" + "GPU界" * 20
+        app.status["runtime"]["gpu_name"] = "GPU界" * 30
+        app.updated -= 30
+        app._draw(screen)
+        self.assertIn("[STALE]", screen.text)
+        self.assertIn("HTTP READY", screen.text)
+        self.assertIn("SSH READY", screen.text)
+        self.assertEqual(dashboard.clip_cells("界界", 3), "界")
+        self.assertEqual(dashboard.clip_cells("a\tb\nc", 3), "abc")
+
+    def test_monochrome_preserves_status_words_and_progress(self):
+        app, screen = self.app("error"), GridScreen()
+        with (
+            mock.patch.object(dashboard.curses, "has_colors", return_value=False),
+            mock.patch.object(dashboard.curses, "start_color") as start,
+        ):
+            app.theme.initialize()
+        start.assert_not_called()
+        app._draw(screen)
+        self.assertIn("FAIL", screen.text)
+        self.assertIn("checksum mismatch", screen.text)
+
+    def test_palette_uses_orange_cyan_and_basic_color_fallback(self):
+        for available, orange, cyan in (
+            (256, 208, 81),
+            (8, dashboard.curses.COLOR_YELLOW, dashboard.curses.COLOR_CYAN),
+        ):
+            with (
+                self.subTest(colors=available),
+                mock.patch.dict(dashboard.os.environ, {"NO_COLOR": ""}, clear=False),
+            ):
+                dashboard.os.environ.pop("NO_COLOR")
+                theme = dashboard.Theme()
+                with (
+                    mock.patch.object(
+                        dashboard.curses, "has_colors", return_value=True
+                    ),
+                    mock.patch.object(dashboard.curses, "start_color"),
+                    mock.patch.object(dashboard.curses, "use_default_colors"),
+                    mock.patch.object(
+                        dashboard.curses, "COLORS", available, create=True
+                    ),
+                    mock.patch.object(dashboard.curses, "init_pair") as pairs,
+                    mock.patch.object(
+                        dashboard.curses,
+                        "color_pair",
+                        side_effect=lambda number: number << 8,
+                    ),
+                ):
+                    theme.initialize()
+                self.assertIn(mock.call(1, orange, -1), pairs.call_args_list)
+                self.assertIn(mock.call(2, cyan, -1), pairs.call_args_list)
+                self.assertNotEqual(theme.roles["title"], theme.roles["accent"])
+
+    def test_no_color_setting_avoids_color_calls(self):
+        with mock.patch.object(dashboard.curses, "has_colors") as colors:
+            dashboard.Theme(color=False).initialize()
+        colors.assert_not_called()
+
+    def test_demo_disables_all_actions_including_browser_and_release(self):
+        app = self.app("ready")
+        with (
+            mock.patch.object(dashboard.subprocess, "run") as command,
+            mock.patch.object(dashboard.webbrowser, "open") as browser,
+            mock.patch.object(app.worker, "submit") as submit,
+        ):
+            for key, _ in dashboard.MENU:
+                app._action(None, key)
+        command.assert_not_called()
+        browser.assert_not_called()
+        submit.assert_not_called()
+        self.assertIn("disabled", app.message)
+        with self.assertRaises(dashboard.DashboardError):
+            app.backend.bridge(app.config, "start")
+        with self.assertRaises(dashboard.DashboardError):
+            app.backend.ssh(app.config, "start")
+        with self.assertRaises(dashboard.DashboardError):
+            app.backend.interactive(["new"])
+
+    def test_term_dumb_demo_uses_plain_mode_without_commands_or_curses(self):
+        output, input_stream = TTYBuffer(), TTYBuffer("X\nq\n")
+        with (
+            mock.patch.dict(dashboard.os.environ, {"TERM": "dumb"}),
+            mock.patch.object(dashboard.sys, "stdin", input_stream),
+            mock.patch.object(dashboard.sys, "stdout", output),
+            mock.patch.object(
+                dashboard.select, "select", return_value=([input_stream], [], [])
+            ),
+            mock.patch.object(dashboard.curses, "wrapper") as wrapper,
+            mock.patch.object(dashboard.subprocess, "run") as command,
+            mock.patch.object(dashboard.webbrowser, "open") as browser,
+        ):
+            self.assertEqual(dashboard.main(["--demo"]), 0)
+        wrapper.assert_not_called()
+        command.assert_not_called()
+        browser.assert_not_called()
+        self.assertIn("Text mode", output.getvalue())
+        self.assertNotIn("\x1b", output.getvalue())
+        self.assertIn("action keys are disabled", output.getvalue())
+
+    def test_curses_initialization_failure_falls_back_to_plain_mode(self):
+        output, input_stream = TTYBuffer(), TTYBuffer("q\n")
+        with (
+            mock.patch.dict(dashboard.os.environ, {"TERM": "xterm"}),
+            mock.patch.object(dashboard.sys, "stdin", input_stream),
+            mock.patch.object(dashboard.sys, "stdout", output),
+            mock.patch.object(
+                dashboard.select, "select", return_value=([input_stream], [], [])
+            ),
+            mock.patch.object(
+                dashboard.curses,
+                "wrapper",
+                side_effect=dashboard.curses.error("fixture unsupported"),
+            ),
+            mock.patch.object(dashboard.subprocess, "run") as command,
+        ):
+            self.assertEqual(dashboard.main(["--demo"]), 0)
+        command.assert_not_called()
+        self.assertIn("Text mode", output.getvalue())
 
 
 if __name__ == "__main__":

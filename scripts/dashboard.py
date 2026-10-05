@@ -9,12 +9,16 @@ from __future__ import annotations
 import argparse
 import curses
 import json
+import os
 import queue
 import re
+import select
 import subprocess
 import sys
+import termios
 import threading
 import time
+import unicodedata
 import uuid
 import webbrowser
 from collections.abc import Callable
@@ -492,6 +496,247 @@ def progress_lines(status: dict[str, Any]) -> list[str]:
     return lines
 
 
+class DemoBackend:
+    """Entirely local fixture. No subprocess, browser, credential or file access."""
+
+    def __init__(self, state: str = "prepare"):
+        self.state = state
+
+    def bridge(self, _config: Config, action: str, **_kwargs: Any) -> dict[str, Any]:
+        if action != "status":
+            raise DashboardError(
+                "Demo is read-only; no command or resource is created."
+            )
+        ready = self.state == "ready"
+        files = [
+            (
+                "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+                20_970_379_616,
+                0.43,
+            ),
+            (
+                "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+                15_687_142_551,
+                1.0,
+            ),
+            ("vae/minimax_h3_video_vae_int8_convrot.safetensors", 2_811_065_184, 0.12),
+            ("vae/minimax_h3_audio_vae_fp32.safetensors", 605_254_808, 0.0),
+        ]
+        items = [
+            {
+                "path": path,
+                "phase": "verified"
+                if ready or fraction == 1
+                else ("copy" if fraction else "queued"),
+                "done_bytes": size if ready else int(size * fraction),
+                "total_bytes": size,
+                "rate_bytes_per_second": 72 * 1024**2
+                if fraction not in (0, 1) and not ready
+                else 0,
+            }
+            for path, size, fraction in files
+        ]
+        result = {
+            "ok": True,
+            "runtime": {
+                "gpu_name": "RTX PRO 6000 Blackwell",
+                "gpu_memory_mib": 97887,
+                "python": "3.13.15",
+            },
+            "drive": {"mounted": True, "path": "/content/drive"},
+            "installation": {"status": "ready", "phase": "dependency_check"},
+            "comfyui_alive": ready,
+            "http_ready": ready,
+            "tunnel_alive": False,
+            "models_ready": ready,
+            "access_mode": "local",
+            "model_loading": "local_disk",
+            "startup": {
+                "ok": True,
+                "status": "started" if ready else "starting",
+                "access_mode": "local",
+                "progress": {
+                    "status": "ready" if ready else "starting",
+                    "phase": "local_only",
+                },
+            },
+            "model_prepare": {
+                "running": not ready,
+                "status": "succeeded" if ready else "running",
+                "progress": {"phase": "verified" if ready else "copy", "files": items},
+            },
+            "model_download": {"running": False, "status": "succeeded"},
+            "render": {"running": False, "status": "succeeded" if ready else "idle"},
+        }
+        if self.state == "error":
+            result["model_prepare"] = {
+                "running": False,
+                "status": "failed",
+                "result": {
+                    "ok": False,
+                    "error": "Demo fixture: model checksum mismatch; no real file was accessed.",
+                },
+            }
+        return result
+
+    def ssh(self, config: Config, action: str) -> dict[str, Any]:
+        if action != "status":
+            raise DashboardError("Demo is read-only; no SSH command is executed.")
+        return {
+            "ok": True,
+            "running": self.state == "ready",
+            "http_ready": self.state == "ready",
+            "url": f"http://127.0.0.1:{config.local_port}",
+        }
+
+    def interactive(self, _arguments: list[str]) -> int:
+        raise DashboardError(
+            "Demo is read-only; authentication and provider commands are disabled."
+        )
+
+
+def clip_cells(value: object, width: int) -> str:
+    """Clip by terminal cells; control characters must not reshape the screen."""
+    result, occupied = [], 0
+    for character in str(value):
+        if unicodedata.category(character).startswith("C"):
+            continue
+        cells = (
+            0
+            if unicodedata.combining(character)
+            else (2 if unicodedata.east_asian_width(character) in ("W", "F") else 1)
+        )
+        if occupied + cells > width:
+            break
+        result.append(character)
+        occupied += cells
+    return "".join(result)
+
+
+class Theme:
+    """Orange/cyan accents with readable monochrome and basic-color fallbacks."""
+
+    def __init__(self, color: bool = True):
+        self.color = color
+        self.roles = {
+            "title": curses.A_BOLD,
+            "accent": curses.A_BOLD,
+            "good": curses.A_BOLD,
+            "warn": curses.A_BOLD,
+            "bad": curses.A_BOLD,
+            "muted": curses.A_DIM,
+            "normal": curses.A_NORMAL,
+        }
+        self.unicode = "utf" in (sys.stdout.encoding or "").lower()
+
+    def initialize(self) -> None:
+        if not self.color or os.environ.get("NO_COLOR") is not None:
+            return
+        try:
+            if not curses.has_colors():
+                return
+            curses.start_color()
+            background = curses.COLOR_BLACK
+            try:
+                curses.use_default_colors()
+                background = -1
+            except curses.error:
+                pass
+            extended = curses.COLORS >= 256
+            colors = [
+                ("title", 208 if extended else curses.COLOR_YELLOW),
+                ("accent", 81 if extended else curses.COLOR_CYAN),
+                ("good", 114 if extended else curses.COLOR_GREEN),
+                ("warn", 214 if extended else curses.COLOR_YELLOW),
+                ("bad", 203 if extended else curses.COLOR_RED),
+                ("muted", 245 if extended else curses.COLOR_WHITE),
+            ]
+            for pair, (role, foreground) in enumerate(colors, 1):
+                curses.init_pair(pair, foreground, background)
+                self.roles[role] = curses.color_pair(pair) | (
+                    curses.A_BOLD if role != "muted" else curses.A_NORMAL
+                )
+        except curses.error:
+            # Partial/basic terminal capabilities never prevent local control.
+            return
+
+
+@dataclass(frozen=True)
+class Rect:
+    row: int
+    column: int
+    height: int
+    width: int
+
+
+def action_columns(card_width: int) -> int:
+    return 3 if card_width >= 76 else 2
+
+
+def card_layout(height: int, width: int, show_menu: bool) -> dict[str, Rect]:
+    if height < 22 or width < 60:
+        return {}
+    if width >= 110 and height >= 28:
+        left = max(43, int((width - 3) * 0.43))
+        body = height - 5
+        return {
+            "overview": Rect(2, 0, 10, left),
+            "actions": Rect(13, 0, body - 11, left),
+            "models": Rect(2, left + 1, body, width - left - 2),
+        }
+    menu_columns = action_columns(width - 1)
+    menu_height = (
+        ((len(MENU) + menu_columns - 1) // menu_columns) + 2 if show_menu else 3
+    )
+    body = height - 4
+    overview = 6
+    # At 60x22 use compact fallback rather than silently cut menu rows.
+    if body - overview - menu_height < 4:
+        return {}
+    return {
+        "overview": Rect(2, 0, overview, width - 1),
+        "models": Rect(2 + overview, 0, body - overview - menu_height, width - 1),
+        "actions": Rect(height - 2 - menu_height, 0, menu_height, width - 1),
+    }
+
+
+def status_label(value: object) -> tuple[str, str]:
+    if value is True:
+        return "READY", "good"
+    if value is False:
+        return "OFF", "muted"
+    return "UNKNOWN", "warn"
+
+
+def ssh_label(snapshot: dict[str, Any]) -> tuple[str, str]:
+    if snapshot.get("running") is True and snapshot.get("http_ready") is not True:
+        return "STARTING", "warn"
+    return status_label(snapshot.get("running"))
+
+
+SHORT_MENU = [
+    ("e", "Session"),
+    ("n", "New G4"),
+    ("C", "New CPU"),
+    ("m", "Drive"),
+    ("c", "Settings"),
+    ("f", "Full startup"),
+    ("d", "Deploy"),
+    ("i", "Install"),
+    ("w", "Cache"),
+    ("p", "Prepare"),
+    ("a", "Start"),
+    ("h", "SSH on"),
+    ("H", "SSH off"),
+    ("o", "Open UI"),
+    ("r", "Render H3"),
+    ("t", "PNG smoke"),
+    ("s", "Stop services"),
+    ("X", "Release VM"),
+    ("q", "Keep & quit"),
+]
+
+
 MENU = [
     ("e", "Select existing session"),
     ("n", "Create new G4"),
@@ -528,8 +773,19 @@ class Dashboard:
         self.error = ""
         self.progress_page = 0
         self.show_menu = True
+        self.theme = Theme()
+        self.demo = isinstance(backend, DemoBackend)
 
     def _terminal(self, screen: Any, operation: Callable[[], Any]) -> Any:
+        if screen is None:
+            try:
+                return operation()
+            finally:
+                if sys.stdin.isatty():
+                    try:
+                        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+                    except (termios.error, OSError, ValueError):
+                        pass
         curses.def_prog_mode()
         curses.endwin()
         try:
@@ -748,94 +1004,421 @@ class Dashboard:
             elif kind == "release":
                 self._release(screen, value)
 
-    def _draw(self, screen: Any) -> None:
-        height, width = screen.getmaxyx()
-        screen.erase()
-        age = time.monotonic() - self.updated if self.updated else None
-        freshness = (
-            "never updated"
-            if age is None
-            else f"updated {age:.0f}s ago"
-            + (" [STALE]" if age > 2 * REFRESH_SECONDS or self.error else "")
+    def _write(
+        self,
+        screen: Any,
+        row: int,
+        column: int,
+        text: object,
+        width: int,
+        role: str = "normal",
+    ) -> None:
+        height, columns = screen.getmaxyx()
+        if row < 0 or row >= height or column < 0 or column >= columns - 1:
+            return
+        clipped = clip_cells(text, max(0, min(width, columns - column - 1)))
+        try:
+            screen.addnstr(row, column, clipped, len(clipped), self.theme.roles[role])
+        except (curses.error, UnicodeError):
+            # A terminal's advertised encoding can exceed its actual capability.
+            try:
+                screen.addnstr(
+                    row,
+                    column,
+                    clipped.encode("ascii", "replace").decode(),
+                    len(clipped),
+                    self.theme.roles[role],
+                )
+            except curses.error:
+                pass
+
+    def _card(self, screen: Any, rect: Rect, title: str, role: str = "accent") -> None:
+        corners = (
+            ("╭", "╮", "╰", "╯", "─", "│")
+            if self.theme.unicode
+            else ("+", "+", "+", "+", "-", "|")
         )
+        tl, tr, bl, br, horizontal, vertical = corners
+        self._write(
+            screen,
+            rect.row,
+            rect.column,
+            tl + horizontal * (rect.width - 2) + tr,
+            rect.width,
+            "muted",
+        )
+        self._write(
+            screen,
+            rect.row + rect.height - 1,
+            rect.column,
+            bl + horizontal * (rect.width - 2) + br,
+            rect.width,
+            "muted",
+        )
+        for row in range(rect.row + 1, rect.row + rect.height - 1):
+            self._write(screen, row, rect.column, vertical, 1, "muted")
+            self._write(screen, row, rect.column + rect.width - 1, vertical, 1, "muted")
+        self._write(
+            screen, rect.row, rect.column + 2, " " + title + " ", rect.width - 4, role
+        )
+
+    def _overview(self, screen: Any, rect: Rect) -> None:
+        self._card(screen, rect, "WORKSPACE", "title")
         runtime, drive = (
             self.status.get("runtime") or {},
             self.status.get("drive") or {},
         )
-        installation = self.status.get("installation") or {}
-        startup = self.status.get("startup") or {}
-        startup_progress = startup.get("progress") or {}
-        lines = [
-            "Colab ComfyUI Launcher — selecting a menu item executes it",
-            f"Session: {self.config.session or '(none)'}   Stage: {self.stage}   {freshness}",
-            f"GPU: {runtime.get('gpu_name', 'unknown')}  VRAM: {runtime.get('gpu_memory_mib', '?')}MiB  Python: {runtime.get('python', '?')}",
-            f"Drive: {'mounted' if drive.get('mounted') else 'unknown / unmounted'}  Storage: {'ephemeral' if self.config.ephemeral else self.config.storage_root}",
-            f"Install: {installation.get('status', 'unknown')}/{installation.get('phase', '?')}  Comfy: {self.status.get('comfyui_alive', '?')}  HTTP: {self.status.get('http_ready', '?')}  Cloudflare: {self.status.get('tunnel_alive', '?')}",
-            f"Models ready: {self.status.get('models_ready', '?')}  Access: {self.status.get('access_mode', self.config.access)}  SSH: {self.ssh.get('running', 'unknown')}",
-            "URL: " + str(self._url() or "(not ready)"),
-        ]
-        progress = progress_lines(self.status)
-        # Keep the menu visible at 80x24; page only the changing job/file details.
-        progress.insert(
-            0,
-            "Startup phase: "
-            + str(
-                startup_progress.get(
-                    "phase", self.status.get("loading_phase", "unknown")
-                )
-            ),
+        install = self.status.get("installation") or {}
+        gpu = str(
+            runtime.get("gpu_name") or ("CPU" if self.config.cpu else "not connected")
         )
-        menu_rows = (len(MENU) + 1) // 2 if self.show_menu else 1
-        room = max(1, height - len(lines) - menu_rows - 4)
-        pages = max(1, (len(progress) + room - 1) // room)
-        self.progress_page %= pages
-        start = self.progress_page * room
-        lines.extend(progress[start : start + room])
-        lines.append(
-            f"10s refresh | Tab menu/details | PgUp/PgDn {self.progress_page + 1}/{pages}"
-        )
-        column = max(1, (width - 2) // 2)
-        if self.show_menu:
-            for index in range(0, len(MENU), 2):
-                left = f"[{MENU[index][0]}] {MENU[index][1]}"
-                right = (
-                    f"[{MENU[index + 1][0]}] {MENU[index + 1][1]}"
-                    if index + 1 < len(MENU)
-                    else ""
-                )
-                lines.append(f"{left[:column]:<{column}} {right[:column]}")
-        else:
-            lines.append(
-                "Tab: all actions | f: full startup | s: stop services | X: release VM | q: keep"
+        memory = human_bytes(float(runtime.get("gpu_memory_mib", 0) or 0) * 1024**2)
+        comfy, http, tunnel = (
+            status_label(value)[0]
+            for value in (
+                self.status.get("comfyui_alive"),
+                self.status.get("http_ready"),
+                self.status.get("tunnel_alive"),
             )
-        lines.extend(
-            [
-                "",
-                "q closes this UI only. VM, services and forwarding remain; X explicitly releases the selected VM.",
-                self.error or self.message,
-            ]
         )
-        for row, line in enumerate(lines[: max(0, height - 1)]):
+        ssh = ssh_label(self.ssh)[0]
+        mounted = (
+            "MOUNTED"
+            if drive.get("mounted")
+            else ("EPHEMERAL" if self.config.ephemeral else "UNMOUNTED")
+        )
+        install_state = str(install.get("status", "unknown")).upper()
+        mode = self.status.get("access_mode", self.config.access)
+        model_state = "READY" if self.status.get("models_ready") else "waiting"
+        if rect.height <= 6:
+            rows = [
+                (
+                    f"GPU {compact_name(gpu, 26)}  VRAM {memory}  Python {runtime.get('python', '?')}",
+                    "normal",
+                ),
+                (
+                    f"Drive {mounted}   Install {install_state} / {compact_name(install.get('phase', '?'), 20)}",
+                    "bad"
+                    if install.get("status") == "failed"
+                    else ("good" if drive.get("mounted") else "warn"),
+                ),
+                (
+                    f"Comfy {comfy}   HTTP {http}   Cloudflare {tunnel}   SSH {ssh}",
+                    "good" if self.status.get("http_ready") else "warn",
+                ),
+                (
+                    f"Access {mode}   Models {model_state}   URL {self._url() or 'not ready'}",
+                    "accent",
+                ),
+            ]
+        else:
+            rows = [
+                (f"GPU       {gpu}", "normal"),
+                (f"VRAM      {memory}  Python {runtime.get('python', '?')}", "muted"),
+                (f"Drive     {mounted}", "good" if drive.get("mounted") else "warn"),
+                (
+                    f"Install   {install_state} / {install.get('phase', '?')}",
+                    "bad" if install.get("status") == "failed" else "good",
+                ),
+                (
+                    f"Comfy     {comfy}   HTTP {http}",
+                    "good" if self.status.get("http_ready") else "warn",
+                ),
+                (f"Access    {mode}   Cloudflare {tunnel}", "normal"),
+                (
+                    f"SSH       {ssh}   Models {model_state}",
+                    "good" if self.ssh.get("http_ready") else "muted",
+                ),
+                (f"URL       {self._url() or 'not ready'}", "accent"),
+            ]
+        for offset, (text, role) in enumerate(rows[: rect.height - 2], 1):
+            self._write(
+                screen, rect.row + offset, rect.column + 2, text, rect.width - 4, role
+            )
+
+    def _model_rows(self, width: int) -> list[tuple[str, str]]:
+        jobs = [
+            ("model_prepare", "PREPARE"),
+            ("model_download", "DOWNLOAD"),
+            ("render", "RENDER"),
+        ]
+        jobs.sort(key=lambda item: not (self.status.get(item[0]) or {}).get("running"))
+        chosen = next(
+            (
+                item
+                for item in jobs
+                if (self.status.get(item[0]) or {}).get("progress")
+                or (self.status.get(item[0]) or {}).get("running")
+                or (self.status.get(item[0]) or {}).get("status") == "failed"
+            ),
+            jobs[0],
+        )
+        task = self.status.get(chosen[0]) or {}
+        progress = task.get("progress") or {}
+        state, phase = task.get("status", "waiting"), progress.get("phase", "")
+        rows = [
+            (
+                f"{chosen[1]}  {state.upper()}" + (f" / {phase}" if phase else ""),
+                "bad" if state == "failed" else "accent",
+            )
+        ]
+        files = progress.get("files") or []
+        for index, item in enumerate(files[:6], 1):
+            if not isinstance(item, dict):
+                continue
+            phase = str(item.get("phase", item.get("status", "queued")))[:10]
+            filename = compact_name(
+                item.get("path", "file"), max(12, width - len(phase) - 9)
+            )
+            rows.append((f"{index:02d}  {filename} / {phase}", "muted"))
+            done, total, rate = (
+                human_bytes(item.get(key))
+                for key in ("done_bytes", "total_bytes", "rate_bytes_per_second")
+            )
             try:
-                screen.addnstr(row, 0, line, max(0, width - 1))
-            except curses.error:
-                pass
-        # Preserve the cleanup warning and current error even on a small terminal.
-        if height >= 2:
-            try:
-                screen.addnstr(
-                    height - 2,
+                fraction = max(
                     0,
-                    "q: keep resources | X: release selected VM | "
-                    + (self.error or self.message),
-                    max(0, width - 1),
-                    curses.A_REVERSE,
+                    min(
+                        1,
+                        float(item.get("done_bytes", 0))
+                        / float(item.get("total_bytes", 0)),
+                    ),
                 )
-            except curses.error:
-                pass
+                percent = f"{fraction * 100:.0f}%"
+            except (TypeError, ValueError, ZeroDivisionError):
+                fraction, percent = 0.0, "?%"
+            metrics = f"{percent:>4} {done}/{total} {rate}/s"
+            length = max(4, min(12, width - len(metrics) - 3))
+            filled = round(fraction * length)
+            full, empty = ("█", "░") if self.theme.unicode else ("#", "-")
+            meter = full * filled + empty * (length - filled)
+            rows.append((f"{meter}  {metrics}", "good" if fraction == 1 else "title"))
+        if not files:
+            result = task.get("result") or {}
+            if result.get("ok") is False:
+                rows.append(
+                    (
+                        safe_error(result.get("error", "Task failed; inspect status.")),
+                        "bad",
+                    )
+                )
+            elif not self.config.session:
+                rows.extend(
+                    [
+                        ("Your GPU workspace starts here.", "title"),
+                        ("Choose [n] New G4 or [e] an existing session.", "muted"),
+                        ("Then [f] handles setup and preparation.", "normal"),
+                    ]
+                )
+            else:
+                rows.extend(
+                    [
+                        (
+                            f"Download {(self.status.get('model_download') or {}).get('status', 'unknown')}   Render {(self.status.get('render') or {}).get('status', 'unknown')}",
+                            "muted",
+                        ),
+                        ("Models load from VM disk; assets stay in Drive.", "muted"),
+                    ]
+                )
+        return rows
+
+    def _job_badges(self) -> tuple[str, str]:
+        badges = []
+        failed = False
+        for key, label in (
+            ("model_download", "C"),
+            ("model_prepare", "P"),
+            ("render", "R"),
+        ):
+            state = (self.status.get(key) or {}).get("status", "?")
+            failed = failed or state in ("failed", "interrupted")
+            short = {
+                "succeeded": "OK",
+                "running": "RUN",
+                "starting": "RUN",
+                "failed": "FAIL",
+                "interrupted": "FAIL",
+            }.get(state, state[:5].upper())
+            badges.append(f"{label}:{short}")
+        return " ".join(badges), "bad" if failed else "accent"
+
+    def _models(self, screen: Any, rect: Rect) -> None:
+        room = rect.height - 2
+        rows = self._model_rows(rect.width - 4)
+        pages = max(1, (len(rows) + room - 1) // room)
+        self.progress_page %= pages
+        badges, role = self._job_badges()
+        self._card(
+            screen,
+            rect,
+            f"MODELS  {badges}  {self.progress_page + 1}/{pages}",
+            role,
+        )
+        for offset, (text, role) in enumerate(
+            rows[self.progress_page * room : (self.progress_page + 1) * room], 1
+        ):
+            self._write(
+                screen, rect.row + offset, rect.column + 2, text, rect.width - 4, role
+            )
+
+    def _actions(self, screen: Any, rect: Rect) -> None:
+        self._card(screen, rect, "ACTIONS  select to execute", "title")
+        if not self.show_menu:
+            self._write(
+                screen,
+                rect.row + 1,
+                rect.column + 2,
+                "Tab: all actions   f: startup   s: stop   X: release   q: keep",
+                rect.width - 4,
+                "muted",
+            )
+            return
+        columns = action_columns(rect.width)
+        slot = (rect.width - 4) // columns
+        for index, (key, label) in enumerate(SHORT_MENU):
+            row, column = (
+                rect.row + 1 + index // columns,
+                rect.column + 2 + index % columns * slot,
+            )
+            if row >= rect.row + rect.height - 1:
+                break
+            role = "bad" if key == "X" else ("accent" if key == "f" else "title")
+            self._write(screen, row, column, f"[{key}]", 3, role)
+            self._write(screen, row, column + 4, label, slot - 5)
+
+    def _compact(self, screen: Any) -> None:
+        height, width = screen.getmaxyx()
+        runtime, install = (
+            self.status.get("runtime") or {},
+            self.status.get("installation") or {},
+        )
+        http, ssh = (
+            status_label(self.status.get("http_ready"))[0],
+            ssh_label(self.ssh)[0],
+        )
+        self._write(
+            screen,
+            2,
+            0,
+            f"GPU {compact_name(runtime.get('gpu_name', '?'), 12)} HTTP {http} SSH {ssh}",
+            width - 1,
+        )
+        self._write(
+            screen,
+            3,
+            0,
+            f"Drive {'MOUNTED' if (self.status.get('drive') or {}).get('mounted') else 'UNKNOWN'} Install {install.get('status', '?')}",
+            width - 1,
+            "accent",
+        )
+        badges, role = self._job_badges()
+        self._write(
+            screen,
+            4,
+            0,
+            f"{badges} | Resize 80x24" if width >= 32 else "Resize to 80x24; PgDn",
+            width - 1,
+            role,
+        )
+        columns = max(1, min(4, (width - 1) // 9))
+        room = max(1, height - 7)
+        pages = max(1, (len(SHORT_MENU) + room * columns - 1) // (room * columns))
+        self.progress_page %= pages
+        slot = max(1, (width - 1) // columns)
+        start = self.progress_page * room * columns
+        for index, (key, label) in enumerate(
+            SHORT_MENU[start : start + room * columns]
+        ):
+            self._write(
+                screen,
+                5 + index // columns,
+                index % columns * slot,
+                f"[{key}] {label}",
+                slot - 1,
+                "bad" if key == "X" else "title",
+            )
+
+    def _draw(self, screen: Any) -> None:
+        height, width = screen.getmaxyx()
+        screen.erase()
+        badge = "DEMO / OFFLINE" if self.demo else "GPU WORKSPACE"
+        self._write(
+            screen, 0, 0, "> COLAB / COMFYUI", max(0, width - len(badge) - 3), "title"
+        )
+        self._write(
+            screen, 0, max(0, width - len(badge) - 1), badge, len(badge), "accent"
+        )
+        age = time.monotonic() - self.updated if self.updated else None
+        stale = age is not None and (age > 2 * REFRESH_SECONDS or bool(self.error))
+        freshness = (
+            "WAITING"
+            if age is None
+            else (f"[STALE] {age:.0f}s" if stale else f"LIVE {age:.0f}s")
+        )
+        self._write(
+            screen,
+            1,
+            0,
+            f"{compact_name(self.config.session or 'choose a session', 24)}  /  {self.stage}",
+            max(0, width - len(freshness) - 3),
+            "normal",
+        )
+        self._write(
+            screen,
+            1,
+            max(0, width - len(freshness) - 1),
+            freshness,
+            len(freshness),
+            "warn" if stale else "muted",
+        )
+        layout = card_layout(height, width, self.show_menu)
+        if layout:
+            self._overview(screen, layout["overview"])
+            self._models(screen, layout["models"])
+            self._actions(screen, layout["actions"])
+        else:
+            self._compact(screen)
+        failed_result = next(
+            (
+                safe_error(
+                    ((self.status.get(key) or {}).get("result") or {}).get(
+                        "error", "Task failed; inspect status."
+                    )
+                )
+                for key in ("model_prepare", "model_download", "render")
+                if ((self.status.get(key) or {}).get("result") or {}).get("ok") is False
+            ),
+            "",
+        )
+        notice = self.error or failed_result or self.message
+        # Keep a ready endpoint copyable even when the workspace card is narrow.
+        if (
+            not self.demo
+            and not self.worker.busy
+            and not (self.error or failed_result)
+            and self._url()
+        ):
+            notice = f"[o] {self._url()}"
+        self._write(
+            screen,
+            height - 2,
+            0,
+            ("! " if self.error or failed_result else "> ") + notice,
+            width - 1,
+            "bad" if self.error or failed_result else "accent",
+        )
+        footer = (
+            "q keep resources | X release VM | s stop | Tab details | PgUp/PgDn | 10s refresh"
+            if width >= 76
+            else "q keep | X release | s stop | Tab details"
+        )
+        self._write(screen, height - 1, 0, footer, width - 1, "muted")
         screen.refresh()
 
     def _action(self, screen: Any, key: str) -> None:
+        if self.demo:
+            self.message = "Offline demo: action keys are disabled; Tab/PgDn explore the layout, q exits."
+            return
         if self.worker.busy and key in ("e", "n", "C", "m", "c", "f", "o"):
             self.message = "Wait for the worker before using interactive actions. q retains resources."
             return
@@ -891,11 +1474,13 @@ class Dashboard:
                     self.message = "A manual action is running or already queued; no additional action was submitted."
 
     def run(self, screen: Any) -> None:
+        self.theme.initialize()
         try:
             curses.curs_set(0)
         except curses.error:
             pass
         screen.timeout(200)
+        recovering = False
         try:
             while True:
                 self._events(screen)
@@ -925,6 +1510,74 @@ class Dashboard:
                     self._action(screen, key)
                 except (DashboardError, ValueError, EOFError) as exc:
                     self.error = safe_error(exc)
+        except curses.error:
+            recovering = True
+            raise
+        finally:
+            if not recovering:
+                self.worker.close()
+
+    def _plain_snapshot(self) -> str:
+        runtime, installation = (
+            self.status.get("runtime") or {},
+            self.status.get("installation") or {},
+        )
+        age = time.monotonic() - self.updated if self.updated else None
+        freshness = (
+            "unknown"
+            if age is None
+            else f"{age:.0f}s ago"
+            + (" STALE" if age > 2 * REFRESH_SECONDS or self.error else "")
+        )
+        lines = [
+            "COLAB / COMFYUI" + (" [DEMO / OFFLINE]" if self.demo else ""),
+            f"Session: {self.config.session or '(none)'} | Stage: {self.stage} | Updated: {freshness}",
+            f"GPU: {runtime.get('gpu_name', 'unknown')} | Install: {installation.get('status', 'unknown')} | Drive: {(self.status.get('drive') or {}).get('mounted', 'unknown')}",
+            f"HTTP: {self.status.get('http_ready', 'unknown')} | SSH: {self.ssh.get('running', 'unknown')} | URL: {self._url() or '(not ready)'}",
+            *progress_lines(self.status),
+            self.error or self.message,
+            " | ".join(f"[{key}] {label}" for key, label in SHORT_MENU),
+            "q keeps resources; X releases selected VM; s stops services. Type a key + Enter.",
+        ]
+        return "\n".join(lines)
+
+    def run_plain(self) -> None:
+        """Canonical-input fallback, without ANSI or curses initialization."""
+        print("Text mode: this terminal cannot display the full-screen interface.")
+        previous = None
+        try:
+            while True:
+                self._events(None)
+                now = time.monotonic()
+                if (
+                    self.config.session
+                    and now - self.last_refresh >= REFRESH_SECONDS
+                    and not self.worker.busy
+                    and self.worker.submit("status", self.config)
+                ):
+                    self.last_refresh = now
+                current = (
+                    self.updated,
+                    self.stage,
+                    self.error,
+                    self.message,
+                    self.worker.busy,
+                )
+                if current != previous:
+                    print("\n" + self._plain_snapshot(), flush=True)
+                    previous = current
+                ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                if not ready:
+                    continue
+                line = sys.stdin.readline()
+                if not line or line.strip() == "q":
+                    break
+                key = line.strip()
+                if key:
+                    try:
+                        self._action(None, key)
+                    except (DashboardError, ValueError, EOFError) as exc:
+                        self.error = safe_error(exc)
         finally:
             self.worker.close()
 
@@ -952,24 +1605,60 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Explicit VM-local assets for disposable CPU smoke tests",
     )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Offline read-only visual fixture; never execute provider, SSH or browser actions",
+    )
+    parser.add_argument(
+        "--demo-state",
+        choices=("prepare", "ready", "error"),
+        default="prepare",
+        help="State shown by --demo (default: prepare)",
+    )
+    parser.add_argument(
+        "--no-color", action="store_true", help="Use monochrome styling"
+    )
     args = parser.parse_args(argv)
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if not interactive and not args.demo:
         parser.error(
             "Run the dashboard in an interactive terminal; Drive authentication needs its TTY."
         )
     config = Config(
-        session=args.session,
+        session=args.session or ("demo-g4" if args.demo else ""),
         storage_root=args.storage_root,
         cpu=args.cpu,
         ephemeral=args.ephemeral,
     )
-    dashboard = Dashboard(config, Backend())
+    backend = DemoBackend(args.demo_state) if args.demo else Backend()
+    dashboard = Dashboard(config, backend)
+    dashboard.theme = Theme(color=not args.no_color)
+    if args.demo:
+        dashboard.status = backend.bridge(config, "status")
+        dashboard.ssh = backend.ssh(config, "status")
+        dashboard.updated = time.monotonic()
+        dashboard.message = (
+            "Offline demo: no VM, credentials, browser or commands are used."
+        )
     try:
-        curses.wrapper(dashboard.run)
+        if not interactive:
+            print(dashboard._plain_snapshot())
+        elif os.environ.get("TERM", "dumb") == "dumb":
+            dashboard.run_plain()
+        else:
+            try:
+                curses.wrapper(dashboard.run)
+            except curses.error:
+                dashboard.run_plain()
     except KeyboardInterrupt:
+        pass
+    finally:
         dashboard.worker.close()
     print(
-        "Dashboard closed. Remote resources were retained; explicitly release the selected VM when finished."
+        "Offline demo closed; no resources were created."
+        if args.demo
+        else "Dashboard closed. Remote resources were retained; explicitly release the selected VM when finished."
     )
     return 0
 

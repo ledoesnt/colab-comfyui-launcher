@@ -2,6 +2,147 @@
 
 以下分轮保留真实执行证据；历史轮次中的“未执行”只描述当时状态，最新验收边界见后续记录。
 
+## 2026-10-05 四模型先复制后 SHA 与同步 SHA 对比
+
+### Question / Goal
+
+直接测量整套 40.07 GB 模型先复制到 VM、本地再计算完整 SHA256 的耗时；在同一新 G4 上再测复制时同步 SHA，并检查是否有理由取消或调整默认校验。此前 516.032 秒是另一 VM 的同步复制结果，不是这次受控比较的基线。
+
+### Environment
+
+新 G4，实际 RTX PRO 6000 Blackwell Server Edition 97,887 MiB，系统 RAM 189,928,599,552 字节，Python 3.13.15。Drive 已有固定 revision 的四模型，共 40,073,842,159 字节。VM 初始可用磁盘 207,496,339,456 字节，为两个完整副本、小文件补充测试及 8 GiB 余量预检空间。两种方式使用相同 8 MiB chunk、常规文件与源身份检查、显式 flush/fsync 和匹配后原子发布。
+
+只读已知四个 Drive 模型，目标为专有 VM 测试目录；不修改 Drive 权重或 receipt、不重新下载、不安装或启动 ComfyUI、不进行 H3 推理。内部 probe 上限 25 分钟，独立 owned-session watchdog 上限 35 分钟；提前完成并显式停止 G4。
+
+### Steps
+
+1. 用户完成本次 Drive 授权，首次挂载等待超时后重试成功。部署固定清单和私有测试 probe；脚本的本地小 fixture 测试、语法与 Ruff 检查通过。
+2. split：先把全部四个模型复制到 VM 的新 `.partial` 并 flush/fsync，复制阶段不计算 hash；四个文件都复制完毕后，逐一从本地完整读取并计算 SHA256，大小/hash 匹配后才发布。
+3. inline：使用另一个 VM 目标目录，在每次 Drive read / 本地 write 之间同步 SHA.update；每个文件 flush/fsync、确认大小/hash 后发布。
+4. 两种完整方法均成功后，用 605,254,808 字节 audio VAE 在新的目标目录做两组逆序补充：inline→split，然后 split→inline；每次均完整校验。
+5. 保存完整结果到 Git 外，并核对两次完整方法均含四个 verified 文件、全部六个 pass 成功。官方 stop 确认 G4 terminated，sessions 查询无活动会话后取消其 watchdog。没有删除 Drive 缓存或 SSH 密钥。
+
+### Commands
+
+以下为实际接口的脱敏示例。probe 为本轮临时计时工具，不是产品启动步骤，不提交私有路径或原始运行日志；正常使用继续执行 README 的 prepare。
+
+```bash
+colab --auth=oauth2 new -s "$G4_SESSION" --gpu G4
+colab --auth=oauth2 drivemount -s "$G4_SESSION" /content/drive
+python3 scripts/colabctl.py -s "$G4_SESSION" deploy
+colab --auth=oauth2 exec -s "$G4_SESSION" -f "$PRIVATE_BENCHMARK_LAUNCH" --timeout 60
+# 后台 probe 在独立 VM 目录执行有界对比，短只读 probe 读取最终结果。
+colab --auth=oauth2 exec -s "$G4_SESSION" -f "$PRIVATE_BENCHMARK_STATUS" --timeout 60
+colab --auth=oauth2 stop -s "$G4_SESSION"
+colab --auth=oauth2 sessions
+```
+
+### Result
+
+| 完整四模型步骤 | split：先复制后本地 SHA | inline：复制时同步 SHA |
+| --- | --- | --- |
+| Drive read / VM write，扣除 SHA.update | 403.730 秒 | 333.443 秒 |
+| 显式 flush/fsync | 9.240 秒 | 13.042 秒 |
+| SHA 计时口径与耗时 | 本地完整 read + SHA，26.875 秒 | SHA.update 调用墙钟，19.796 秒 |
+| 发布、stat 与状态等剩余开销 | 0.065 秒 | 1.077 秒 |
+| 四模型 pass 总耗时 | **439.911 秒** | **367.357 秒** |
+| 大小与 SHA256 | 四文件全部匹配固定清单 | 四文件全部匹配固定清单 |
+
+split 的复制加显式落盘共 412.971 秒；随后完整本地 SHA 26.875 秒。逐文件本地 SHA 为 diffusion 16.745 秒、text encoder 8.306 秒、video VAE 1.505 秒、audio VAE 0.319 秒。完整 benchmark 含两次四模型和四次小文件补充，总计 818.097 秒；不包含前面的 VM 分配、授权等待或安装。
+
+两种方法的 SHA.update 调用墙钟分别为 19.745 / 19.796 秒，几乎相等；扣除 SHA 后的复制循环却相差 70.288 秒，其中 text encoder 相差 61.928 秒。这进一步说明总差主要出现在传输/写入阶段，不能全算作校验策略的净收益。
+
+| audio VAE 补充组 | 执行顺序 | 单次 pass 总耗时 |
+| --- | --- | --- |
+| 1 | inline → split | 3.704 → 2.344 秒 |
+| 2 | split → inline | 2.390 → 2.386 秒 |
+
+小文件每次本地 read + SHA 约 0.320 秒，inline SHA.update 约 0.298 秒；显式 flush/fsync 为 1.790–3.159 秒，支配这组总时间。此组不能代表全套模型，反而说明总时间也受落盘波动影响，不能只看 SHA 调用。
+
+### Known Limitations
+
+固定顺序 split→inline，未驱逐 Drive/FUSE 或系统 page cache，也未反转整套四模型顺序。split 的本地 SHA 是刚复制后的读，flush/fsync 不等于冷缓存；第二次 Drive 读取也可能已有缓存。观察到 inline 总计少 72.554 秒，不能全部归因于 hash 安排，不能宣称固定提速百分比。
+
+两列 SHA 定义不同：split 包含本地读取，inline 只包 SHA.update 的墙钟调用时间，后者不是 CPU time。方法间可比较完整 pass 总耗时；不能把这两列当作相同微基准。总耗时从 pass 开始到完成，不含 manifest/磁盘预检和完成后的最终结果落盘，也不是完整 CLI 启动时间。
+
+没有测完整 40 GB 的独立 Drive SHA，没有重复新 VM 冷缓存 A/B，也没有此次重新测 receipt 复用、ComfyUI 加载或 H3。之前的 516.032 秒不能与本轮 367.357 秒拼成确定的版本优化幅度。
+
+### Architectural Decision
+
+保留首次复制时完整 SHA：少一次 VM 本地全读，验证实际复制字节，并避免复制前额外完整读取 Drive。新 VM 的主要工作仍是把全部模型搬到本地。此轮本地 SHA 为 26.875 秒，不支持为了速度取消校验；默认策略与同 VM receipt 复用边界不变。专有测试资源已关闭，结果与限制脱敏记录。
+
+## 2026-10-05 彩色 TUI 与 Chrome 访问上下文复验
+
+### Question / Goal
+
+改善终端状态总览、模型进度和操作菜单的可读性，并区分浏览器客户端拦截与 SSH / ComfyUI 服务故障。界面预览使用离线 fixture；实际网页测试使用独立 CPU，不下载 H3 或挂载 Drive。
+
+### Environment
+
+标准库 curses 界面，真实 PTY 验证 120×32、80×24、窄屏和 `TERM=dumb`。独立 CPU 使用固定 ComfyUI / frontend / cloudflared，显式 public / ephemeral / cpu；同一后台另建 SSH loopback 转发。CPU 设置 20 分钟关闭上限，完成后提前释放。浏览器为受控 Chrome、用户日常 Chrome 和 Codex IAB。
+
+### Steps
+
+1. 给 dashboard 加入暖橙/青色强调、状态卡片、进度条和响应终端尺寸的布局。增加 `--demo` 与 prepare/ready/error fixture，所有创建、认证、浏览器和资源动作均禁用；非交互 Demo 打印一次快照。
+2. 在真实 PTY 查看宽屏总览、80×24 菜单与 Tab 模型详情，验证动作禁用与 q 正常退出。无颜色及 `TERM=dumb` 使用文字回退。另用最终终端 cells 回归检查窄屏、完整动作菜单与错误/清理提示。
+3. 用自有最小诊断页分别在本机随机端口及 8188 测试受控 Chrome，HTML、本地 JS 与健康 API 都成功。停掉自有 8188 诊断服务，再在同一个地址建立实际 ComfyUI 的 SSH 转发。
+4. 同一受控 Chrome 标签普通刷新后显示 `ERR_BLOCKED_BY_CLIENT`；实际 ComfyUI 的 system_stats 和新 Cloudflare 根页面也被阻断。没有读取认证数据、更改扩展或关闭保护。
+5. 独立 HTTP 检查实际 SSH 首页为 200，完整读取 20,059 字节；无重定向，响应没有 CSP。SSH ownership / HTTP readiness 通过，远端 PNG smoke 收到 execution_success，API 与临时文件一致。
+6. 请用户在日常 Chrome 手动打开同一个 SSH 地址；用户报告“正常看到 ComfyUI 编辑器”。这是用户确认，未把它描述成 agent 观察的 Chrome Queue 测试。
+7. 在新 IAB 标签实际导入 smoke-ui，点击 Run，查看 Completed，打开 Gallery；图片 complete 为 true，解码尺寸 64×64。保存测试截图在 Git 外。CPU 未执行 H3 或 Drive 持久化测试。
+8. 停止 owned SSH 转发与远端服务，官方 CLI 确认 CPU terminated；随后 sessions 仅剩另行计时的 owned G4。取消 CPU watchdog、停止自有诊断服务，保留 Drive 缓存和 SSH 密钥。G4 清理另见复制对比记录。
+
+### Commands
+
+以下为脱敏复现接口；界面截图、PTY 捕获、自有浏览器 probes 与临时访问地址不进入 Git。
+
+```bash
+python3 scripts/dashboard.py --demo
+python3 scripts/dashboard.py --demo --demo-state ready
+python3 scripts/dashboard.py --demo --demo-state error
+python3 scripts/dashboard.py --demo --no-color
+colab --auth=oauth2 new -s "$CPU_SESSION"
+python3 scripts/colabctl.py -s "$CPU_SESSION" deploy
+python3 scripts/colabctl.py -s "$CPU_SESSION" install
+python3 scripts/colabctl.py -s "$CPU_SESSION" status
+python3 scripts/colabctl.py -s "$CPU_SESSION" start --cpu --ephemeral --public
+python3 scripts/ssh_forward.py -s "$CPU_SESSION" start \
+  --local-port 8188 --identity "$HOME/.ssh/colab_comfyui_launcher"
+python3 scripts/colabctl.py -s "$CPU_SESSION" smoke
+# 手动打开 localhost；IAB 导入 smoke-ui、Run、Completed、Gallery。
+python3 scripts/ssh_forward.py -s "$CPU_SESSION" stop --local-port 8188
+python3 scripts/colabctl.py -s "$CPU_SESSION" stop
+colab --auth=oauth2 stop -s "$CPU_SESSION"
+colab --auth=oauth2 sessions
+```
+
+### Result
+
+| 检查 | 本轮结果 |
+| --- | --- |
+| 彩色 TUI | 真实 120×32 PTY 输出 orange 208 / cyan 81，状态卡片和四模型进度可见；离线 fixture |
+| Demo 隔离 | 创建/释放/打开浏览器等动作禁用，q 正常退出，无外部命令或资源 |
+| 终端回退 | 无颜色、TERM=dumb 和非交互 Demo 验证通过；窄屏布局另有最终 cells 回归 |
+| 受控 Chrome 诊断页 | 两个端口均通过 HTML / JS / API |
+| 受控 Chrome 实际 ComfyUI | SSH 根页面、system_stats、Cloudflare 根页面均客户端拦截 |
+| 用户日常 Chrome | 用户手动确认同一 SSH 地址的编辑器正常；未验证该 Chrome 的 Queue |
+| 新 IAB SSH 浏览器 | 导入 / Run / Completed / Gallery 通过，64×64 图片实际解码 |
+| 远端 PNG smoke | 421 字节 PNG、WS execution_success、API/临时文件一致 |
+| CPU 清理 | 转发和服务停止，官方 CPU terminated，取消其 watchdog；自有诊断服务停止 |
+| 离线验证 | 204 项 unittest、Ruff check / format、bootstrap 语法和 skill validation 通过；含 76 列菜单回归 |
+
+远端 smoke PNG SHA256 为 `6ae680b12006912199536479a23626a990cec6f0dd3079e4de5ffdf647ab770f`；它与浏览器单独提交的任务不是同一文件。
+
+### Known Limitations
+
+受控 Chrome 和用户日常 Chrome 的结果不同，说明不能把所有 Chrome 访问描述为失败。最小页在同一端口成功也不支持“8188 始终被封”。具体拦截组件、规则或自动化上下文原因未定位；不能仅据错误码认定广告扩展，更不能宣称其已修复。[Chromium 当前错误定义](https://chromium.googlesource.com/chromium/src/+/HEAD/net/base/net_error_list.h)仅表示客户端选择阻断；[官方修订](https://chromium.googlesource.com/chromium/src/+/3de98e520cea74e1f1bdc8a112bb66a8f2a19541)明确区分扩展与其他客户端来源。
+
+本轮没有做新的 Cloudflare 页面性能对比，也没有邮箱正向登录。IAB 成功和用户 Chrome 页面确认分别记录。离线 Demo 的进度与状态均为 fixture，不能作为真实模型复制或 GPU 运行证据；本轮视觉升级没有重新跑真实 TUI 的完整 GPU 启动，原协调流程的实测见前轮，修改后的安全语义有离线回归。
+
+### Architectural Decision
+
+保留标准库实现和原有资源所有权/退出语义，用可关闭的配色和终端尺寸布局改善操作。SSH 为已实测的默认访问方式，用户手动浏览器访问可用；受控浏览器拦截作为独立未解决边界保留。未修改主 Render 项目的接口。
+
 ## 2026-10-05 新 G4 本地模型缓存、TUI 与 H3
 
 ### Question / Goal
