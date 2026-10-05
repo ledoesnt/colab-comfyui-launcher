@@ -7,6 +7,11 @@ description: Start, test, reconnect to, and clean up this repository's ComfyUI l
 
 Use the repository scripts to run the workflow and report separately what was verified: runtime allocation, Drive access, ComfyUI execution, the selected external access mode, and optional H3 rendering. Work from the repository root, three directories above this skill folder. Read [README.md](../../../README.md) and inspect `python3 scripts/colabctl.py --help` before running commands.
 
+## Choose an interface
+
+- For guided startup or a user request to operate/test the TUI, use the terminal wizard below. An agent needs an interactive TTY / PTY with key input and screen output; keep it running while sending arrow keys and Enter, and verify the resulting screen and backend state. A CLI result alone does not prove that a TUI action worked.
+- For command automation or an environment without an interactive terminal, use the CLI sections below. The CLI and TUI both run in a terminal and use the same launcher backend; choosing the CLI does not mean entering `colab console` manually. Preserve the user's selected interface when the environment supports it.
+
 ## Choose the runtime and cleanup scope
 
 - Inspect the official CLI version, authentication, current sessions, and usage. The tested CLI is `google-colab-cli==0.7.4`; use explicit `--auth=oauth2`. Follow the CLI's current interactive authentication flow when needed. Do not reuse an old OAuth URL or ask the user to send tokens, authorization codes, or key passphrases in chat.
@@ -16,6 +21,28 @@ Use the repository scripts to run the workflow and report separately what was ve
 - Clarify only missing details that affect execution, such as access mode when none was selected, a mailbox when email mode was chosen, unresolved hardware choice, or whether an existing runtime may be stopped. Continue independent installation work while waiting. A spending limit is a stopping condition, not permission to exceed it.
 - For a test-and-cleanup request, release an agent-created runtime in cleanup even if installation or validation fails. When the user wants an interactive running UI, leave it running as requested and give the exact stop command. Never terminate a reused runtime without authorization to do so.
 
+## Terminal wizard (TUI)
+
+Launch from the repository root in an interactive terminal / PTY:
+
+```bash
+python3 scripts/dashboard.py
+```
+
+The default is an arrow/Enter wizard: new or existing runtime → compute / GPU model → Drive or temporary VM storage → configuration summary → confirmed creation / continuation → background preparation → browser-ready overview. Arrow keys never invoke commands. Esc returns/cancels; PgUp/PgDn scroll the right-hand details. Inputs use a default placeholder only while empty. A missing dedicated SSH key requires explicit creation or an existing path; never overwrite a key.
+
+Account login and Drive consent run in an actual controlling child PTY while the UI stays on screen. Authorization URLs and instructions appear transiently on the right. The user selects Open authorization in browser and completes the current provider flow; only their explicit confirmation/code is sent. Code input is masked and cleared after submission. Exit cancels the owned CLI coordination, retaining the VM. A successful CLI exit still requires actual mounted Drive and MyDrive validation. Do not save authorization frames or raw transcripts in screenshots, logs or Git.
+
+Existing runtimes are inspected before any mutation. Restore only complete saved storage/access configuration; unknown configuration requires a storage choice. Already running installation/preparation is waited on, ready steps are skipped, and uncertain state is not restarted automatically. A new runtime reports not_deployed before uploading scripts; this is normal and does not require Drive. The default wizard performs deployment automatically after confirmed allocation. The Ready overview offers browser access, Exit and keep resources, End this VM with a separate default-Cancel confirmation, other runtimes, and Advanced actions. Summary/failure also exposes advanced recovery when an existing service needs explicit stopping.
+
+Exit retains remote resources, owned SSH and running tasks; End this VM releases only the selected authorized runtime. Cleanup queued during startup is bound to the original session/key/port. Do not claim a result from a selected menu item before Enter or before verification. `--classic` retains the legacy action-code interface for advanced usage.
+
+`--demo` is an offline read-only fixture, with prepare/ready/error variants and navigable configuration previews; never use it as cloud evidence. `--no-color`/`NO_COLOR` disable the brand palette; unsupported terminals use numeric choices followed by Enter. Use the full-screen terminal for sensitive provider code input. Follow the user's screenshot requirement by capturing each real operation stage after sensitive authorization data has cleared, recording Demo and live tests separately.
+
+Read the [Advanced actions table](../../../README.md#advanced-actions) when managing an individual step. Normal startup already handles Drive mounting (or skips it for temporary storage), GPU model preparation, service startup and, in the default local-only mode, SSH forwarding.
+
+## CLI: allocate a runtime
+
 Example allocation after the user authorizes G4:
 
 ```bash
@@ -24,7 +51,7 @@ colab --auth=oauth2 new -s "$SESSION" --gpu G4
 
 Inspect `new --help` if the installed CLI rejects that GPU name. Do not silently substitute a more expensive GPU. A session name identifies the current runtime; it does not restore files after Colab recycles that runtime.
 
-## Mount Drive and install
+## CLI: mount Drive and install
 
 For persistent assets, run the official mount command in a terminal that supports its interaction:
 
@@ -46,17 +73,7 @@ Installation being started is not installation being ready. Poll `status` with s
 
 The bootstrap fixes the ComfyUI source commit and cloudflared version/checksum, and reuses the Colab torch environment. Its remaining dependencies depend on the Colab image and package resolution. Record the actual installed versions; do not describe this as a fully locked environment.
 
-For interactive operation, run `python3 scripts/dashboard.py`. The default is an arrow/Enter wizard: new or existing runtime → compute / GPU model → Drive or temporary VM storage → configuration summary → confirmed creation / continuation → background preparation → browser-ready overview. Arrow keys never invoke commands. Esc returns/cancels; PgUp/PgDn scroll the right-hand details. Inputs use a default placeholder only while empty. A missing dedicated SSH key requires explicit creation or an existing path; never overwrite a key.
-
-Account login and Drive consent run in an actual controlling child PTY while the UI stays on screen. Authorization URLs and instructions appear transiently on the right. The user selects Open authorization in browser and completes the current provider flow; only their explicit confirmation/code is sent. Code input is masked and cleared after submission. Exit cancels the owned CLI coordination, retaining the VM. A successful CLI exit still requires actual mounted Drive and MyDrive validation. Do not save authorization frames or raw transcripts in screenshots, logs or Git.
-
-Existing runtimes are inspected before any mutation. Restore only complete saved storage/access configuration; unknown configuration requires a storage choice. Already running installation/preparation is waited on, ready steps are skipped, and uncertain state is not restarted automatically. A new runtime reports not_deployed before uploading scripts; this is normal and does not require Drive. The default wizard performs deployment automatically after confirmed allocation. The Ready overview offers browser access, Exit and keep resources, End this VM with a separate default-Cancel confirmation, other runtimes, and Advanced actions. Summary/failure also exposes advanced recovery when an existing service needs explicit stopping.
-
-Exit retains remote resources, owned SSH and running tasks; End this VM releases only the selected authorized runtime. Cleanup queued during startup is bound to the original session/key/port. Do not claim a result from a selected menu item before Enter or before verification. Agents can use the bounded bridge directly rather than driving the TUI. `--classic` retains the legacy action-code interface for advanced usage.
-
-`--demo` is an offline read-only fixture, with prepare/ready/error variants and navigable configuration previews; never use it as cloud evidence. `--no-color`/`NO_COLOR` disable the brand palette; unsupported terminals use numeric choices followed by Enter. Use the full-screen terminal for sensitive provider code input. Follow the user's screenshot requirement by capturing each real operation stage after sensitive authorization data has cleared, recording Demo and live tests separately.
-
-## Prepare models on VM disk
+## CLI: prepare models on VM disk
 
 Before GPU startup, read the H3 model prerequisites below. Drive is only the persistent cache: never point ComfyUI model configuration at Drive. The preparation operation downloads only missing pinned files into Drive, then copies each model into `/content/colab-comfyui-runtime/models` while computing SHA256 in the same pass:
 
@@ -73,7 +90,7 @@ For explicitly selected temporary GPU storage, skip Drive and use `prepare --eph
 
 CPU `--ephemeral --cpu` network/PNG tests do not require H3 preparation or Drive. Code, dependencies, model loading and progress records remain on VM disk. Persistent runs save output files under the selected Drive storage root; ephemeral output survives only while that VM is retained.
 
-## Start and verify
+## CLI: start and verify
 
 When the user has authorized public access, start explicitly in public mode with the dedicated Drive storage directory. Add `--cpu` when the selected runtime should use CPU:
 

@@ -60,6 +60,23 @@ Demo 是只读 fixture，可预览导航、输入与进度，不作为云端成�
 
 需要旧操作码界面时显式运行 `python3 scripts/dashboard.py --classic`；`f` 是完整部署/安装/准备/启动流程，`m` 单独挂载，`H` 停止 SSH，`s` 停服务保留 VM，`X` 释放 VM，`q` 保留资源退出。这些操作码都需 Enter。新向导用 **Advanced actions** 管理单独步骤，正常启动无需记操作码。
 
+### Advanced actions
+
+这些操作针对当前选中的实例，上下选择后按 Enter 执行。正常启动优先使用完整向导；需要检查、测试或恢复单独步骤时再进入高级操作。
+
+| 菜单项 | 作用 |
+| --- | --- |
+| Inspect current runtime | 查询真实状态，恢复已保存的配置与本机 SSH 转发信息。 |
+| Authorize / check Google Drive | 检查 Drive；需要时在屏内引导授权，已挂载则跳过。VM disk 模式直接跳过，不切换存储模式。 |
+| Run a PNG smoke test | 运行无模型的 64×64 PNG 工作流，检查执行、输出获取与存储一致性；CPU 也可使用。 |
+| Render the H3 API test | 执行项目固定的 H3 视频测试并校验媒体和存储输出；需要 GPU、已准备的模型和运行中的 ComfyUI。 |
+| Stop services · retain VM | 先停止本机 owned SSH 转发，再停止启动器服务；保留 VM。 |
+| Start local SSH forwarding | 为当前实例建立本机 SSH 转发并检查 ComfyUI HTTP；不创建新 VM。 |
+| Stop local SSH forwarding | 只停止当前配置的本机 owned SSH 转发，保留远端服务与 VM。 |
+| Continue missing startup steps | 检查已有状态，跳过已就绪步骤、等待已有任务，并完成缺少的启动步骤；状态不明时停下。 |
+
+**Return to runtime overview** 返回概览。**End this VM** 在概览页单独操作并再次确认；停止服务或转发不等于释放 VM。
+
 完整导航和两条存储分支见 [启动流程图](docs/startup-wizard.md)。
 
 ### H3 模板提示缺模型
