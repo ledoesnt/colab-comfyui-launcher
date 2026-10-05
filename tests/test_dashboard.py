@@ -181,6 +181,74 @@ class BackendTests(unittest.TestCase):
             self.backend.bridge(self.config, "render")
         self.run.assert_not_called()
 
+    def test_official_creation_verifies_name_and_discards_runtime_endpoint(self):
+        self.run.side_effect = [
+            subprocess.CompletedProcess([], 0, "[colab] Session READY.\n", ""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                "[chosen-existing-session] private-runtime-endpoint | Hardware: CPU | Shape: Standard | Variant: DEFAULT | Status: IDLE\n",
+                "",
+            ),
+        ]
+        self.config.cpu = True
+        result = self.backend.create(self.config)
+        self.assertEqual(result["name"], self.config.session)
+        self.assertEqual(result["hardware"], "CPU")
+        self.assertNotIn("endpoint", result)
+        first, second = self.run.call_args_list
+        self.assertEqual(
+            first.args[0], ["colab", "--auth=oauth2", "new", "-s", self.config.session]
+        )
+        self.assertEqual(
+            second.args[0],
+            ["colab", "--auth=oauth2", "status", "-s", self.config.session],
+        )
+        for call in (first, second):
+            self.assertIs(call.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertTrue(call.kwargs["capture_output"])
+
+    def test_provider_stop_exit_zero_without_termination_is_unknown(self):
+        self.run.return_value = subprocess.CompletedProcess(
+            [], 0, "Session 'chosen-existing-session' not found.", ""
+        )
+        with self.assertRaisesRegex(dashboard.DashboardError, "not verified"):
+            self.backend.release(self.config)
+        self.run.assert_called_once()
+        self.run.reset_mock()
+        self.run.return_value = subprocess.CompletedProcess(
+            [], 0, "[colab] Session terminated.", ""
+        )
+        self.backend.release(self.config)
+        self.assertEqual(
+            self.command(),
+            ["colab", "--auth=oauth2", "stop", "-s", self.config.session],
+        )
+
+    def test_provider_lists_named_sessions_without_retaining_endpoints(self):
+        self.run.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            "[cpu-one] hidden-endpoint | Hardware: CPU | Shape: Standard | Variant: DEFAULT\n"
+            "[?] hidden-orphan | Hardware: T4 | Shape: Standard | Variant: GPU\n",
+            "",
+        )
+        self.assertEqual(
+            self.backend.sessions(),
+            [
+                {
+                    "name": "cpu-one",
+                    "hardware": "CPU",
+                    "shape": "Standard",
+                    "variant": "DEFAULT",
+                }
+            ],
+        )
+        self.run.return_value = subprocess.CompletedProcess(
+            [], 0, "[colab] No active sessions found on server.", ""
+        )
+        self.assertEqual(self.backend.sessions(), [])
+
 
 class WorkerTests(unittest.TestCase):
     def setUp(self):
@@ -329,7 +397,7 @@ class WorkerTests(unittest.TestCase):
         )
         self.backend.ssh.assert_called_once()
         self.assertEqual(self.backend.ssh.call_args.args[1], "stop")
-        releases = [config for kind, config in self.events() if kind == "release"]
+        releases = [value[0] for kind, value in self.events() if kind == "released"]
         self.assertEqual(
             [config.session for config in releases], ["only-selected-session"]
         )
@@ -576,10 +644,48 @@ class WorkerTests(unittest.TestCase):
         self.backend.bridge.side_effect = dashboard.DashboardError("not deployed")
         self.worker.submit("release", self.config)
         self.finish()
-        releases = [value for kind, value in self.events() if kind == "release"]
+        releases = [value[0] for kind, value in self.events() if kind == "released"]
         self.assertEqual(
             [value.session for value in releases], ["only-selected-session"]
         )
+        self.backend.interactive.assert_not_called()
+        self.backend.release.assert_called_once_with(self.config)
+
+    def test_new_cpu_background_event_then_not_deployed_status_never_installs(self):
+        self.config.cpu = True
+        self.backend.create.return_value = {
+            "name": self.config.session,
+            "hardware": "CPU",
+        }
+        baseline = {
+            "ok": True,
+            "deployment": {"status": "not_deployed"},
+            "installation": {"status": "not_started"},
+            "comfyui_alive": False,
+        }
+        self.backend.bridge.return_value = baseline
+        self.worker.submit("new", self.config)
+        self.finish()
+        events = self.events()
+        self.assertEqual(
+            [kind for kind, _ in events], ["stage", "session", "status", "done"]
+        )
+        self.assertEqual(
+            [call.args[1] for call in self.backend.bridge.call_args_list], ["status"]
+        )
+        self.backend.create.assert_called_once()
+        self.backend.interactive.assert_not_called()
+
+    def test_failed_release_retains_session_and_is_not_retried(self):
+        self.backend.release.side_effect = dashboard.DashboardError("release unknown")
+        self.worker.submit("release", self.config)
+        self.finish()
+        events = self.events()
+        self.assertFalse(any(kind == "released" for kind, _ in events))
+        self.assertTrue(
+            any(kind == "error" and "unknown" in value for kind, value in events)
+        )
+        self.backend.release.assert_called_once_with(self.config)
         self.backend.interactive.assert_not_called()
 
 
@@ -772,16 +878,38 @@ class DisplayTests(unittest.TestCase):
             app._configure()
         self.assertEqual(app.config.local_port, 8188)
 
-    def test_release_executes_only_selected_session_official_stop(self):
+    def test_live_ssh_guard_rolls_back_every_configuration_field(self):
         app = self.app()
-        app.backend.interactive.return_value = 0
-        with mock.patch.object(
-            app, "_terminal", side_effect=lambda screen, operation: operation()
+        original = dashboard.replace(app.config)
+        app.backend.ssh.return_value = {"ok": True, "running": True}
+        with (
+            mock.patch.object(dashboard.Path, "exists", return_value=True),
+            self.assertRaisesRegex(dashboard.DashboardError, "press H"),
         ):
-            app._release(mock.Mock(), app.config)
-        app.backend.interactive.assert_called_once_with(
-            ["stop", "-s", "fixture-session"]
-        )
+            app._configure(
+                mock.Mock(side_effect=["ephemeral", "local-only", "yes", "8189", ""])
+            )
+        self.assertEqual(app.config, original)
+        self.assertEqual(app.backend.ssh.call_args.args[0], original)
+
+    def test_ephemeral_model_card_does_not_claim_drive_persistence(self):
+        app = self.app()
+        app.config.ephemeral = True
+        rows = "\n".join(text for text, _ in app._model_rows(76))
+        self.assertIn("Temporary VM assets", rows)
+        self.assertNotIn("assets stay in Drive", rows)
+
+    def test_release_result_clears_only_its_selected_session_without_terminal(self):
+        app = self.app()
+        with mock.patch.object(app, "_terminal") as terminal:
+            other = dashboard.Config(session="another-session")
+            app.worker.events.put(("released", (other, "")))
+            app._events(mock.Mock())
+            self.assertEqual(app.config.session, "fixture-session")
+            app.worker.events.put(("released", (app.config, "")))
+            app._events(mock.Mock())
+        terminal.assert_not_called()
+        app.backend.interactive.assert_not_called()
         self.assertEqual(app.config.session, "")
 
     def test_failures_redact_urls_email_and_credential_text(self):
@@ -799,6 +927,208 @@ class DisplayTests(unittest.TestCase):
         ):
             dashboard.main(["--help"])
         self.assertEqual(raised.exception.code, 0)
+
+
+class InputTests(unittest.TestCase):
+    def app(self):
+        app = dashboard.Dashboard(
+            dashboard.Config(session="fixture-session"), mock.Mock()
+        )
+        self.addCleanup(app.worker.close)
+        app.worker.submit = mock.Mock(return_value=True)
+        return app
+
+    def test_cpu_code_waits_for_enter_and_repeated_enter_cannot_duplicate_creation(
+        self,
+    ):
+        app, screen = self.app(), GridScreen()
+        with mock.patch.object(app, "_terminal") as terminal:
+            self.assertTrue(app._key(screen, "C"))
+            app.worker.submit.assert_not_called()
+            app._draw(screen)
+            self.assertIn("Action> C", screen.text)
+            self.assertIn("Enter executes", screen.text)
+            app._key(screen, "\n")
+            app._key(screen, "\n")
+        terminal.assert_not_called()
+        app.worker.submit.assert_called_once()
+        action, config = app.worker.submit.call_args.args
+        self.assertEqual(action, "new")
+        self.assertTrue(config.cpu)
+        self.assertTrue(config.session.startswith("launcher-cpu-"))
+        self.assertEqual(app.action_input, "")
+
+    def test_escape_navigation_and_quit_do_not_execute_unconfirmed_actions(self):
+        app = self.app()
+        app._key(None, "X")
+        app._key(None, "\t")
+        app._key(None, "KEY_NPAGE")
+        self.assertEqual(app.action_input, "X")
+        app._key(None, "\x1b")
+        app._key(None, "\n")
+        app.worker.submit.assert_not_called()
+        self.assertTrue(app._key(None, "q"))
+        self.assertFalse(app._key(None, "\n"))
+        app.backend.release.assert_not_called()
+
+    def test_release_needs_enter_and_is_queued_without_terminal_handoff(self):
+        app = self.app()
+        with mock.patch.object(app, "_terminal") as terminal:
+            app._key(None, "X")
+            app.worker.submit.assert_not_called()
+            app._key(None, "\n")
+        app.worker.submit.assert_called_once_with("release", app.config)
+        terminal.assert_not_called()
+
+    def test_modal_text_never_triggers_menu_actions(self):
+        app, screen = self.app(), GridScreen()
+        screen.getkey = mock.Mock(side_effect=["X", "\n"])
+        self.assertEqual(app._prompt(screen, "Fixture field:"), "X")
+        app.worker.submit.assert_not_called()
+        app.backend.interactive.assert_not_called()
+        self.assertIn("INPUT / Enter confirms", screen.text)
+
+    def test_config_form_stays_in_screen_and_esc_discards_the_entire_candidate(self):
+        app, screen = self.app(), GridScreen()
+        original = dashboard.replace(app.config)
+        with (
+            mock.patch.object(
+                app,
+                "_prompt",
+                side_effect=[
+                    "ephemeral",
+                    "public",
+                    dashboard.FormCancelled("cancelled"),
+                ],
+            ),
+            mock.patch.object(app, "_terminal") as terminal,
+            mock.patch.object(dashboard.curses, "flushinp"),
+            self.assertRaises(dashboard.FormCancelled),
+        ):
+            app._action(screen, "c")
+        self.assertEqual(app.config, original)
+        terminal.assert_not_called()
+        app.backend.ssh.assert_not_called()
+
+    def test_cpu_ephemeral_full_start_uses_forms_without_provider_terminal(self):
+        app, screen = self.app(), GridScreen()
+        with (
+            mock.patch.object(
+                app,
+                "_prompt",
+                side_effect=["ephemeral", "local-only", "yes", "", "", ""],
+            ),
+            mock.patch.object(dashboard.Path, "exists", return_value=True),
+            mock.patch.object(app, "_terminal") as terminal,
+            mock.patch.object(dashboard.curses, "flushinp"),
+        ):
+            app._action(screen, "f")
+        self.assertTrue(app.config.cpu)
+        self.assertTrue(app.config.ephemeral)
+        app.worker.submit.assert_called_once_with("pipeline", app.config)
+        terminal.assert_not_called()
+        app.backend.interactive.assert_not_called()
+
+    def test_existing_session_selection_uses_loaded_list_and_in_screen_prompt(self):
+        app = self.app()
+        app.pending_sessions = [{"name": "known-cpu", "hardware": "CPU"}]
+        with (
+            mock.patch.object(app, "_prompt", return_value="1") as prompt,
+            mock.patch.object(app, "_terminal") as terminal,
+        ):
+            app._session_form(None)
+        self.assertEqual(app.config.session, "known-cpu")
+        self.assertTrue(app.config.cpu)
+        self.assertIn("known-cpu", prompt.call_args.args[2][0])
+        terminal.assert_not_called()
+        app.backend.interactive.assert_not_called()
+
+    def test_async_session_form_discards_old_action_on_selection_and_cancel(self):
+        for selected in ("1", dashboard.FormCancelled("cancelled")):
+            with self.subTest(selected=selected):
+                app = self.app()
+                app.action_input = "X"
+                app.pending_sessions = [{"name": "new-selected-cpu", "hardware": "CPU"}]
+                with mock.patch.object(app, "_prompt", side_effect=[selected]):
+                    app._session_form(None)
+                self.assertEqual(app.action_input, "")
+                app._key(None, "\n")
+                app.worker.submit.assert_not_called()
+                app.backend.release.assert_not_called()
+                self.assertEqual(
+                    app.config.session,
+                    "fixture-session"
+                    if isinstance(selected, Exception)
+                    else "new-selected-cpu",
+                )
+
+    def test_created_session_event_clears_actions_typed_for_the_previous_context(self):
+        app = self.app()
+        app.action_input = "X"
+        created = dashboard.Config(session="new-created-cpu", cpu=True)
+        app.worker.events.put(
+            ("session", (created, {"hardware": "CPU", "name": created.session}))
+        )
+        app._events(None)
+        self.assertEqual(app.action_input, "")
+        app._key(None, "\n")
+        app.worker.submit.assert_not_called()
+
+    def test_not_deployed_status_is_visible_and_never_automatically_deploys(self):
+        app, screen = self.app(), GridScreen()
+        status = {
+            "ok": True,
+            "deployment": {"status": "not_deployed"},
+            "installation": {"status": "not_started"},
+            "comfyui_alive": False,
+        }
+        app.worker.events.put(("status", status))
+        app._events(screen)
+        app._draw(screen)
+        self.assertIn("launcher not deployed", screen.text)
+        self.assertIn("Install NOT_STARTED", screen.text)
+        self.assertIn("Deployment NOT_DEPLOYED", screen.text)
+        self.assertIn("d + Enter deploys", screen.text)
+        app.worker.submit.assert_not_called()
+        app.backend.bridge.assert_not_called()
+
+    def test_deployment_transition_replaces_only_its_own_old_notice(self):
+        app, screen = self.app(), GridScreen()
+        app.message = dashboard.NOT_DEPLOYED_NOTICE
+        installing = {
+            "ok": True,
+            "deployment": {"status": "deployed"},
+            "installation": {"status": "installing", "phase": "packages"},
+            "access_mode": None,
+        }
+        app.worker.events.put(("status", installing))
+        app._events(screen)
+        app._draw(screen)
+        self.assertNotIn("launcher not deployed", screen.text)
+        self.assertIn(
+            "Launcher deployed; installation installing / packages", screen.text
+        )
+        self.assertIn("Access local-only", screen.text)
+        for notice in (
+            "render queued after current command",
+            "Inspect previous failure before retrying",
+        ):
+            app.message, app.error = notice, "Scoped cleanup failed"
+            app.worker.events.put(("status", installing))
+            app._events(screen)
+            self.assertEqual(app.message, notice)
+            self.assertEqual(app.error, "Scoped cleanup failed")
+
+    def test_pre_start_access_falls_back_to_config_in_both_card_layouts(self):
+        for height, width in ((24, 80), (32, 120)):
+            with self.subTest(size=(height, width)):
+                app, screen = self.app(), GridScreen(height, width)
+                app.config.access = "public"
+                app.status = {"access_mode": None}
+                app._draw(screen)
+                self.assertIn("Access", screen.text)
+                self.assertIn("public", screen.text)
+                self.assertNotIn("None", screen.text)
 
 
 class VisualTests(unittest.TestCase):

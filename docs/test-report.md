@@ -2,6 +2,67 @@
 
 以下分轮保留真实执行证据；历史轮次中的“未执行”只描述当时状态，最新验收边界见后续记录。
 
+## 2026-10-05 输入确认、屏内交互与新建 CPU 回归
+
+### Question / Goal
+
+修复 TUI 新建 CPU 后自动刷新报缺少 `/content/colab-comfyui-launcher`，并实际验证操作码必须 Enter 确认、普通操作留在界面内。此前彩色 Demo 验收没有覆盖真实 `C` 创建路径；本轮使用真实官方 CLI 和远端实例。
+
+### Environment
+
+本机真实 120×36 PTY，运行未加 `--demo` 的 dashboard；官方 Colab CLI 0.7.4，远端 CPU / Standard / DEFAULT、Python 3.13.15。测试开始时没有活动会话。第一实例用于完整 CPU 启动，显式 ephemeral / local-only；第二短暂实例只验证最终版创建和部署状态。两者分别设置 25 分钟、3 分钟 owned-session 保护上限，完成后提前释放。未挂载 Drive、下载 H3、分配 GPU 或启动 Cloudflare。
+
+### Steps
+
+1. 只输入 `C`，真实官方 sessions 仍为空；按 Enter 后创建 CPU，自动刷新显示 `not_deployed`，没有目录异常。`C` 的创建已成功，原错误来自随后在尚未部署的目录执行状态脚本，与 Drive 无关。
+2. `e` + Enter 在屏内加载真实会话列表；输入序号并 Enter 选择。`c` + Enter 在屏内逐项填写 Storage、Access、CPU、SSH 端口、密钥及缓存审计；选择 ephemeral / local-only / CPU，不经过 Drive 授权。
+3. `f` + Enter 在屏内确认配置，实际部署、安装、等待服务启动并建立 SSH。安装期间 Tab 可切换菜单；最终 HTTP、ComfyUI、SSH 都就绪。
+4. 第一遍真实测试发现部署后的旧 footer 和未启动时的 Access `None`。保留原始截图，修复后 `q` + Enter 退出保留资源，再用最终版连接同一 CPU；明确核对 VM、服务和 SSH 仍在运行。
+5. 最终版 `t` + Enter 执行真实 PNG smoke。另在 IAB 打开 SSH 地址，编辑器加载后实际点击 Run，查看 Completed 和 Gallery；两个任务的 history 都有 execution_success，下载响应都是 64×64 PNG，Gallery 图片 complete=true、naturalWidth/naturalHeight=64。
+6. 只输入 `s` 不按 Enter，SSH/HTTP 仍就绪；Enter 后停止服务和转发，官方 status 确认 VM 保留。最终版再次 `f` + Enter，实际完整启动并重新建立 SSH。
+7. 只输入 `X` 不按 Enter，官方 sessions 仍包含第一实例；Enter 后串行清理并释放，TUI 留在界面且清空已释放会话。官方 sessions 为空、owned SSH 状态为 false 后取消第一保护计时器。
+8. 同一最终版 TUI 再次 `C` + Enter 创建第二短暂 CPU，正常显示未部署；`d` + Enter 仅部署代码。实际状态变成 deployed，旧缺部署提示消失，服务未启动时 Access 显示 local-only。`X` + Enter 释放第二实例，官方 sessions 为空后取消第二计时器。
+9. 最终版仅输入 `q` 时程序仍活着；Enter 后正常退出，返回码 0。关闭本轮浏览器标签和 PTY 捕获工具，保留已有 Drive 缓存及 SSH 密钥。
+
+### Commands
+
+以下为脱敏复现方式；每个操作码和每个表单值都需要 Enter。第二条命令是接回已存在的 CPU，不创建实例。
+
+```bash
+python3 scripts/dashboard.py
+# C + Enter → c + Enter，配置 ephemeral / local-only / CPU yes
+# f + Enter → 确认各字段 → 等 HTTP/SSH ready → t + Enter
+# s + Enter 保留 VM；X + Enter 释放；q + Enter 只退出界面
+python3 scripts/dashboard.py -s "$CPU_SESSION" --cpu --ephemeral
+colab --auth=oauth2 sessions
+python3 scripts/ssh_forward.py -s "$CPU_SESSION" status --local-port 8188
+```
+
+### Result
+
+| 检查 | 实际结果 |
+| --- | --- |
+| 最终版新建 CPU | C 单独不执行；C+Enter 创建并正常报告尚未部署，无缺目录错误 |
+| 屏内交互 | 真实会话选择、设置、完整启动、停止和释放均保留 TUI |
+| Enter 语义 | C、s、X、q 单独输入不执行；Enter 后执行，q 返回码 0 |
+| 最终版启动 | 同一真实 CPU 停止后完整启动成功，ComfyUI/HTTP/SSH 就绪 |
+| PNG | TUI smoke 为 421 字节；浏览器 Run 为 1,576 字节，均为 64×64、history success；Gallery 实际解码 |
+| 新实例部署转换 | not_deployed → deployed，缺部署提示消失；Access None 回退为配置值 |
+| 留屏证据 | 两次 dashboard 运行的原始 ANSI 只有两对 alternate-screen 进入/退出，均对应启动和明确退出 |
+| 图文记录 | 63 张真实 PTY 终端帧、3 张真实网页截图及逐步 Markdown 保存于 Git 外 |
+| 清理 | 两个 owned CPU 均释放；官方无活动会话，SSH 停止，两个保护计时器和捕获工具已退出 |
+| 离线检查 | 231 项 unittest，包括 69 项 dashboard；Ruff check/format、bootstrap 语法及 skill validation 通过 |
+
+### Known Limitations
+
+终端 PNG 根据真实 PTY 的 ANSI/cell 状态渲染，保留对应文本与原始输出；它们不是桌面截屏，也不是 Demo 或手工重画的状态。网页 JPEG 是实际浏览器截图。原始记录含本次实例信息，只保存在 Git 外；公开记录使用脱敏接口。
+
+本轮未重新验证 G4 创建、Drive OAuth、40 GB 模型准备、Cloudflare、邮箱登录或 H3 推理；这些不能从 CPU 图片测试推断。Drive 授权仍通过提供方要求的真实终端/浏览器交互，属于会暂时切回终端的明确例外。Esc/取消、异步表单输入残留、超时不重试和错误不被自动刷新覆盖有离线回归；没有将它们都描述成真实远端测试。
+
+### Architectural Decision
+
+保留 Python 标准库实现；原切屏是主动调用 endwin 和同步终端输入造成，语言并不要求这种交互。普通创建和释放改为捕获输出的后台任务，配置和会话选择改为界面内表单。状态适配器明确区分尚未部署与执行失败；已有服务记录但控制代码缺失时仍拒绝假装已清理。所有业务动作先输入代码再 Enter，导航键直接生效。未改主 Render API。
+
 ## 2026-10-05 四模型先复制后 SHA 与同步 SHA 对比
 
 ### Question / Goal

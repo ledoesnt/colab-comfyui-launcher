@@ -131,9 +131,12 @@ class BackgroundBridgeTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             ["runtime"], 0, stdout='{"ok": true}', stderr=""
         )
-        with mock.patch.object(
-            self.namespace["subprocess"], "run", return_value=completed
-        ) as run:
+        with (
+            mock.patch.object(self.namespace["Path"], "is_file", return_value=True),
+            mock.patch.object(
+                self.namespace["subprocess"], "run", return_value=completed
+            ) as run,
+        ):
             self.namespace["runtime_result"](
                 {"action": "stop", "request_id": "new-start-request"}
             )
@@ -278,6 +281,201 @@ class BackgroundBridgeTests(unittest.TestCase):
         )
 
 
+class UndeployedRuntimeTests(unittest.TestCase):
+    """Map every remote path to actual temporary files; execute no child process."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="launcher-undeployed-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.namespace = {}
+        exec(bridge.REMOTE_HELPERS, self.namespace)  # noqa: S102 - trusted local code.
+
+        def remote_path(value):
+            path = Path(value)
+            return self.root / (str(path).lstrip("/") if path.is_absolute() else path)
+
+        self.namespace["Path"] = remote_path
+        self.runtime = remote_path("/content/colab-comfyui-runtime")
+        self.launcher = remote_path("/content/colab-comfyui-launcher")
+        self.script = self.launcher / "scripts/runtime.py"
+        self.services = self.runtime / "services.json"
+        self.run = self.patch(
+            self.namespace["subprocess"],
+            "run",
+            side_effect=AssertionError(
+                "A fixture must explicitly provide its child result"
+            ),
+        )
+        self.spawn = self.patch(self.namespace["subprocess"], "Popen")
+        self.kill = self.patch(self.namespace["os"], "kill")
+        self.killpg = self.patch(self.namespace["os"], "killpg")
+        self.patch(self.namespace["os"].path, "ismount", return_value=False)
+
+    def patch(self, target, name, **kwargs):
+        patcher = mock.patch.object(target, name, **kwargs)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def snapshot(self):
+        return {
+            str(path.relative_to(self.root)): path.read_bytes()
+            if path.is_file()
+            else None
+            for path in self.root.rglob("*")
+        }
+
+    def assert_no_process_action(self):
+        self.run.assert_not_called()
+        self.spawn.assert_not_called()
+        self.kill.assert_not_called()
+        self.killpg.assert_not_called()
+
+    def create_services_record(self):
+        self.runtime.mkdir(parents=True)
+        self.services.write_text(
+            json.dumps({"comfyui": {"pid": 12345, "stamp": "historical-start"}})
+        )
+
+    def deploy_fixture_script(self):
+        self.script.parent.mkdir(parents=True)
+        self.script.write_text("# Child execution is stubbed by this fixture.\n")
+
+    def test_fresh_status_is_readable_without_creating_remote_directories(self):
+        before = self.snapshot()
+        result = self.namespace["runtime_action"]({"action": "status"})
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["deployed"])
+        self.assertEqual(result["deployment"]["status"], "not_deployed")
+        self.assertEqual(result["installation"]["status"], "not_started")
+        for field in ("comfyui_alive", "tunnel_alive", "http_ready", "models_ready"):
+            self.assertIs(result[field], False)
+        self.assertIsNone(result["startup"])
+        for task in ("model_download", "model_prepare", "render"):
+            self.assertFalse(result[task]["running"])
+            self.assertEqual(result[task]["status"], "not_started")
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((self.root / "content").exists())
+        self.assert_no_process_action()
+
+    def test_historical_service_record_keeps_liveness_unknown_without_runtime_code(
+        self,
+    ):
+        self.create_services_record()
+        before = self.snapshot()
+        result = self.namespace["runtime_action"]({"action": "status"})
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["deployed"])
+        self.assertEqual(result["installation"]["status"], "unknown")
+        for field in ("comfyui_alive", "tunnel_alive", "http_ready"):
+            self.assertIsNone(result[field])
+        self.assertFalse(result["models_ready"])
+        self.assertIsNone(result["url"])
+        self.assertEqual(self.snapshot(), before)
+        self.assert_no_process_action()
+
+    def test_historical_installation_does_not_claim_ready_without_runtime_code(self):
+        self.runtime.mkdir(parents=True)
+        (self.runtime / "install.json").write_text(json.dumps({"status": "ready"}))
+        before = self.snapshot()
+        result = self.namespace["runtime_action"]({"action": "status"})
+        self.assertFalse(result["deployed"])
+        self.assertEqual(result["installation"]["status"], "unknown")
+        for field in ("comfyui_alive", "tunnel_alive", "http_ready", "models_ready"):
+            self.assertIs(result[field], False)
+        self.assertEqual(self.snapshot(), before)
+        self.assert_no_process_action()
+
+    def test_fresh_stop_is_noop_without_state_files_or_signals(self):
+        before = self.snapshot()
+        result = self.namespace["runtime_action"]({"action": "stop"})
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["deployed"])
+        self.assertTrue(result["cleanup_skipped"])
+        self.assertTrue(result["runtime_still_running"])
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((self.runtime / "start-result.json").exists())
+        self.assert_no_process_action()
+
+    def test_historical_services_without_runtime_code_refuse_stop(self):
+        self.create_services_record()
+        before = self.snapshot()
+        with self.assertRaisesRegex(
+            RuntimeError, "[Ee]xisting service state cannot be cleaned"
+        ):
+            self.namespace["runtime_action"]({"action": "stop"})
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((self.runtime / "start-result.json").exists())
+        self.assert_no_process_action()
+
+    def test_deployed_runtime_keeps_real_child_failure_instead_of_fresh_success(self):
+        self.deploy_fixture_script()
+        self.run.side_effect = None
+        self.run.return_value = subprocess.CompletedProcess(
+            ["runtime"],
+            0,
+            stdout=json.dumps(
+                {"ok": False, "error": "Model preparation checksum failed"}
+            ),
+            stderr="",
+        )
+        with self.assertRaisesRegex(RuntimeError, "Model preparation checksum failed"):
+            self.namespace["runtime_action"]({"action": "status"})
+        self.run.assert_called_once()
+        self.assertEqual(
+            self.run.call_args.args[0][-2:],
+            ["/content/colab-comfyui-launcher/scripts/runtime.py", "status"],
+        )
+        self.assertFalse((self.runtime / "start-result.json").exists())
+        self.spawn.assert_not_called()
+        self.killpg.assert_not_called()
+
+    def test_deployed_status_adds_deployment_marker_without_replacing_real_status(self):
+        self.deploy_fixture_script()
+        self.run.side_effect = None
+        self.run.return_value = subprocess.CompletedProcess(
+            ["runtime"],
+            0,
+            stdout=json.dumps(
+                {"ok": True, "http_ready": False, "installation": {"status": "failed"}}
+            ),
+            stderr="",
+        )
+        result = self.namespace["runtime_action"]({"action": "status"})
+        self.assertTrue(result["deployed"])
+        self.assertEqual(result["deployment"]["status"], "deployed")
+        self.assertFalse(result["http_ready"])
+        self.assertEqual(result["installation"]["status"], "failed")
+        self.run.assert_called_once()
+
+    def test_missing_session_and_exec_failure_are_not_undeployed_success(self):
+        fresh_response = bridge.RESULT_PREFIX + json.dumps(
+            {"ok": True, "deployed": False}
+        )
+        for output, error in (
+            ("", "Session missing was not found"),
+            (fresh_response, "Remote exec failed"),
+        ):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with (
+                self.subTest(error=error),
+                mock.patch.object(
+                    bridge,
+                    "_run_colab",
+                    return_value=subprocess.CompletedProcess(
+                        ["colab", "exec"], 1, stdout=output, stderr=error
+                    ),
+                ) as command,
+                mock.patch("sys.stdout", stdout),
+                mock.patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(bridge.main(["-s", "missing", "status"]), 1)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn(error, stderr.getvalue())
+            self.assertEqual(command.call_args.args[0][:3], ["exec", "-s", "missing"])
+        self.assert_no_process_action()
+
+
 class BackgroundArgumentsTests(unittest.TestCase):
     def test_start_requires_one_access_mode(self):
         for access in ([], ["--public", "--allowed-email", "tester@example.invalid"]):
@@ -309,13 +507,16 @@ class BackgroundArgumentsTests(unittest.TestCase):
             }
             if public:
                 payload["public"] = True
-            with mock.patch.object(
-                namespace["subprocess"],
-                "run",
-                return_value=subprocess.CompletedProcess(
-                    ["python"], 0, stdout='{"ok": true}', stderr=""
-                ),
-            ) as run:
+            with (
+                mock.patch.object(namespace["Path"], "is_file", return_value=True),
+                mock.patch.object(
+                    namespace["subprocess"],
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        ["python"], 0, stdout='{"ok": true}', stderr=""
+                    ),
+                ) as run,
+            ):
                 namespace["runtime_result"](payload)
             arguments = run.call_args.args[0]
             self.assertEqual("--public" in arguments, public)

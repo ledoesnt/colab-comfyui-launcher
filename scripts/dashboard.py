@@ -1,4 +1,4 @@
-"""Local, standard-library dashboard. Selecting an action executes that action.
+"""Local, standard-library dashboard. Type an action code, then press Enter.
 
 Authentication stays in the real terminal. Nothing is written to a dashboard log.
 Quit retains remote resources; release explicitly stops only the selected VM.
@@ -16,6 +16,7 @@ import select
 import subprocess
 import sys
 import termios
+import textwrap
 import threading
 import time
 import unicodedata
@@ -30,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STORAGE = "/content/drive/MyDrive/colab-comfyui-launcher-test"
 DEFAULT_IDENTITY = Path.home() / ".ssh/colab_comfyui_launcher"
 REFRESH_SECONDS = 10.0
+NOT_DEPLOYED_NOTICE = "VM ready; launcher not deployed. Use d + Enter to deploy, or f + Enter for full startup."
 
 
 class DashboardError(RuntimeError):
@@ -38,6 +40,10 @@ class DashboardError(RuntimeError):
 
 class OperationCancelled(DashboardError):
     """Pipeline coordination yielded to an explicitly selected cleanup action."""
+
+
+class FormCancelled(DashboardError):
+    """The user cancelled an in-screen form without changing configuration."""
 
 
 def safe_error(value: object) -> str:
@@ -204,6 +210,76 @@ class Backend:
             print(safe_error(exc))
             return 1
 
+    def official(self, arguments: list[str], *, timeout: int = 150) -> str:
+        """Capture ordinary provider commands; authentication alone inherits a TTY."""
+        try:
+            completed = self.run(
+                ["colab", "--auth=oauth2", *arguments],
+                text=True,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DashboardError(
+                "Provider command timed out; outcome is unknown. Inspect sessions before retrying."
+            ) from exc
+        except OSError as exc:
+            raise DashboardError(safe_error(exc)) from exc
+        if completed.returncode:
+            raise DashboardError(safe_error(completed.stderr or completed.stdout))
+        return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", completed.stdout)
+
+    @staticmethod
+    def session_rows(output: str) -> list[dict[str, str]]:
+        rows = []
+        for line in output.splitlines():
+            match = re.match(r"^\[([^\]\s]+)\].+\|\s*Hardware:\s*([^|]+)", line)
+            if not match or match[1] == "?":
+                continue
+            row = {"name": match[1], "hardware": match[2].strip()}
+            for part in line.split("|")[2:]:
+                key, separator, value = part.strip().partition(":")
+                if separator and key in ("Shape", "Variant", "Status"):
+                    row[key.lower()] = value.strip()
+            rows.append(row)
+        return rows
+
+    def sessions(self) -> list[dict[str, str]]:
+        output = self.official(["sessions"])
+        rows = self.session_rows(output)
+        if not rows and "No active sessions" not in output:
+            raise DashboardError(
+                "Provider session list could not be verified; no action was retried."
+            )
+        return rows
+
+    def create(self, config: Config) -> dict[str, str]:
+        require_session(config)
+        arguments = ["new", "-s", config.session]
+        if not config.cpu:
+            arguments.extend(["--gpu", "G4"])
+        output = self.official(arguments, timeout=300)
+        if "Session READY." not in output:
+            raise DashboardError(
+                "Creation outcome is unknown. Inspect official sessions before retrying."
+            )
+        rows = self.session_rows(self.official(["status", "-s", config.session]))
+        selected = next((row for row in rows if row["name"] == config.session), None)
+        if selected is None:
+            raise DashboardError(
+                "Created session could not be verified; inspect sessions before retrying."
+            )
+        return selected
+
+    def release(self, config: Config) -> None:
+        require_session(config)
+        output = self.official(["stop", "-s", config.session])
+        if "Session terminated." not in output:
+            raise DashboardError(
+                "VM release was not verified; inspect the selected session before retrying."
+            )
+
 
 class Worker:
     """Exactly one command at a time, including periodic status refreshes."""
@@ -358,7 +434,7 @@ class Worker:
             self.events.put(("stage", "starting local SSH forwarding"))
             self.events.put(("ssh", self.backend.ssh(config, "start")))
 
-    def _stop(self, config: Config) -> None:
+    def _stop(self, config: Config) -> str:
         warnings = []
         try:
             self.events.put(("ssh", self.backend.ssh(config, "stop")))
@@ -374,6 +450,7 @@ class Worker:
                     + safe_error(warnings[0]),
                 )
             )
+        return safe_error(warnings[0]) if warnings else ""
 
     def _loop(self) -> None:
         while not self.cancelled.is_set():
@@ -391,12 +468,22 @@ class Worker:
                 self.events.put(("stage", action))
                 if action == "pipeline":
                     self._pipeline(config)
-                elif action in ("stop", "release"):
+                elif action == "sessions":
+                    self.events.put(("sessions", self.backend.sessions()))
+                elif action == "new":
+                    provider = self.backend.create(config)
+                    self.events.put(("session", (config, provider)))
+                    self._status(config)
+                elif action == "release":
+                    cleanup_error = ""
                     try:
-                        self._stop(config)
-                    finally:
-                        if action == "release":
-                            self.events.put(("release", config))
+                        cleanup_error = self._stop(config)
+                    except DashboardError as exc:
+                        cleanup_error = safe_error(exc)
+                    self.backend.release(config)
+                    self.events.put(("released", (config, cleanup_error)))
+                elif action == "stop":
+                    self._stop(config)
                 elif action.startswith("ssh_"):
                     self.events.put(("ssh", self.backend.ssh(config, action[4:])))
                 elif action == "status":
@@ -775,6 +862,8 @@ class Dashboard:
         self.show_menu = True
         self.theme = Theme()
         self.demo = isinstance(backend, DemoBackend)
+        self.action_input = ""
+        self.pending_sessions: list[dict[str, str]] | None = None
 
     def _terminal(self, screen: Any, operation: Callable[[], Any]) -> Any:
         if screen is None:
@@ -796,48 +885,51 @@ class Dashboard:
             screen.clear()
             screen.refresh()
 
-    def _configure(self) -> None:
-        print("Configuration is kept in memory only. No credentials or URLs are saved.")
-        value = input(f"Storage [{self.config.storage_root}] (or ephemeral): ").strip()
+    def _configure(self, ask: Callable[[str], str] | None = None) -> None:
+        ask = ask or input
+        candidate = replace(self.config)
+        storage = "ephemeral" if candidate.ephemeral else candidate.storage_root
+        value = ask(f"Storage [{storage}] (or ephemeral): ").strip()
         if value:
-            self.config.ephemeral = value == "ephemeral"
-            if not self.config.ephemeral:
-                self.config.storage_root = value
-        value = input(
-            f"Access public / local-only / email [{self.config.access}]: "
+            candidate.ephemeral = value == "ephemeral"
+            if not candidate.ephemeral:
+                candidate.storage_root = value
+        value = ask(
+            f"Access public / local-only / email [{candidate.access}]: "
         ).strip()
         if value:
             if value not in ("public", "local-only", "email"):
                 raise DashboardError("Access must be public, local-only or email.")
-            self.config.access = value
-        if self.config.access == "email":
-            self.config.email = input(
-                "Allowed email (provider OTP remains in your browser): "
+            candidate.access = value
+        if candidate.access == "email":
+            value = ask(
+                f"Allowed email [{candidate.email}] (OTP remains in your browser): "
             ).strip()
+            if value:
+                candidate.email = value
+            if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", candidate.email):
+                raise DashboardError("Enter a valid allowed email.")
         value = (
-            input(f"CPU mode yes/no [{'yes' if self.config.cpu else 'no'}]: ")
+            ask(f"CPU mode yes/no [{'yes' if candidate.cpu else 'no'}]: ")
             .strip()
             .lower()
         )
         if value:
             if value not in ("yes", "no"):
                 raise DashboardError("CPU choice must be yes or no.")
-            self.config.cpu = value == "yes"
-        if self.config.access == "local-only":
-            print(
-                "Background SSH needs a dedicated key without a passphrase; existing keys are never overwritten."
-            )
-            value = input(f"SSH local port [{self.config.local_port}]: ").strip()
-            proposed_port = self.config.local_port
+            candidate.cpu = value == "yes"
+        if candidate.access == "local-only":
+            value = ask(f"SSH local port [{candidate.local_port}]: ").strip()
+            proposed_port = candidate.local_port
             if value:
                 port = int(value)
                 if not 1024 <= port <= 65535:
                     raise DashboardError("Port must be between 1024 and 65535.")
                 proposed_port = port
-            value = input(
-                f"SSH identity path [{self.config.identity or DEFAULT_IDENTITY}]: "
+            value = ask(
+                f"SSH identity path [{candidate.identity or DEFAULT_IDENTITY}]: "
             ).strip()
-            proposed_identity = self.config.identity
+            proposed_identity = candidate.identity
             if value:
                 path = Path(value).expanduser()
                 if not path.is_absolute() or any(
@@ -864,39 +956,78 @@ class Dashboard:
                     raise DashboardError(
                         "SSH ownership status is unknown; keep the current port/identity and inspect before changing them."
                     )
-            self.config.local_port = proposed_port
-            self.config.identity = proposed_identity
-            identity = Path(self.config.identity or DEFAULT_IDENTITY)
+            candidate.local_port = proposed_port
+            candidate.identity = proposed_identity
+            identity = Path(candidate.identity or DEFAULT_IDENTITY)
             if not identity.exists():
                 value = (
-                    input(
-                        "Dedicated key is absent. Create it on SSH start? yes/no [no]: "
+                    ask(
+                        f"Dedicated key absent. Create it on SSH start? yes/no [{'yes' if candidate.create_key else 'no'}]: "
                     )
                     .strip()
                     .lower()
                 )
-                self.config.create_key = value == "yes"
-                if not self.config.create_key:
+                if value:
+                    if value not in ("yes", "no"):
+                        raise DashboardError("Key creation choice must be yes or no.")
+                    candidate.create_key = value == "yes"
+                if not candidate.create_key:
                     raise DashboardError(
                         "No SSH key selected; choose key creation or public/email access before full startup."
                     )
-        self.config.verify_cache = (
-            input("Rehash Drive model cache during prepare? yes/no [no]: ")
+        value = (
+            ask(
+                f"Rehash Drive model cache during prepare? yes/no [{'yes' if candidate.verify_cache else 'no'}]: "
+            )
             .strip()
             .lower()
-            == "yes"
         )
+        if value:
+            if value not in ("yes", "no"):
+                raise DashboardError("Cache audit choice must be yes or no.")
+            candidate.verify_cache = value == "yes"
+        if not candidate.ephemeral:
+            root, mydrive = Path(candidate.storage_root), Path("/content/drive/MyDrive")
+            if (
+                not root.is_absolute()
+                or root == mydrive
+                or mydrive not in root.parents
+                or ".." in root.parts
+            ):
+                raise DashboardError(
+                    "Use a dedicated directory inside /content/drive/MyDrive."
+                )
+        self.config = candidate
 
-    def _select(self) -> None:
-        self.backend.interactive(["sessions"])
-        name = input("Select ONE existing session name (blank cancels): ").strip()
+    def _select(self, screen: Any, rows: list[dict[str, str]]) -> None:
+        if not rows:
+            self.message = (
+                "No active named sessions; C + Enter creates CPU, n + Enter creates G4."
+            )
+            return
+        choices = [
+            f"{index}. {row['name']} ({row['hardware']})"
+            for index, row in enumerate(rows, 1)
+        ]
+        name = self._prompt(
+            screen, "Select a session number or exact name (blank cancels):", choices
+        ).strip()
+        if name.isdecimal() and 1 <= int(name) <= len(rows):
+            name = rows[int(name) - 1]["name"]
         if name:
-            candidate = replace(self.config, session=name)
+            selected = next((row for row in rows if row["name"] == name), None)
+            if selected is None:
+                raise DashboardError(
+                    "Select one named session from the displayed list."
+                )
+            candidate = replace(
+                self.config, session=name, cpu=selected["hardware"] == "CPU"
+            )
             require_session(candidate)
             self.config = candidate
             self.status, self.ssh = {}, {}
             self.updated, self.last_refresh = 0.0, 0.0
-            self.message = "Session selected; set CPU mode in configuration if needed."
+            self.message = "Session selected; status will show deployment and services."
 
     def _new(self, cpu: bool) -> None:
         name = (
@@ -905,36 +1036,27 @@ class Dashboard:
             + time.strftime("%Y%m%d-%H%M%S-")
             + uuid.uuid4().hex[:6]
         )
-        arguments = ["new", "-s", name]
-        if not cpu:
-            arguments.extend(["--gpu", "G4"])
-        print(f"Creating only this session: {name}")
-        code = self.backend.interactive(arguments)
-        if code:
-            raise DashboardError(
-                "Creation did not complete successfully. Inspect official sessions before retrying."
-            )
-        self.config.session, self.config.cpu = name, cpu
-        self.status, self.ssh = {}, {}
-        self.updated, self.last_refresh = 0.0, 0.0
-        self.message = (
-            "Creation command completed; deployment/status will verify the runtime."
-        )
+        candidate = replace(self.config, session=name, cpu=cpu)
+        if self.worker.submit("new", candidate):
+            self.message = f"Creating one {'CPU' if cpu else 'G4'} session; waiting for provider status."
 
     def _mount(self) -> None:
         require_session(self.config)
         if self.config.ephemeral:
-            print("Ephemeral storage selected; no Drive mount is needed.")
+            self.message = "Ephemeral storage selected; no Drive mount is needed."
             return
+        print(
+            "Drive authorization uses the provider terminal/browser. The dashboard resumes afterward."
+        )
         code = self.backend.interactive(["drivemount", "-s", self.config.session])
         if code:
             raise DashboardError(
                 "Drive mount did not succeed. Finish provider authorization, then mount again explicitly."
             )
 
-    def _full_inputs(self) -> None:
+    def _full_inputs(self, ask: Callable[[str], str] | None = None) -> None:
         require_session(self.config)
-        self._configure()
+        self._configure(ask)
         if self.config.ephemeral and not self.config.cpu:
             raise DashboardError(
                 "Full H3 startup requires a Drive model cache; ephemeral mode is for CPU smoke testing."
@@ -951,21 +1073,6 @@ class Dashboard:
                 raise DashboardError(
                     "Use a dedicated directory inside /content/drive/MyDrive."
                 )
-        self._mount()
-
-    def _release(self, screen: Any, config: Config) -> None:
-        code = self._terminal(
-            screen, lambda: self.backend.interactive(["stop", "-s", config.session])
-        )
-        self.message = (
-            "VM release command completed for selected session."
-            if code == 0
-            else "VM release failed or is unknown; select the session and inspect before retrying."
-        )
-        if code == 0:
-            self.config.session = ""
-            self.status, self.ssh = {}, {}
-            self.updated = 0.0
 
     def _url(self) -> str | None:
         if self.config.access == "local-only":
@@ -987,7 +1094,16 @@ class Dashboard:
             except queue.Empty:
                 return
             if kind == "status":
-                self.status, self.updated, self.error = value, time.monotonic(), ""
+                self.status, self.updated = value, time.monotonic()
+                deployment = (value.get("deployment") or {}).get("status")
+                if deployment == "not_deployed":
+                    self.message = NOT_DEPLOYED_NOTICE
+                elif deployment == "deployed" and self.message == NOT_DEPLOYED_NOTICE:
+                    installation = value.get("installation") or {}
+                    self.message = (
+                        f"Launcher deployed; installation {installation.get('status', 'unknown')}"
+                        f" / {installation.get('phase') or self.stage}."
+                    )
             elif kind == "ssh":
                 self.ssh = value
             elif kind == "ssh_error":
@@ -1001,8 +1117,100 @@ class Dashboard:
             elif kind == "done":
                 self.stage = "idle"
                 self.last_refresh = time.monotonic()
-            elif kind == "release":
-                self._release(screen, value)
+            elif kind == "session":
+                config, provider = value
+                self.action_input = ""
+                self.config = config
+                self.status = {
+                    "provider": provider,
+                    "runtime": {"gpu_name": provider["hardware"]},
+                }
+                self.ssh = {}
+                self.updated, self.last_refresh = 0.0, 0.0
+                self.message = (
+                    "Created selected session; no launcher services have been started."
+                )
+            elif kind == "sessions":
+                self.pending_sessions = value
+            elif kind == "released":
+                config, cleanup_error = value
+                self.message = "Selected VM release verified."
+                if cleanup_error:
+                    self.message += " Service cleanup warning: " + safe_error(
+                        cleanup_error
+                    )
+                if self.config.session == config.session:
+                    self.action_input = ""
+                    self.config.session = ""
+                    self.status, self.ssh = {}, {}
+                    self.updated = 0.0
+
+    def _prompt(
+        self, screen: Any, prompt: str, choices: list[str] | None = None
+    ) -> str:
+        if screen is None:
+            if choices:
+                print("\n".join(choices))
+            return input(prompt)
+        value = ""
+        while True:
+            self._draw(screen)
+            self._draw_prompt(screen, prompt, value, choices or [])
+            screen.refresh()
+            try:
+                key = screen.getkey()
+            except curses.error:
+                continue
+            if key in ("\n", "\r", "KEY_ENTER"):
+                return value
+            if key == "\x1b":
+                raise FormCancelled("Form cancelled; configuration unchanged.")
+            if key in ("KEY_BACKSPACE", "\b", "\x7f"):
+                value = value[:-1]
+            elif len(key) == 1 and key.isprintable() and len(value) < 300:
+                value += key
+
+    def _draw_prompt(
+        self, screen: Any, prompt: str, value: str, choices: list[str]
+    ) -> None:
+        height, width = screen.getmaxyx()
+        card_width = max(8, min(88, width - 2))
+        lines = textwrap.wrap(prompt, max(1, card_width - 4))
+        available = max(0, height - len(lines) - 7)
+        visible_choices = choices[:available]
+        if len(visible_choices) < len(choices) and available:
+            visible_choices[-1] = "More sessions: enter their exact name."
+        card_height = min(height - 2, len(lines) + len(visible_choices) + 5)
+        rect = Rect(
+            max(0, (height - card_height) // 2),
+            max(0, (width - card_width) // 2),
+            card_height,
+            card_width,
+        )
+        for row in range(rect.row, rect.row + rect.height):
+            self._write(screen, row, rect.column, " " * rect.width, rect.width)
+        self._card(screen, rect, "INPUT / Enter confirms / Esc cancels", "title")
+        for offset, text in enumerate([*visible_choices, *lines], 1):
+            if offset < rect.height - 3:
+                self._write(
+                    screen, rect.row + offset, rect.column + 2, text, rect.width - 4
+                )
+        self._write(
+            screen,
+            rect.row + rect.height - 3,
+            rect.column + 2,
+            "> " + value[-max(1, rect.width - 7) :] + "_",
+            rect.width - 4,
+            "accent",
+        )
+        self._write(
+            screen,
+            rect.row + rect.height - 2,
+            rect.column + 2,
+            "Blank Enter keeps default; Esc cancels.",
+            rect.width - 4,
+            "muted",
+        )
 
     def _write(
         self,
@@ -1088,7 +1296,7 @@ class Dashboard:
             else ("EPHEMERAL" if self.config.ephemeral else "UNMOUNTED")
         )
         install_state = str(install.get("status", "unknown")).upper()
-        mode = self.status.get("access_mode", self.config.access)
+        mode = self.status.get("access_mode") or self.config.access
         model_state = "READY" if self.status.get("models_ready") else "waiting"
         if rect.height <= 6:
             rows = [
@@ -1137,6 +1345,11 @@ class Dashboard:
             )
 
     def _model_rows(self, width: int) -> list[tuple[str, str]]:
+        if (self.status.get("deployment") or {}).get("status") == "not_deployed":
+            return [
+                ("Deployment NOT_DEPLOYED", "warn"),
+                ("d + Enter deploys; f + Enter runs setup.", "normal"),
+            ]
         jobs = [
             ("model_prepare", "PREPARE"),
             ("model_download", "DOWNLOAD"),
@@ -1217,7 +1430,12 @@ class Dashboard:
                             f"Download {(self.status.get('model_download') or {}).get('status', 'unknown')}   Render {(self.status.get('render') or {}).get('status', 'unknown')}",
                             "muted",
                         ),
-                        ("Models load from VM disk; assets stay in Drive.", "muted"),
+                        (
+                            "Temporary VM assets; releasing the VM deletes them."
+                            if self.config.ephemeral
+                            else "Models load from VM disk; assets stay in Drive.",
+                            "muted",
+                        ),
                     ]
                 )
         return rows
@@ -1262,7 +1480,7 @@ class Dashboard:
             )
 
     def _actions(self, screen: Any, rect: Rect) -> None:
-        self._card(screen, rect, "ACTIONS  select to execute", "title")
+        self._card(screen, rect, "ACTIONS  code + Enter", "title")
         if not self.show_menu:
             self._write(
                 screen,
@@ -1408,34 +1626,49 @@ class Dashboard:
             "bad" if self.error or failed_result else "accent",
         )
         footer = (
-            "q keep resources | X release VM | s stop | Tab details | PgUp/PgDn | 10s refresh"
+            f"Action> {self.action_input or '_'}  Enter executes | q keep resources | X release VM | Tab details"
             if width >= 76
-            else "q keep | X release | s stop | Tab details"
+            else f"Action> {self.action_input or '_'} Enter | q keep | X release"
         )
+        if width < 40:
+            footer = "q keep | X release"
         self._write(screen, height - 1, 0, footer, width - 1, "muted")
         screen.refresh()
 
     def _action(self, screen: Any, key: str) -> None:
         if self.demo:
-            self.message = "Offline demo: action keys are disabled; Tab/PgDn explore the layout, q exits."
+            self.message = "Offline demo: action keys are disabled; Tab/PgDn explore, q + Enter exits."
             return
         if self.worker.busy and key in ("e", "n", "C", "m", "c", "f", "o"):
             self.message = "Wait for the worker before using interactive actions. q retains resources."
             return
-        if key in ("e", "n", "C", "m", "c", "f"):
-            operations = {
-                "e": self._select,
-                "n": lambda: self._new(False),
-                "C": lambda: self._new(True),
-                "m": self._mount,
-                "c": self._configure,
-            }
-            if key == "f":
-                self._terminal(screen, self._full_inputs)
-                self.worker.submit("pipeline", self.config)
+        self.error = ""
+        if key == "e":
+            if self.worker.submit("sessions", self.config):
+                self.message = "Loading named sessions for in-screen selection."
+        elif key in ("n", "C"):
+            self._new(key == "C")
+        elif key in ("c", "f"):
+            try:
+                ask = lambda prompt: self._prompt(screen, prompt)
+                if key == "f":
+                    self._full_inputs(ask)
+                    if not self.config.ephemeral:
+                        self.message = "Drive authorization requires the provider terminal/browser; returning to the TUI afterward."
+                        self._terminal(screen, self._mount)
+                    self.worker.submit("pipeline", self.config)
+                else:
+                    self._configure(ask)
+                    self.message = "Settings updated in memory."
+            finally:
+                if screen is not None:
+                    curses.flushinp()
+        elif key == "m":
+            if self.config.ephemeral:
+                self._mount()
             else:
-                self._terminal(screen, operations[key])
-                self.last_refresh = 0.0
+                self.message = "Drive authorization uses the provider terminal/browser, then returns here."
+                self._terminal(screen, self._mount)
         elif key == "o":
             url = self._url()
             if not isinstance(url, str) or not (
@@ -1473,6 +1706,47 @@ class Dashboard:
                 else:
                     self.message = "A manual action is running or already queued; no additional action was submitted."
 
+    def _key(self, screen: Any, key: str) -> bool:
+        """Typing never executes an action. Enter submits exactly one command."""
+        if key == "\t":
+            self.show_menu = not self.show_menu
+            self.progress_page = 0
+        elif key in ("KEY_NPAGE", "KEY_PPAGE"):
+            self.progress_page += 1 if key == "KEY_NPAGE" else -1
+        elif key == "\x1b":
+            self.action_input = ""
+        elif key in ("KEY_BACKSPACE", "\b", "\x7f"):
+            self.action_input = self.action_input[:-1]
+        elif key in ("\n", "\r", "KEY_ENTER"):
+            action, self.action_input = self.action_input, ""
+            if action == "q":
+                return False
+            if action:
+                if action not in dict(MENU):
+                    raise DashboardError(
+                        "Enter one action code from the menu; Esc clears input."
+                    )
+                self._action(screen, action)
+        elif len(key) == 1 and key.isprintable() and len(self.action_input) < 8:
+            self.action_input += key
+        return True
+
+    def _session_form(self, screen: Any) -> None:
+        if self.pending_sessions is None or self.worker.busy:
+            return
+        rows, self.pending_sessions = self.pending_sessions, None
+        self.action_input = ""
+        try:
+            self._select(screen, rows)
+        except FormCancelled as exc:
+            self.message = str(exc)
+        except DashboardError as exc:
+            self.error = safe_error(exc)
+        finally:
+            self.action_input = ""
+            if screen is not None:
+                curses.flushinp()
+
     def run(self, screen: Any) -> None:
         self.theme.initialize()
         try:
@@ -1484,6 +1758,7 @@ class Dashboard:
         try:
             while True:
                 self._events(screen)
+                self._session_form(screen)
                 now = time.monotonic()
                 if (
                     self.config.session
@@ -1497,17 +1772,11 @@ class Dashboard:
                     key = screen.getkey()
                 except curses.error:
                     continue
-                if key == "q":
-                    break
-                if key == "\t":
-                    self.show_menu = not self.show_menu
-                    self.progress_page = 0
-                    continue
-                if key in ("KEY_NPAGE", "KEY_PPAGE"):
-                    self.progress_page += 1 if key == "KEY_NPAGE" else -1
-                    continue
                 try:
-                    self._action(screen, key)
+                    if not self._key(screen, key):
+                        break
+                except FormCancelled as exc:
+                    self.message = str(exc)
                 except (DashboardError, ValueError, EOFError) as exc:
                     self.error = safe_error(exc)
         except curses.error:
@@ -1548,6 +1817,7 @@ class Dashboard:
         try:
             while True:
                 self._events(None)
+                self._session_form(None)
                 now = time.monotonic()
                 if (
                     self.config.session
@@ -1570,12 +1840,16 @@ class Dashboard:
                 if not ready:
                     continue
                 line = sys.stdin.readline()
-                if not line or line.strip() == "q":
+                if not line:
                     break
                 key = line.strip()
                 if key:
                     try:
-                        self._action(None, key)
+                        self.action_input = key
+                        if not self._key(None, "\n"):
+                            break
+                    except FormCancelled as exc:
+                        self.message = str(exc)
                     except (DashboardError, ValueError, EOFError) as exc:
                         self.error = safe_error(exc)
         finally:

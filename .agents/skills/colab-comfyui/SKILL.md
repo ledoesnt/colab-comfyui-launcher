@@ -32,7 +32,7 @@ For persistent assets, run the official mount command in a terminal that support
 colab --auth=oauth2 drivemount -s "$SESSION" /content/drive
 ```
 
-When the provider requests consent, including for a new runtime, let the user complete it through the displayed provider UI; do not simulate consent or replace it with an unrelated Drive connector. Do not request another human action when the provider already accepts existing consent. Do not scan the user's Drive. The launcher uses only `/content/drive/MyDrive/colab-comfyui` or the dedicated directory the user specifies. If mounting is blocked, report it and use `--ephemeral` only with the user's acceptance of temporary assets.
+When the provider requests consent, including for a new runtime, let the user complete it through the displayed provider UI; do not simulate consent or replace it with an unrelated Drive connector. Do not request another human action when the provider already accepts existing consent. Do not scan the user's Drive. The dashboard defaults to the dedicated `/content/drive/MyDrive/colab-comfyui-launcher-test` directory; honor another dedicated directory the user specifies. If mounting is blocked, report it and use `--ephemeral` only with the user's acceptance of temporary assets.
 
 Deploy and start the background installation from the local repository:
 
@@ -46,7 +46,15 @@ Installation being started is not installation being ready. Poll `status` with s
 
 The bootstrap fixes the ComfyUI source commit and cloudflared version/checksum, and reuses the Colab torch environment. Its remaining dependencies depend on the Colab image and package resolution. Record the actual installed versions; do not describe this as a fully locked environment.
 
-For a person who wants interactive operation, run `python3 scripts/dashboard.py`. It can select/create one session and perform the full startup pipeline with colored status cards and per-file progress. Provider OAuth pauses curses and remains in the real terminal. `Tab` shows more progress; `q` exits the UI while retaining resources, and `X` releases the selected VM. `--demo` previews fixture data entirely offline and disables resource/browser actions; never treat its status as live evidence. `--demo-state prepare|ready|error` previews those states. `--no-color`/`NO_COLOR` disable colors, and unsupported terminals use a plain fallback. An agent can use the same bounded bridge commands without driving the TUI.
+For a person who wants interactive operation, run `python3 scripts/dashboard.py`. Every action requires one case-sensitive code followed by Enter; typing a letter alone does nothing. `n` + Enter creates G4, `C` + Enter creates CPU, `e` + Enter selects a named session, and `c` + Enter configures storage/access/SSH. These inputs, ordinary creation and release stay inside the TUI. In the full-screen UI, Esc clears unsubmitted action input or cancels the current form, Backspace edits input, Enter submits form values, and blank Enter keeps a shown default or cancels session selection. Tab and PgUp/PgDn navigate directly without Enter.
+
+A new VM reporting `deployment.status: not_deployed` is ready but has no launcher code. Use `d` + Enter to deploy or `f` + Enter for full startup; creating a VM and checking that state do not depend on Drive. Historical installation or service records without runtime code are not proof of readiness. For a CPU-only PNG/network run, configure Storage `ephemeral` and CPU mode `yes`, then use `f` + Enter; this skips Drive and H3 preparation.
+
+The full startup pipeline confirms settings in-screen, mounts persistent Drive storage when needed, deploys, installs and waits, prepares local H3 models only for GPU, starts services, and starts SSH for local-only mode. It shows colored status cards and per-file progress. Drive authorization remains interactive in the real provider terminal/browser: `m` + Enter or the pipeline's mount step temporarily leaves curses and returns afterward. Do not substitute an in-screen text field for this authorization.
+
+`h` + Enter starts SSH forwarding; uppercase `H` + Enter stops it. `s` + Enter stops forwarding and services while retaining the VM; uppercase `X` + Enter releases the selected VM. `q` + Enter exits the UI while retaining remote resources and forwarding. The worker serializes commands, and a cleanup action requested during pipeline waits is queued for that pipeline's original session. Do not claim that typing a code already performed an action. An agent can use the same bounded bridge commands without driving the TUI.
+
+`--demo` previews fixture data entirely offline and disables resource/browser actions; never treat its status as live evidence. `--demo-state prepare|ready|error` previews those states. Demo allows navigation and `q` + Enter to exit. `--no-color`/`NO_COLOR` disable colors; unsupported terminals use a plain fallback accepting an action code and Enter.
 
 ## Prepare models on VM disk
 
@@ -61,7 +69,7 @@ python3 scripts/colabctl.py -s "$SESSION" status
 
 Wait for `model_prepare.running: false`, `model_prepare.status: succeeded`, `model_prepare.result.ok: true`, and `models_ready: true`. Per-file download/copy/hash progress appears in `model_prepare.progress`. Existing legacy Drive models are verified during copy without a separate initial Drive hash. Within the same VM, verified receipts and unchanged metadata avoid reading all model bytes again. These metadata receipts are a trusted private-cache optimization, not fresh content hashing or protection against a same-account attacker. A new VM still copies and verifies all 40 GB. Add `--verify-cache` only when an explicit extra Drive content audit is needed. No cross-VM distributed writer lock is provided: use one writer per Drive cache.
 
-CPU `--ephemeral --cpu` network/PNG tests do not require H3 preparation. Code, dependencies, model loading and progress records remain on VM disk; output files remain under the selected Drive storage root.
+CPU `--ephemeral --cpu` network/PNG tests do not require H3 preparation or Drive. Code, dependencies, model loading and progress records remain on VM disk. Persistent runs save output files under the selected Drive storage root; ephemeral output survives only while that VM is retained.
 
 ## Start and verify
 

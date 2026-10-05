@@ -199,6 +199,30 @@ def install(payload):
 
 def runtime_result(payload, timeout=50):
     script = '/content/colab-comfyui-launcher/scripts/runtime.py'
+    if not Path(script).is_file():
+        services_record = Path('/content/colab-comfyui-runtime/services.json')
+        if payload['action'] == 'status':
+            unknown_services = services_record.exists()
+            unknown_installation = unknown_services or Path('/content/colab-comfyui-runtime/install.json').exists()
+            return {
+                'ok': True, 'deployed': False,
+                'deployment': {'status': 'not_deployed'},
+                'installation': {'status': 'unknown' if unknown_installation else 'not_started',
+                                 'phase': 'deployment_missing'},
+                'comfyui_alive': None if unknown_services else False,
+                'tunnel_alive': None if unknown_services else False,
+                'http_ready': None if unknown_services else False,
+                'models_ready': False, 'url': None,
+                'runtime': {'python': sys.version.split()[0]},
+                'drive': {'mounted': os.path.ismount('/content/drive'), 'path': '/content/drive'},
+                'next': 'Session exists; deploy the launcher before installation or service actions.',
+            }
+        if payload['action'] == 'stop' and not services_record.exists():
+            return {'ok': True, 'status': 'not_deployed', 'deployed': False,
+                    'runtime_still_running': True, 'cleanup_skipped': True}
+        if payload['action'] == 'stop':
+            raise RuntimeError('Existing service state cannot be cleaned without its runtime script; deploy the launcher first.')
+        raise RuntimeError('Deploy the launcher before this service action.')
     executable = '/content/colab-comfyui-runtime/.venv/bin/python'
     if payload['action'] in ('status', 'stop') and not Path(executable).is_file():
         executable = sys.executable
@@ -235,6 +259,8 @@ def runtime_result(payload, timeout=50):
     if completed.returncode != 0 or result.get('ok') is not True:
         raise RuntimeError(redact(str(result.get('error', 'Runtime action failed.'))
                                   + ': ' + str(result.get('message', ''))))
+    result['deployed'] = True
+    result['deployment'] = {'status': 'deployed'}
     return result
 
 def process_stamp(pid):
@@ -425,7 +451,7 @@ def runtime_action(payload):
         result['model_download'] = background_status('download')
         result['model_prepare'] = background_status('prepare')
         result['render'] = background_status('render')
-    elif payload['action'] == 'stop':
+    elif payload['action'] == 'stop' and result.get('deployed') is not False:
         atomic_json(Path('/content/colab-comfyui-runtime/start-result.json'),
                     {'ok': True, 'status': 'stopped'})
     return result

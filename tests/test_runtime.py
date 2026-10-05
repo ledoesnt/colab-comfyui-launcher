@@ -446,6 +446,7 @@ class BridgeResultTests(unittest.TestCase):
             stderr="",
         )
         with (
+            mock.patch.object(namespace["Path"], "is_file", return_value=True),
             mock.patch.object(namespace["subprocess"], "run", return_value=result),
             self.assertRaisesRegex(RuntimeError, "Runtime rejected"),
         ):
@@ -463,7 +464,12 @@ class BridgeResultTests(unittest.TestCase):
                 with (
                     self.subTest(installed=installed, action=action),
                     mock.patch.object(
-                        namespace["Path"], "is_file", return_value=installed
+                        namespace["Path"],
+                        "is_file",
+                        autospec=True,
+                        side_effect=lambda path, installed=installed: (
+                            str(path).endswith("/scripts/runtime.py") or installed
+                        ),
                     ),
                     mock.patch.object(
                         namespace["subprocess"], "run", return_value=result
