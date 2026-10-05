@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Own only this launcher's processes; keep assets on Drive and code on VM disk."""
+"""Load verified models from VM disk; persist input/output assets on Drive."""
 
 import argparse
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -137,11 +138,55 @@ def storage_root(args):
     return root
 
 
+def local_models_ready():
+    """Check local verification receipts without rereading multi-GB weights."""
+    helper = Path(__file__).with_name("prepare_models.py")
+    manifest = Path(__file__).resolve().parents[1] / "models/h3.json"
+    if not helper.is_file():
+        return False
+    try:
+        spec = importlib.util.spec_from_file_location("launcher_prepare", helper)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return bool(module.local_cache_ready(BASE / "models", manifest))
+    except (OSError, ValueError, RuntimeError, AttributeError):
+        return False
+
+
+def hardware_info():
+    result = {
+        "python": sys.version.split()[0],
+        "gpu_name": None,
+        "gpu_memory_mib": None,
+    }
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if completed.returncode == 0 and completed.stdout.strip():
+            name, memory = completed.stdout.strip().splitlines()[0].rsplit(",", 1)
+            result.update(gpu_name=name.strip(), gpu_memory_mib=int(memory.strip()))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return result
+
+
 def start(args):
     public = getattr(args, "public", False)
-    if bool(public) == bool(args.allowed_email):
-        raise ValueError("Choose exactly one of --public or --allowed-email")
-    if not public and not re.fullmatch(
+    local_only = getattr(args, "local_only", False)
+    if sum(bool(value) for value in (public, args.allowed_email, local_only)) != 1:
+        raise ValueError(
+            "Choose exactly one of --public, --allowed-email or --local-only"
+        )
+    if args.allowed_email and not re.fullmatch(
         r"[^\s@,]+@[^\s@,]+\.[^\s@,]+", args.allowed_email or ""
     ):
         raise ValueError("--allowed-email must be one explicit mailbox")
@@ -159,8 +204,16 @@ def start(args):
             "Port 8188 already has a server; do not reuse an unowned server"
         )
     root = storage_root(args)
+    model_root = BASE / "models"
+    if model_root.is_symlink():
+        raise ValueError("Local models directory must not be a symlink")
+    model_root.mkdir(parents=True, exist_ok=True)
+    if not args.cpu and not local_models_ready():
+        raise RuntimeError(
+            "Local H3 models are not prepared; run prepare before starting GPU services"
+        )
     # JSON is valid YAML; prevent values from being interpreted as YAML syntax.
-    paths = {"launcher": {"base_path": str(root / "models"), "is_default": True}}
+    paths = {"launcher": {"base_path": str(model_root), "is_default": True}}
     for category in (
         "diffusion_models",
         "text_encoders",
@@ -169,7 +222,9 @@ def start(args):
         "loras",
         "clip_vision",
     ):
-        (root / "models" / category).mkdir(exist_ok=True)
+        if (model_root / category).is_symlink():
+            raise ValueError("Local model categories must not be symlinks")
+        (model_root / category).mkdir(exist_ok=True)
         paths["launcher"][category] = category
     config = BASE / "model-paths.yaml"
     config.write_text(json.dumps(paths))
@@ -177,8 +232,15 @@ def start(args):
         "storage_root": str(root),
         "ephemeral": args.ephemeral,
         "started_at": time.time(),
-        "access_mode": "public" if public else "email",
+        "access_mode": "local" if local_only else ("public" if public else "email"),
+        "local_models_root": str(model_root),
+        "model_loading": "local_disk",
+        "startup_request_id": getattr(args, "request_id", None) or uuid.uuid4().hex,
     }
+    progress = BASE / "startup-progress.json"
+    write_json(
+        progress, {"status": "starting", "phase": "comfyui", "updated_at": time.time()}
+    )
     comfy = [
         str(BASE / ".venv/bin/python"),
         str(BASE / "ComfyUI/main.py"),
@@ -214,6 +276,23 @@ def start(args):
             time.sleep(1)
         if not alive(state["comfyui"]):
             raise RuntimeError("Owned ComfyUI exited during readiness")
+        if local_only:
+            write_json(
+                progress,
+                {"status": "ready", "phase": "local_only", "updated_at": time.time()},
+            )
+            return {
+                "ok": True,
+                "status": "started",
+                "url": None,
+                "storage_root": str(root),
+                "local_models_root": str(model_root),
+                "access_mode": "local",
+            }
+        write_json(
+            progress,
+            {"status": "starting", "phase": "cloudflare", "updated_at": time.time()},
+        )
         log = BASE / "logs/cloudflared.log"
         log.write_text("")
         tunnel = [
@@ -240,11 +319,20 @@ def start(args):
                     )
                 state["url"] = matches[-1]
                 write_json(STATE, state)
+                write_json(
+                    progress,
+                    {
+                        "status": "ready",
+                        "phase": "cloudflare",
+                        "updated_at": time.time(),
+                    },
+                )
                 return {
                     "ok": True,
                     "status": "started",
                     "url": state["url"],
                     "storage_root": str(root),
+                    "local_models_root": str(model_root),
                     "access_mode": state["access_mode"],
                 }
             if not alive(state["cloudflared"]):
@@ -257,6 +345,10 @@ def start(args):
         kill_owned(state.get("comfyui"))
         state["status"] = "failed"
         write_json(STATE, state)
+        write_json(
+            progress,
+            {"status": "failed", "phase": "startup", "updated_at": time.time()},
+        )
         raise
 
 
@@ -271,16 +363,35 @@ def status(_args):
         "url": state.get("url"),
         "storage_root": state.get("storage_root"),
         "access_mode": state.get("access_mode"),
+        "local_models_root": state.get("local_models_root", str(BASE / "models")),
+        "models_ready": local_models_ready(),
+        "model_loading": state.get("model_loading"),
+        "runtime": hardware_info(),
+        "drive": {
+            "mounted": os.path.ismount("/content/drive"),
+            "path": "/content/drive",
+        },
     }
 
 
 def stop(_args):
     state = read_json(STATE)
+    request_id = getattr(_args, "request_id", None)
+    if request_id and state.get("startup_request_id") != request_id:
+        return {
+            "ok": True,
+            "status": "cleanup_skipped",
+            "reason": "Different startup request owns these services",
+        }
     kill_owned(state.get("cloudflared"))
     kill_owned(state.get("comfyui"))
     state.pop("url", None)
     state["status"] = "stopped"
     write_json(STATE, state)
+    write_json(
+        BASE / "startup-progress.json",
+        {"status": "stopped", "phase": "stopped", "updated_at": time.time()},
+    )
     return {"ok": True, "status": "stopped", "runtime_still_running": True}
 
 
@@ -373,10 +484,18 @@ def main():
     access.add_argument(
         "--public", action="store_true", help="Explicitly expose a temporary public URL"
     )
+    access.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Use SSH forwarding; do not start Cloudflare",
+    )
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--request-id", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.action == "start" and not (args.public or args.allowed_email):
-        parser.error("start requires --public or --allowed-email")
+    if args.action == "start" and not (
+        args.public or args.allowed_email or args.local_only
+    ):
+        parser.error("start requires --public, --allowed-email or --local-only")
     BASE.mkdir(exist_ok=True)
     (BASE / "logs").mkdir(exist_ok=True)
     try:

@@ -109,6 +109,96 @@ class ModelDownloadTests(unittest.TestCase):
         )
         self.assertIsNone(request.get_header("Range"))
 
+    def test_fresh_download_hashes_stream_without_re_reading_drive_model(self):
+        self.response(DATA)
+        with mock.patch.object(
+            downloader, "hash_file", side_effect=AssertionError("No second file read")
+        ):
+            result = self.download()
+        self.assertEqual(result["verification"], "stream_sha256")
+        self.assertTrue((self.root / downloader.RECEIPT_NAME).is_file())
+
+    def test_verified_receipt_skips_content_read_but_explicit_verify_re_reads(self):
+        self.final.write_bytes(DATA)
+        self.assertEqual(self.download()["verification"], "full_sha256")
+        with mock.patch.object(
+            downloader, "hash_file", wraps=downloader.hash_file
+        ) as hashing:
+            self.assertEqual(
+                self.download()["verification"], "verified_receipt_metadata"
+            )
+            hashing.assert_not_called()
+            downloader.download_file(
+                self.root,
+                "Fixture-Org/Fixture-Model",
+                "a" * 40,
+                self.item,
+                downloader.Deadline(10),
+                verify_cache=True,
+            )
+            self.assertEqual(hashing.call_count, 1)
+
+    def test_changed_metadata_invalidates_receipt_and_corruption_is_preserved(self):
+        self.final.write_bytes(DATA)
+        self.download()
+        self.final.write_bytes(b"X" * len(DATA))
+        with self.assertRaisesRegex(downloader.DownloadError, "not overwritten"):
+            self.download()
+        self.assertEqual(self.final.read_bytes(), b"X" * len(DATA))
+
+    def test_receipt_cannot_transfer_to_a_different_manifest_revision(self):
+        self.final.write_bytes(DATA)
+        self.download()
+        changed = downloader.Receipts(self.root, "Fixture-Org/Fixture-Model", "b" * 40)
+        self.assertFalse(changed.matches(self.final, self.item))
+
+    def test_corrupt_or_symlinked_receipts_never_authorize_skip(self):
+        self.final.write_bytes(DATA)
+        receipt = self.root / downloader.RECEIPT_NAME
+        receipt.write_text("not json")
+        self.assertEqual(self.download()["verification"], "full_sha256")
+        receipt.unlink()
+        receipt.symlink_to(self.final)
+        with self.assertRaisesRegex(downloader.DownloadError, "symlinks"):
+            self.download()
+
+    def test_resume_reads_only_the_existing_prefix_once(self):
+        self.partial.write_bytes(DATA[:11])
+        self.response(
+            DATA[11:], 206, {"Content-Range": f"bytes 11-{len(DATA) - 1}/{len(DATA)}"}
+        )
+        with mock.patch.object(
+            downloader, "hash_file", wraps=downloader.hash_file
+        ) as hashing:
+            self.assertEqual(self.download()["verification"], "stream_sha256")
+        self.assertEqual(hashing.call_count, 1)
+        self.assertEqual(hashing.call_args.args[-1], 11)
+
+    def test_progress_is_local_atomic_throttled_and_records_failure(self):
+        progress = downloader.Progress(None, "download", [self.item])
+        with mock.patch.object(
+            downloader, "atomic_json", wraps=downloader.atomic_json
+        ) as writes:
+            progress.update(self.item, "download", 1)
+            progress.update(self.item, "download", 2)
+            self.assertEqual(writes.call_count, 1)
+            progress.finish(False)
+        snapshot = json.loads(progress.path.read_text())
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["files"][0]["done_bytes"], 2)
+        self.assertEqual(snapshot["phase"], "download")
+        self.assertFalse(list(progress.root.glob("*.tmp-*")))
+
+    def test_progress_and_model_root_symlinks_are_rejected_before_writes(self):
+        with self.assertRaises(downloader.DownloadError):
+            downloader.Progress(
+                self.drive / "MyDrive" / "progress.json", "download", [self.item]
+            )
+        link = self.content / "linked-root"
+        link.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(downloader.DownloadError, "symlinks"):
+            downloader.models_root(link, True)
+
     def test_206_resumes_exact_range(self):
         offset = 11
         self.partial.write_bytes(DATA[:offset])

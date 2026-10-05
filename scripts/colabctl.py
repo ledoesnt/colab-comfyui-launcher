@@ -115,6 +115,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 import zipfile
 
 def redact(text):
@@ -141,7 +142,7 @@ def deploy(payload):
     if destination.is_symlink():
         raise RuntimeError('Deployment directory must not be a symlink.')
     destination.mkdir(parents=True, exist_ok=True)
-    allowed = re.compile(r'(?:scripts/(?:bootstrap\\.sh|runtime\\.py|download_models\\.py|render_workflow\\.py)|(?:models|workflows)/[^/]+\\.json)')
+    allowed = re.compile(r'(?:scripts/(?:bootstrap\\.sh|runtime\\.py|download_models\\.py|prepare_models\\.py|render_workflow\\.py)|(?:models|workflows)/[^/]+\\.json)')
     with zipfile.ZipFile(archive) as bundle:
         members = bundle.infolist()
         names = [member.filename for member in members]
@@ -202,12 +203,16 @@ def runtime_result(payload, timeout=50):
     if payload['action'] in ('status', 'stop') and not Path(executable).is_file():
         executable = sys.executable
     arguments = [executable, script, payload['action']]
+    if payload.get('request_id'):
+        arguments.extend(['--request-id', payload['request_id']])
     if payload['action'] == 'start':
         if payload['ephemeral']:
             arguments.append('--ephemeral')
         else:
             arguments.extend(['--storage-root', payload['storage_root']])
-        if payload.get('public', False):
+        if payload.get('local_only', False):
+            arguments.append('--local-only')
+        elif payload.get('public', False):
             arguments.append('--public')
         else:
             arguments.extend(['--allowed-email', payload['allowed_email']])
@@ -241,7 +246,22 @@ def process_stamp(pid):
 
 def read_startup():
     path = Path('/content/colab-comfyui-runtime/start-result.json')
-    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
+    result = json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
+    if isinstance(result, dict):
+        result['progress'] = read_progress('startup-progress.json')
+    return result
+
+def read_progress(filename):
+    path = Path('/content/colab-comfyui-runtime') / filename
+    try:
+        if not path.is_file():
+            return None
+        if path.stat().st_size > 65536:
+            return {'status': 'unreadable', 'error': 'Progress record exceeds size limit.'}
+        value = json.loads(path.read_text(encoding='utf-8'))
+        return safe_result(value) if isinstance(value, dict) else {'status': 'unreadable'}
+    except (OSError, ValueError):
+        return {'status': 'unreadable'}
 
 def safe_result(value):
     if isinstance(value, dict):
@@ -251,7 +271,7 @@ def safe_result(value):
     return redact(value) if isinstance(value, str) else value
 
 def background_paths(action):
-    name = {'download': 'model-download', 'render': 'render'}[action]
+    name = {'download': 'model-download', 'prepare': 'model-prepare', 'render': 'render'}[action]
     state = Path('/content/colab-comfyui-runtime')
     return state, state / (name + '-process.json'), state / (name + '-result.json'), name
 
@@ -265,14 +285,15 @@ def background_status(action):
     if not running and status == 'starting':
         status = 'interrupted'
         result = {'ok': False, 'status': status, 'error': 'Controller exited without a verified final result.'}
-    return {'running': running, 'status': status, 'result': safe_result(result)}
+    progress_name = {'download': 'model-progress.json', 'prepare': 'prepare-progress.json', 'render': 'render-progress.json'}[action]
+    return {'running': running, 'status': status, 'result': safe_result(result), 'progress': read_progress(progress_name)}
 
 def background_arguments(payload):
     action = payload['action']
     state, process_path, result_path, name = background_paths(action)
     source = Path('/content/colab-comfyui-launcher/scripts')
-    executable = sys.executable if action == 'download' else '/content/colab-comfyui-runtime/.venv/bin/python'
-    script = source / ('download_models.py' if action == 'download' else 'render_workflow.py')
+    executable = sys.executable if action in ('download', 'prepare') else '/content/colab-comfyui-runtime/.venv/bin/python'
+    script = source / {'download': 'download_models.py', 'prepare': 'prepare_models.py', 'render': 'render_workflow.py'}[action]
     if not script.is_file() or not Path(executable).is_file():
         raise RuntimeError('Deploy and install required scripts before starting this task.')
     arguments = [str(executable), str(script), '--max-seconds', str(payload['max_seconds'])]
@@ -281,6 +302,15 @@ def background_arguments(payload):
             arguments.extend(['--models-root', payload['models_root']])
         if payload.get('ephemeral'):
             arguments.append('--ephemeral')
+        if payload.get('verify_cache'):
+            arguments.append('--verify-cache')
+    elif action == 'prepare':
+        if payload.get('cache_root'):
+            arguments.extend(['--cache-root', payload['cache_root']])
+        if payload.get('verify_cache'):
+            arguments.append('--verify-cache')
+        if payload.get('download_missing'):
+            arguments.append('--download-missing')
     else:
         arguments.extend(['--workflow', '/content/colab-comfyui-launcher/workflows/h3-api.json',
                           '--result-file', str(state / 'render-progress.json')])
@@ -299,6 +329,8 @@ def run_background(payload):
                     'task': payload['action']}
         background_arguments(payload)
         atomic_json(result_path, {'ok': True, 'status': 'starting', 'deadline_seconds': payload['max_seconds']})
+        progress_name = {'download': 'model-progress.json', 'prepare': 'prepare-progress.json', 'render': 'render-progress.json'}[payload['action']]
+        atomic_json(state / progress_name, {'status': 'starting', 'phase': 'queued', 'files': []})
         with (logs / (name + '.log')).open('a', encoding='utf-8') as log:
             process = subprocess.Popen(
                 [sys.executable, '-c', BACKGROUND_SUPERVISOR, json.dumps(payload)],
@@ -344,7 +376,9 @@ def start_service(payload):
             return {'ok': True, 'status': 'starting', 'already_running': True}
         if not (state / '.venv/bin/python').is_file():
             raise RuntimeError('Installation must be ready before starting services.')
-        atomic_json(state / 'start-result.json', {'ok': True, 'status': 'starting'})
+        payload = dict(payload, request_id=uuid.uuid4().hex)
+        atomic_json(state / 'start-result.json', {'ok': True, 'status': 'starting', 'request_id': payload['request_id']})
+        atomic_json(state / 'startup-progress.json', {'status': 'starting', 'phase': 'queued', 'updated_at': time.time()})
         with (logs / 'start.log').open('a', encoding='utf-8') as log:
             process = subprocess.Popen(
                 [sys.executable, '-c', START_SUPERVISOR, json.dumps(payload)],
@@ -383,11 +417,13 @@ def runtime_action(payload):
     if payload['action'] == 'stop':
         stop_startup()
         stop_background('download')
+        stop_background('prepare')
         stop_background('render')
     result = runtime_result(payload)
     if payload['action'] == 'status':
         result['startup'] = read_startup()
         result['model_download'] = background_status('download')
+        result['model_prepare'] = background_status('prepare')
         result['render'] = background_status('render')
     elif payload['action'] == 'stop':
         atomic_json(Path('/content/colab-comfyui-runtime/start-result.json'),
@@ -408,7 +444,8 @@ try:
 except Exception as error:
     result = {'ok': False, 'status': 'failed', 'error': redact(str(error))}
     try:
-        runtime_result({'action': 'stop'}, timeout=20)
+        # Refusing a duplicate start must preserve services from an older request.
+        runtime_result({'action': 'stop', 'request_id': payload['request_id']}, timeout=20)
     except Exception:
         pass
 atomic_json(Path('/content/colab-comfyui-runtime/start-result.json'), result)
@@ -453,7 +490,7 @@ try:
         result = deploy(payload)
     elif payload['action'] == 'install':
         result = install(payload)
-    elif payload['action'] in ('download', 'render'):
+    elif payload['action'] in ('download', 'prepare', 'render'):
         result = run_background(payload)
     else:
         result = runtime_action(payload)
@@ -500,6 +537,7 @@ def build_archive(destination: Path) -> str:
         PROJECT_ROOT / "scripts/bootstrap.sh",
         PROJECT_ROOT / "scripts/runtime.py",
         PROJECT_ROOT / "scripts/download_models.py",
+        PROJECT_ROOT / "scripts/prepare_models.py",
         PROJECT_ROOT / "scripts/render_workflow.py",
     ]
     files.extend(sorted((PROJECT_ROOT / "models").glob("*.json")))
@@ -601,6 +639,11 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly expose this temporary UI publicly",
     )
+    access.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Run ComfyUI for SSH forwarding without Cloudflare",
+    )
     start.add_argument("--cpu", action="store_true", help="Explicit CPU mode")
     download = actions.add_parser(
         "download", help="Start bounded background downloads of pinned H3 models"
@@ -608,6 +651,26 @@ def parser() -> argparse.ArgumentParser:
     download.add_argument("--max-seconds", type=positive_seconds, default=1800.0)
     download.add_argument("--models-root", help="Absolute models directory on runtime")
     download.add_argument("--ephemeral", action="store_true")
+    download.add_argument(
+        "--verify-cache",
+        action="store_true",
+        help="Rehash existing Drive files instead of using verified metadata receipts",
+    )
+    prepare = actions.add_parser(
+        "prepare", help="Copy Drive models to VM disk and verify them during the copy"
+    )
+    prepare.add_argument("--max-seconds", type=positive_seconds, default=1800.0)
+    prepare.add_argument("--cache-root", help="Absolute Drive models cache directory")
+    prepare.add_argument(
+        "--verify-cache",
+        action="store_true",
+        help="Also rehash the Drive source before copying",
+    )
+    prepare.add_argument(
+        "--download-missing",
+        action="store_true",
+        help="Download missing pinned files into Drive before copying; existing cache is verified during copy",
+    )
     render = actions.add_parser(
         "render", help="Start bounded execution of the deployed H3 API workflow"
     )
@@ -629,17 +692,28 @@ def main(argv: list[str] | None = None) -> int:
     payload: dict[str, Any] = {"action": arguments.action}
     if arguments.action == "install":
         payload["install_timeout"] = arguments.install_timeout
-    elif arguments.action in ("download", "render"):
+    elif arguments.action in ("download", "prepare", "render"):
         payload["max_seconds"] = arguments.max_seconds
         if arguments.action == "download":
             if arguments.models_root and not arguments.models_root.startswith("/"):
                 print("Models root must be an absolute runtime path.", file=sys.stderr)
                 return 2
             payload.update(
-                models_root=arguments.models_root, ephemeral=arguments.ephemeral
+                models_root=arguments.models_root,
+                ephemeral=arguments.ephemeral,
+                verify_cache=arguments.verify_cache,
+            )
+        elif arguments.action == "prepare":
+            if arguments.cache_root and not arguments.cache_root.startswith("/"):
+                print("Cache root must be an absolute runtime path.", file=sys.stderr)
+                return 2
+            payload.update(
+                cache_root=arguments.cache_root,
+                verify_cache=arguments.verify_cache,
+                download_missing=arguments.download_missing,
             )
     elif arguments.action == "start":
-        if not arguments.public and not re.fullmatch(
+        if arguments.allowed_email and not re.fullmatch(
             r"[^\s@]+@[^\s@]+\.[^\s@]+", arguments.allowed_email
         ):
             print("Allowed email must be a valid email address.", file=sys.stderr)
@@ -652,6 +726,7 @@ def main(argv: list[str] | None = None) -> int:
             ephemeral=arguments.ephemeral,
             allowed_email=arguments.allowed_email,
             public=arguments.public,
+            local_only=arguments.local_only,
             cpu=arguments.cpu,
         )
     try:

@@ -24,6 +24,7 @@ def load_script(name):
 
 runtime = load_script("runtime")
 bridge = load_script("colabctl")
+real_port_free = runtime.port_free
 
 
 class RuntimeSafetyTests(unittest.TestCase):
@@ -35,6 +36,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         patches = [
             mock.patch.object(runtime, "BASE", self.base),
             mock.patch.object(runtime, "STATE", self.base / "services.json"),
+            mock.patch.object(runtime, "port_free", return_value=True),
         ]
         for patch in patches:
             patch.start()
@@ -175,6 +177,40 @@ class RuntimeSafetyTests(unittest.TestCase):
         spawn.assert_not_called()
         kill.assert_not_called()
 
+    def test_failed_start_scoped_cleanup_preserves_previous_services(self):
+        old = {
+            "startup_request_id": "previous-request",
+            "access_mode": "public",
+            "comfyui": {"pid": 12345, "start_ticks": "owned"},
+        }
+        runtime.write_json(runtime.STATE, old)
+        self.args.request_id = "new-request"
+        with mock.patch.object(runtime, "kill_owned") as kill:
+            result = runtime.stop(self.args)
+        self.assertEqual(result["status"], "cleanup_skipped")
+        self.assertEqual(runtime.read_json(runtime.STATE), old)
+        kill.assert_not_called()
+
+    def test_scoped_cleanup_stops_only_matching_startup_request(self):
+        comfy = {"pid": 12345, "start_ticks": "owned"}
+        runtime.write_json(
+            runtime.STATE, {"startup_request_id": "same-request", "comfyui": comfy}
+        )
+        self.args.request_id = "same-request"
+        with mock.patch.object(runtime, "kill_owned") as kill:
+            result = runtime.stop(self.args)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(kill.call_args_list, [mock.call(None), mock.call(comfy)])
+
+    def test_scoped_cleanup_never_stops_legacy_services_without_request_identity(self):
+        old = {"comfyui": {"pid": 12345, "start_ticks": "owned"}}
+        runtime.write_json(runtime.STATE, old)
+        self.args.request_id = "new-request"
+        with mock.patch.object(runtime, "kill_owned") as kill:
+            self.assertEqual(runtime.stop(self.args)["status"], "cleanup_skipped")
+        self.assertEqual(runtime.read_json(runtime.STATE), old)
+        kill.assert_not_called()
+
     def test_unowned_healthy_server_is_not_reused(self):
         with (
             mock.patch.object(runtime, "healthy", return_value=True),
@@ -195,6 +231,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             occupied.listen(1)
             with (
                 mock.patch.object(runtime, "healthy", return_value=False),
+                mock.patch.object(runtime, "port_free", side_effect=real_port_free),
                 mock.patch.object(runtime, "alive", return_value=False),
                 mock.patch.object(
                     runtime,
@@ -275,6 +312,36 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(result["access_mode"], "public")
         self.assertEqual(status["access_mode"], "public")
         self.assertEqual(runtime.read_json(runtime.STATE)["access_mode"], "public")
+
+    def test_local_only_uses_vm_models_without_spawning_cloudflare(self):
+        self.args.allowed_email = None
+        self.args.local_only = True
+        with (
+            mock.patch.object(runtime, "healthy", return_value=True),
+            mock.patch.object(runtime, "alive", side_effect=bool),
+            mock.patch.object(
+                runtime, "spawn", return_value={"pid": 12345, "start_ticks": "owned"}
+            ) as spawn,
+        ):
+            result = runtime.start(self.args)
+        self.assertEqual(spawn.call_count, 1)
+        self.assertEqual(result["access_mode"], "local")
+        self.assertIsNone(result["url"])
+        paths = json.loads((self.base / "model-paths.yaml").read_text())
+        self.assertEqual(paths["launcher"]["base_path"], str(self.base / "models"))
+        self.assertNotIn("ephemeral-assets", paths["launcher"]["base_path"])
+
+    def test_gpu_start_requires_verified_local_models(self):
+        self.args.cpu = False
+        with (
+            mock.patch.object(runtime, "healthy", return_value=False),
+            mock.patch.object(runtime, "port_free", return_value=True),
+            mock.patch.object(runtime, "local_models_ready", return_value=False),
+            mock.patch.object(runtime, "spawn") as spawn,
+            self.assertRaisesRegex(RuntimeError, "run prepare"),
+        ):
+            runtime.start(self.args)
+        spawn.assert_not_called()
 
     def test_access_mode_cannot_be_implicit_or_conflicting(self):
         for public, email in ((False, None), (True, "tester@example.com")):

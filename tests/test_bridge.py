@@ -30,7 +30,11 @@ class BackgroundBridgeTests(unittest.TestCase):
         self.namespace["BACKGROUND_SUPERVISOR"] = "trusted supervisor placeholder"
 
         def paths(action):
-            name = "model-download" if action == "download" else "render"
+            name = {
+                "download": "model-download",
+                "prepare": "model-prepare",
+                "render": "render",
+            }[action]
             return (
                 self.state,
                 self.state / f"{name}-process.json",
@@ -64,20 +68,78 @@ class BackgroundBridgeTests(unittest.TestCase):
         self.assertTrue(result["already_running"])
         spawn.assert_not_called()
 
-    def supervisor_body(self):
+    def supervisor_body(self, name="BACKGROUND_SUPERVISOR"):
         program = ast.parse(bridge.remote_program(self.payload))
         assignment = next(
             node
             for node in program.body
             if isinstance(node, ast.Assign)
             and any(
-                isinstance(target, ast.Name) and target.id == "BACKGROUND_SUPERVISOR"
+                isinstance(target, ast.Name) and target.id == name
                 for target in node.targets
             )
         )
         source = ast.literal_eval(assignment.value)
         self.assertTrue(source.startswith(bridge.REMOTE_HELPERS))
         return source[len(bridge.REMOTE_HELPERS) :]
+
+    def test_failed_start_cleanup_is_scoped_to_its_request(self):
+        payload = {"action": "start", "request_id": "new-start-request"}
+        results = []
+        runtime = mock.Mock(side_effect=[RuntimeError("Already running"), {"ok": True}])
+        with (
+            mock.patch.object(
+                self.namespace["sys"], "argv", ["controller", json.dumps(payload)]
+            ),
+            mock.patch.dict(
+                self.namespace,
+                runtime_result=runtime,
+                atomic_json=lambda path, value: results.append(value),
+            ),
+        ):
+            exec(self.supervisor_body("START_SUPERVISOR"), self.namespace)  # noqa: S102
+        self.assertFalse(results[0]["ok"])
+        self.assertEqual(
+            runtime.call_args_list,
+            [
+                mock.call(payload, timeout=210),
+                mock.call(
+                    {"action": "stop", "request_id": "new-start-request"}, timeout=20
+                ),
+            ],
+        )
+
+    def test_successful_start_supervisor_does_not_issue_cleanup(self):
+        payload = {"action": "start", "request_id": "new-start-request"}
+        results = []
+        runtime = mock.Mock(return_value={"ok": True, "status": "started"})
+        with (
+            mock.patch.object(
+                self.namespace["sys"], "argv", ["controller", json.dumps(payload)]
+            ),
+            mock.patch.dict(
+                self.namespace,
+                runtime_result=runtime,
+                atomic_json=lambda path, value: results.append(value),
+            ),
+        ):
+            exec(self.supervisor_body("START_SUPERVISOR"), self.namespace)  # noqa: S102
+        runtime.assert_called_once_with(payload, timeout=210)
+        self.assertTrue(results[0]["ok"])
+
+    def test_runtime_cleanup_request_identity_is_passed_to_child(self):
+        completed = subprocess.CompletedProcess(
+            ["runtime"], 0, stdout='{"ok": true}', stderr=""
+        )
+        with mock.patch.object(
+            self.namespace["subprocess"], "run", return_value=completed
+        ) as run:
+            self.namespace["runtime_result"](
+                {"action": "stop", "request_id": "new-start-request"}
+            )
+        self.assertEqual(
+            run.call_args.args[0][-2:], ["--request-id", "new-start-request"]
+        )
 
     def execute_supervisor(self, completed=None, error=None):
         with (
@@ -169,7 +231,7 @@ class BackgroundBridgeTests(unittest.TestCase):
         self.assertEqual(status["status"], "failed")
         self.assertNotIn("example.invalid", json.dumps(status))
 
-    def test_status_includes_both_background_tasks(self):
+    def test_status_includes_download_prepare_and_render(self):
         with mock.patch.dict(
             self.namespace,
             runtime_result=lambda payload: {"ok": True},
@@ -177,6 +239,7 @@ class BackgroundBridgeTests(unittest.TestCase):
         ):
             result = self.namespace["runtime_action"]({"action": "status"})
         self.assertEqual(result["model_download"]["status"], "not_started")
+        self.assertEqual(result["model_prepare"]["status"], "not_started")
         self.assertEqual(result["render"]["status"], "not_started")
 
     def test_stop_never_signals_reused_pid_and_stops_owned_group(self):
@@ -210,7 +273,9 @@ class BackgroundBridgeTests(unittest.TestCase):
             atomic_json=lambda path, value: None,
         ):
             self.namespace["runtime_action"]({"action": "stop"})
-        self.assertEqual(calls, ["startup", "download", "render", "services"])
+        self.assertEqual(
+            calls, ["startup", "download", "prepare", "render", "services"]
+        )
 
 
 class BackgroundArgumentsTests(unittest.TestCase):
@@ -285,6 +350,7 @@ class BackgroundArgumentsTests(unittest.TestCase):
                 "max_seconds": 120.0,
                 "models_root": "/content/dedicated/models",
                 "ephemeral": True,
+                "verify_cache": False,
             },
         )
 
@@ -303,6 +369,43 @@ class BackgroundArgumentsTests(unittest.TestCase):
             "/content/colab-comfyui-launcher/workflows/h3-api.json", arguments
         )
         self.assertIn("/content/colab-comfyui-runtime/.venv/bin/python", arguments)
+
+    def test_prepare_and_local_only_contracts(self):
+        with (
+            mock.patch.object(
+                bridge, "execute_remote", return_value={"ok": True}
+            ) as execute,
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(
+                bridge.main(
+                    [
+                        "-s",
+                        "owned",
+                        "prepare",
+                        "--cache-root",
+                        "/content/drive/MyDrive/cache/models",
+                        "--download-missing",
+                    ]
+                ),
+                0,
+            )
+        payload = execute.call_args.args[1]
+        self.assertTrue(payload["download_missing"])
+        namespace = {}
+        exec(bridge.REMOTE_HELPERS, namespace)  # noqa: S102
+        with mock.patch.object(namespace["Path"], "is_file", return_value=True):
+            arguments = namespace["background_arguments"](payload)
+        self.assertIn("--download-missing", arguments)
+        self.assertIn("/content/drive/MyDrive/cache/models", arguments)
+        with (
+            mock.patch.object(
+                bridge, "execute_remote", return_value={"ok": True}
+            ) as execute,
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(bridge.main(["-s", "owned", "start", "--local-only"]), 0)
+        self.assertTrue(execute.call_args.args[1]["local_only"])
 
 
 if __name__ == "__main__":

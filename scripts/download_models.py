@@ -16,12 +16,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path, PurePosixPath
 
 CONTENT_ROOT = Path("/content")
 DRIVE_MOUNT = CONTENT_ROOT / "drive"
 DEFAULT_MANIFEST = Path(__file__).resolve().parents[1] / "models" / "h3.json"
 CHUNK_BYTES = 4 * 1024 * 1024
+RECEIPT_NAME = ".verified-models.json"
 
 
 class DownloadError(Exception):
@@ -123,11 +125,11 @@ def models_root(path, ephemeral):
     drive = DRIVE_MOUNT.resolve()
     if ephemeral:
         root = (
-            Path(path).expanduser().resolve()
+            Path(path).expanduser().absolute()
             if path
             else (
                 CONTENT_ROOT / "colab-comfyui-runtime" / "ephemeral-assets" / "models"
-            ).resolve()
+            )
         )
         content = CONTENT_ROOT.resolve()
         if (
@@ -147,14 +149,21 @@ def models_root(path, ephemeral):
         if mydrive.is_symlink() or not mydrive.is_dir():
             raise DownloadError("Mounted Drive has no real MyDrive directory")
         root = (
-            Path(path).expanduser().resolve()
+            Path(path).expanduser().absolute()
             if path
-            else (mydrive / "colab-comfyui" / "models").resolve()
+            else (mydrive / "colab-comfyui" / "models")
         )
         if root == mydrive.resolve() or not root.is_relative_to(mydrive.resolve()):
             raise DownloadError(
                 "models-root must be a dedicated directory inside /content/drive/MyDrive"
             )
+    if ".." in root.parts:
+        raise DownloadError("Model root must not contain parent traversal")
+    for part in (root, *root.parents):
+        if part.is_symlink():
+            raise DownloadError("Model roots must not contain symlinks")
+        if part == CONTENT_ROOT:
+            break
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -181,17 +190,268 @@ def file_size(path):
     return info.st_size
 
 
-def verify_file(path, item, deadline):
-    if file_size(path) != item["size_bytes"]:
-        return False
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
+def file_identity(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise DownloadError("Model metadata is not a regular file")
+    return stat_identity(info)
+
+
+def stat_identity(info):
+    return {
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+    }
+
+
+def atomic_json(path, value, root, durable=True):
+    check_path(path, root)
+    temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
+    check_path(temporary, root)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False)
+            stream.flush()
+            if durable:
+                os.fsync(stream.fileno())
+        check_path(path, root)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class Progress:
+    """Throttled local snapshots; no per-chunk Drive metadata writes or fsync."""
+
+    def __init__(self, path, operation, items):
+        runtime = CONTENT_ROOT / "colab-comfyui-runtime"
+        self.path = (
+            Path(path)
+            if path
+            else runtime
+            / (
+                "model-progress.json"
+                if operation == "download"
+                else "prepare-progress.json"
+            )
+        )
+        if (
+            not self.path.is_absolute()
+            or self.path.parent != runtime
+            or self.path.suffix != ".json"
+        ):
+            raise DownloadError(
+                "Progress file must be a JSON file directly inside the dedicated runtime"
+            )
+        for part in (runtime, *runtime.parents):
+            if part.is_symlink():
+                raise DownloadError("Progress path must not contain symlinks")
+        runtime.mkdir(parents=True, exist_ok=True)
+        check_path(self.path, runtime)
+        self.root = runtime
+        self.started = time.monotonic()
+        self.updated = -math.inf
+        self.current_started = self.started
+        self.current_path = None
+        self.current_phase = None
+        self.phase_started = self.started
+        self.phase_base = 0
+        self.value = {
+            "version": 1,
+            "operation": operation,
+            "status": "running",
+            "files": [
+                {
+                    "path": item["path"],
+                    "phase": "pending",
+                    "status": "pending",
+                    "done_bytes": 0,
+                    "total_bytes": item["size_bytes"],
+                    "rate_bytes_per_second": 0,
+                    "elapsed_seconds": 0,
+                }
+                for item in items
+            ],
+        }
+
+    def update(self, item, phase, done, status="running", force=False):
+        now = time.monotonic()
+        if self.current_path != item["path"]:
+            self.current_started = now
+            self.current_path = item["path"]
+            self.current_phase = None
+            force = True
+        elapsed = now - self.current_started
+        entry = next(
+            value for value in self.value["files"] if value["path"] == item["path"]
+        )
+        if phase != self.current_phase:
+            self.current_phase = phase
+            self.phase_started = now
+            self.phase_base = done
+        phase_elapsed = now - self.phase_started
+        rate = (
+            entry["rate_bytes_per_second"]
+            if phase == "complete"
+            else (
+                round((done - self.phase_base) / phase_elapsed, 3)
+                if phase_elapsed > 0
+                else 0
+            )
+        )
+        entry.update(
+            phase=phase,
+            status=status,
+            done_bytes=done,
+            rate_bytes_per_second=rate,
+            elapsed_seconds=round(elapsed, 3),
+        )
+        self.value.update(
+            file=item["path"],
+            path=item["path"],
+            phase=phase,
+            done_bytes=done,
+            total_bytes=item["size_bytes"],
+            rate_bytes_per_second=entry["rate_bytes_per_second"],
+            elapsed_seconds=round(now - self.started, 3),
+        )
+        if force or now - self.updated >= 1:
+            atomic_json(self.path, self.value, self.root, durable=False)
+            self.updated = now
+
+    def finish(self, ok):
+        self.value["status"] = "succeeded" if ok else "failed"
+        if not ok:
+            for entry in self.value["files"]:
+                if entry["path"] == self.current_path and entry["status"] == "running":
+                    entry["status"] = "failed"
+        self.value["elapsed_seconds"] = round(time.monotonic() - self.started, 3)
+        atomic_json(self.path, self.value, self.root, durable=False)
+
+
+class Receipts:
+    """Prior full SHA verification plus current metadata, never a fresh SHA claim."""
+
+    def __init__(self, root, repo, revision, boot_id=None):
+        self.root, self.repo, self.revision, self.boot_id = (
+            root,
+            repo,
+            revision,
+            boot_id,
+        )
+        self.path = root / RECEIPT_NAME
+        check_path(self.path, root)
+        self.records = {}
+        if file_size(self.path) is not None:
+            if file_size(self.path) > 1024 * 1024:
+                raise DownloadError("Model receipt is unexpectedly large")
+            try:
+                with os.fdopen(
+                    os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW),
+                    "r",
+                    encoding="utf-8",
+                ) as stream:
+                    saved = json.load(stream)
+                if saved.get("version") == 1 and isinstance(saved.get("records"), dict):
+                    self.records = saved["records"]
+            except (ValueError, AttributeError):
+                # Invalid metadata cannot authorise a skip; re-hash the actual model.
+                pass
+
+    def key(self, item):
+        identity = [
+            self.repo,
+            self.revision,
+            item["path"],
+            item["size_bytes"],
+            item["sha256"],
+        ]
+        return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+    def matches(self, path, item):
+        check_path(path, self.root)
+        current = file_identity(path)
+        saved = self.records.get(self.key(item))
+        if (
+            not current
+            or current["size"] != item["size_bytes"]
+            or not isinstance(saved, dict)
+        ):
+            return False
+        if (
+            saved.get("sha256") != item["sha256"]
+            or saved.get("boot_id") != self.boot_id
+        ):
+            return False
+        metadata = (
+            current
+            if self.boot_id is not None
+            else {name: current[name] for name in ("size", "mtime_ns")}
+        )
+        return saved.get("stat") == metadata
+
+    def record(self, path, item, expected=None, source=None):
+        check_path(path, self.root)
+        current = file_identity(path)
+        if not current or current["size"] != item["size_bytes"]:
+            raise DownloadError("Verified model changed before receipt publication")
+        if expected is not None and current != expected:
+            raise DownloadError(
+                "Verified model metadata changed before receipt publication"
+            )
+        metadata = (
+            current
+            if self.boot_id is not None
+            else {name: current[name] for name in ("size", "mtime_ns")}
+        )
+        self.records[self.key(item)] = {
+            "sha256": item["sha256"],
+            "stat": metadata,
+            "boot_id": self.boot_id,
+            "verified_at": time.time(),
+        }
+        if source is not None:
+            self.records[self.key(item)]["source"] = source
+        atomic_json(self.path, {"version": 1, "records": self.records}, self.root)
+
+
+def hash_file(path, deadline, item, progress=None, total=None):
+    before = file_identity(path)
+    digest, done = hashlib.sha256(), 0
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise DownloadError("Model is not a regular file")
+        if before != stat_identity(os.fstat(stream.fileno())):
+            raise DownloadError("Model changed before hash verification")
+        if progress:
+            progress.update(item, "hash", 0, force=True)
         while True:
             deadline.remaining()
             chunk = stream.read(CHUNK_BYTES)
             if not chunk:
                 break
             digest.update(chunk)
+            done += len(chunk)
+            if progress:
+                progress.update(item, "hash", done)
+    if before != file_identity(path) or done != (before or {}).get("size"):
+        raise DownloadError("Model changed during hash verification")
+    if total is not None and done != total:
+        raise DownloadError("Partial changed before resumed download")
+    return digest
+
+
+def verify_file(path, item, deadline, progress=None):
+    if file_size(path) != item["size_bytes"]:
+        return False
+    digest = hash_file(path, deadline, item, progress)
     return digest.hexdigest() == item["sha256"]
 
 
@@ -212,17 +472,40 @@ def root_lock(root):
         yield
 
 
-def download_file(root, repo, revision, item, deadline):
+def download_file(
+    root,
+    repo,
+    revision,
+    item,
+    deadline,
+    receipts=None,
+    verify_cache=False,
+    progress=None,
+):
+    receipts = receipts or Receipts(root, repo, revision)
     final = root / item["path"]
     partial = final.with_name(final.name + ".partial")
     check_path(final, root)
     check_path(partial, root)
     if file_size(final) is not None:
-        if not verify_file(final, item, deadline):
-            raise DownloadError(
-                "Existing model failed size/SHA256 verification; it was not overwritten"
-            )
-        return {"path": item["path"], "status": "skipped", "bytes": item["size_bytes"]}
+        if not verify_cache and receipts.matches(final, item):
+            verification = "verified_receipt_metadata"
+        else:
+            before = file_identity(final)
+            if not verify_file(final, item, deadline, progress):
+                raise DownloadError(
+                    "Existing model failed size/SHA256 verification; it was not overwritten"
+                )
+            receipts.record(final, item, expected=before)
+            verification = "full_sha256"
+        if progress:
+            progress.update(item, "complete", item["size_bytes"], "skipped", force=True)
+        return {
+            "path": item["path"],
+            "status": "skipped",
+            "bytes": item["size_bytes"],
+            "verification": verification,
+        }
     offset = file_size(partial) or 0
     if offset > item["size_bytes"]:
         raise DownloadError("Partial file is longer than the pinned model size")
@@ -230,6 +513,7 @@ def download_file(root, repo, revision, item, deadline):
     check_path(final, root)
     check_path(partial, root)
     result_status = "resumed" if offset else "downloaded"
+    digest = None
     if offset < item["size_bytes"]:
         url = f"https://huggingface.co/{repo}/resolve/{revision}/{item['path']}"
         headers = {
@@ -244,6 +528,7 @@ def download_file(root, repo, revision, item, deadline):
                 request, timeout=min(30, deadline.remaining())
             )
         except urllib.error.HTTPError as error:
+            error.close()
             raise DownloadError(f"Model server returned HTTP {error.code}") from None
         except (urllib.error.URLError, OSError):
             raise DownloadError("Model server connection failed") from None
@@ -287,12 +572,26 @@ def download_file(root, repo, revision, item, deadline):
                 raise DownloadError(
                     "Response Content-Length does not match the pinned range"
                 )
+            # Resume hashes the retained prefix once; new bytes are hashed while
+            # downloading. A 200 restart never reads the discarded prefix.
+            digest = (
+                hash_file(partial, deadline, item, progress, offset)
+                if offset
+                else hashlib.sha256()
+            )
             check_path(partial, root)
             flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
             flags |= os.O_APPEND if offset else os.O_TRUNC
             fd = os.open(partial, flags, 0o600)
             received = 0
             with os.fdopen(fd, "ab" if offset else "wb") as stream:
+                if (
+                    not stat.S_ISREG(os.fstat(stream.fileno()).st_mode)
+                    or os.fstat(stream.fileno()).st_size != offset
+                ):
+                    raise DownloadError("Partial changed before download write")
+                if progress:
+                    progress.update(item, "download", offset, force=True)
                 while True:
                     deadline.remaining()
                     chunk = response.read(CHUNK_BYTES)
@@ -301,14 +600,22 @@ def download_file(root, repo, revision, item, deadline):
                     if received + len(chunk) > body_size:
                         raise DownloadError("Response body exceeds its pinned range")
                     stream.write(chunk)
+                    digest.update(chunk)
                     received += len(chunk)
+                    if progress:
+                        progress.update(item, "download", offset + received)
                 stream.flush()
                 os.fsync(stream.fileno())
+                written_identity = stat_identity(os.fstat(stream.fileno()))
+            if written_identity != file_identity(partial):
+                raise DownloadError("Partial changed during download")
             if received != body_size or offset + received != item["size_bytes"]:
                 raise DownloadError(
                     "Download was incomplete; partial file retained for resume"
                 )
-    if not verify_file(partial, item, deadline):
+    if digest is None:
+        digest = hash_file(partial, deadline, item, progress)
+    if file_size(partial) != item["size_bytes"] or digest.hexdigest() != item["sha256"]:
         raise DownloadError(
             "Partial file failed size/SHA256 verification; no model was published"
         )
@@ -320,20 +627,46 @@ def download_file(root, repo, revision, item, deadline):
             "Model appeared during download; existing file was not overwritten"
         )
     os.replace(partial, final)
-    return {"path": item["path"], "status": result_status, "bytes": item["size_bytes"]}
+    receipts.record(final, item)
+    if progress:
+        progress.update(item, "complete", item["size_bytes"], "succeeded", force=True)
+    return {
+        "path": item["path"],
+        "status": result_status,
+        "bytes": item["size_bytes"],
+        "verification": "stream_sha256"
+        if offset < item["size_bytes"]
+        else "full_sha256",
+    }
 
 
 def run(args):
     with time_budget(args.max_seconds) as deadline:
         manifest = load_manifest(args.manifest)
         root = models_root(args.models_root, args.ephemeral)
-        with root_lock(root):
-            results = [
-                download_file(
-                    root, manifest["repo_id"], manifest["revision"], item, deadline
-                )
-                for item in manifest["files"]
-            ]
+        progress = Progress(
+            getattr(args, "progress_file", None), "download", manifest["files"]
+        )
+        try:
+            with root_lock(root):
+                receipts = Receipts(root, manifest["repo_id"], manifest["revision"])
+                results = [
+                    download_file(
+                        root,
+                        manifest["repo_id"],
+                        manifest["revision"],
+                        item,
+                        deadline,
+                        receipts,
+                        getattr(args, "verify_cache", False),
+                        progress,
+                    )
+                    for item in manifest["files"]
+                ]
+            progress.finish(True)
+        except BaseException:
+            progress.finish(False)
+            raise
         return {
             "ok": True,
             "repo_id": manifest["repo_id"],
@@ -368,6 +701,16 @@ def main(argv=None):
         type=float,
         default=1800,
         help="Overall deadline including hash checks (default: 1800)",
+    )
+    parser.add_argument(
+        "--verify-cache",
+        action="store_true",
+        help="Re-read complete cached files and verify SHA256 instead of prior verified receipts",
+    )
+    parser.add_argument(
+        "--progress-file",
+        type=Path,
+        help="Local runtime progress JSON (default: model-progress.json)",
     )
     try:
         result = run(parser.parse_args(argv))

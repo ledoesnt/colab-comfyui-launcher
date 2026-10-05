@@ -4,7 +4,9 @@
 - Read README.md, docs/test-report.md and the relevant script before changing behavior. Distinguish executed tests from static configuration or mocked tests.
 - Use the existing checkout. Follow the user's existing hardware, access-mode and cleanup authorization; do not repeatedly ask for permissions already given.
 - Keep Drive and browser authentication interactive when the provider requires it. Never extract tokens/cookies or ask for OTPs in chat.
-- Preserve explicit `--public` / `--allowed-email` selection, process-start identity checks, bounded background tasks and dedicated storage directories.
+- Persist model caches on Drive, prepare verified regular files on VM disk, load ComfyUI models only from VM disk, and persist outputs to Drive. Do not restore direct Drive model loading.
+- Preserve explicit `--local-only` / `--public` / `--allowed-email` selection, process-start identity checks, bounded background tasks and dedicated storage directories. Dashboard quit retains resources; release is a separate action.
+- First preparation hashes while copying; same-VM metadata receipts avoid unnecessary rereads. Clearly distinguish receipt reuse from a new content hash, and retain the explicit full-cache audit option.
 - Cleanup only processes and Colab sessions created by this run or explicitly authorized by the user. Closing a terminal does not release a runtime.
 - Test locally with `python3 -m unittest discover -s tests -v` and `bash -n scripts/bootstrap.sh`. Tests must not allocate runtimes or use real credentials.
 - Never commit model weights, generated media, runtime files, private probes, logs, personal email values, credentials, OAuth URLs or virtual environments.

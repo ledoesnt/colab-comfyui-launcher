@@ -27,3 +27,6 @@ watchdog.*
 *.probe.py
 scripts/*_probe.py
 scripts/probe.py
+# SSH --state-dir overrides must never stage runtime endpoint credentials.
+**/proxy-session.json
+**/forward.json

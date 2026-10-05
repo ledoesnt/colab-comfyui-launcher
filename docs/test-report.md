@@ -2,6 +2,140 @@
 
 以下分轮保留真实执行证据；历史轮次中的“未执行”只描述当时状态，最新验收边界见后续记录。
 
+## 2026-10-05 新 G4 本地模型缓存、TUI 与 H3
+
+### Question / Goal
+
+验证 Drive 保存模型、新 VM 复制到本地并在复制时校验、ComfyUI 从本地加载、输出保存回 Drive。测量已有缓存准备与同 VM 复用，并实际操作终端界面的完整启动、状态和资源释放。
+
+### Environment
+
+独立 G4，实际 NVIDIA RTX PRO 6000 Blackwell Server Edition，97,887 MiB；Python 3.13.15、PyTorch 2.11.0+cu130，沿用固定 ComfyUI commit、模型 revision 和四文件清单。Drive 已有前轮完整下载的 40,073,842,159 字节缓存，仅使用专用测试目录。代码、依赖、进度和加载模型位于 VM 本地，input/output/user 位于 Drive。设置本会话 45 分钟关闭上限，完成后提前关闭。
+
+### Steps
+
+1. 新 G4 分配，用户完成 Drive 授权；首次等待授权导致 mount 超时，重试接受已有授权并实际挂载。修正的 bootstrap 在该新 G4 一次安装到 ready。
+2. 通过后台 `prepare --download-missing` 读取四个已有 Drive 文件，复制到 VM `.partial` 时同步完整 SHA256；大小与 hash 匹配后发布本地模型并写入 receipts。记录完成时间和逐文件进度。
+3. 同 VM 用新 Python 子进程再次运行 prepare，验证四文件均以 `verified_receipt_metadata` 跳过。另对本地 605,254,808 字节 audio VAE 进行完整 SHA256，匹配清单。使用 ComfyUI 的真实 `folder_paths` 与生成的 extra-path 配置，逐一确认四个文件解析到 `/content/colab-comfyui-runtime/models`。
+4. 在真实 TTY 操作 TUI `f`：配置、Drive 挂载、部署、安装等待、已在进行的模型准备等待、local-only 启动与 SSH 转发成功。安装/复制时自动更新阶段与模型进度，详情可翻页。
+5. 验收时发现旧界面自动刷新期间会丢弃手动按键；修正为允许排入一次操作。并加入 pipeline 等待时 `s`/`X` 取消后续协调、串行清理原会话，确定性测试覆盖准备等待中取消且不再 start。此中途取消行为没有在真实 40 GB 复制中注入故障测试。
+6. 确认之前 TUI 渲染按键没有提交任务后，通过 CLI **只提交一次**固定 H3 工作流。history 成功，检查 MP4 首音视频帧、元数据、API/Drive 大小与 hash。H3 渲染本轮经 CLI 验收，不声称经 TUI `r` 实测。
+7. 新 TUI 自动 status 运行时按 `X`，成功排队，关闭 SSH 和服务并调用官方 stop，返回 Session terminated；随后 sessions 无活跃会话，forward 的 listener/HTTP 为 false，取消仅属于本轮的 watchdog。
+8. G4 释放后，通过独立 Drive connector 获取实际新输出并下载到 Git 外，完整大小与 hash 一致；本地 PyAV 完整解码验证另列 Result。首次 streamed URL 下载返回 HTTP 403，新 fetch 返回的 stream 下载成功，没有转用 inline base64。
+
+### Commands
+
+以下为脱敏的实际操作接口；TUI `f` 包含相关后台命令及等待。复用/hash/path probes 仅用于测试，保存在 Git 外。
+
+```bash
+colab --auth=oauth2 new -s "$G4_SESSION" --gpu G4
+colab --auth=oauth2 drivemount -s "$G4_SESSION" /content/drive
+python3 scripts/colabctl.py -s "$G4_SESSION" deploy
+python3 scripts/colabctl.py -s "$G4_SESSION" install
+python3 scripts/colabctl.py -s "$G4_SESSION" prepare \
+  --download-missing --cache-root "$STORAGE_ROOT/models" --max-seconds 1800
+python3 scripts/dashboard.py -s "$G4_SESSION"
+# f：配置/挂载后执行完整流程，等待模型复制，local-only + SSH。
+python3 scripts/colabctl.py -s "$G4_SESSION" render --max-seconds 600
+python3 scripts/colabctl.py -s "$G4_SESSION" status
+# 新 TUI 中 X：停止转发、停止服务、释放该 VM。
+colab --auth=oauth2 sessions
+```
+
+### Result
+
+| 检查 | 本轮结果 |
+| --- | --- |
+| Drive → VM 复制与流式完整 SHA | 四文件共 40,073,842,159 字节；516.032 秒，全部 copied |
+| 同 VM 再次 prepare | 新 Python 子进程计时 0.055 秒；四文件元数据 receipts 匹配并跳过内容读取 |
+| 本地 audio VAE SHA | 605,254,808 字节，0.325 秒；完整 hash 匹配，暖缓存读 |
+| ComfyUI 模型来源 | 四个实际 folder_paths 解析均在 VM 本地模型根目录 |
+| TUI | 完整启动、自动状态、local-only SSH 及 `X` 排队释放实际通过；中途取消由离线测试验证 |
+| H3 作业 | API 渲染与输出验证共 58.662 秒；不是纯推理耗时 |
+| MP4 | 575,001 字节，H.264 864×480、124 帧、24 fps、5.166667 秒；AAC stereo 32,000 Hz、5.166688 秒 |
+| 输出完整性 | API / Drive hash 一致；停止 G4 后独立取回大小、完整 hash 一致 |
+| 停止后本地完整解码 | PyAV 19.0.1：124 个视频帧、162 个音频帧，均无解码错误 |
+| 资源 | 本轮 CPU 与 G4 已释放，SSH forward 已停止；未停止其他会话或删除 Drive 缓存 |
+
+新输出 SHA256 为 `df92b9467069520c7bb50df39b0e7f2350b6c90a9174cdc3cbd21eb49eaa2cf3`，工作流 SHA256 为 `07a30c993ba61426f6e2943652ebac0c90784d0ac779bad86dee158a64cd28a9`。与前轮固定 seed 输出恰好一致，不保证其他环境逐字节相同。
+
+### Known Limitations
+
+没有做完整 40 GB 的 Drive 与本地独立 hash 受控 A/B；小文件本地暖缓存读不能代表全部模型速度。本轮优化消除了复制前的额外 Drive 完整读取，不取消首次复制流中的 SHA。receipt 只证明先前校验与本次文件身份匹配，不能抵抗同账号恶意修改。新 VM 仍需读取和复制全部模型；Drive 性能没有时限保证。
+
+本轮缓存已经存在，没有真实触发新模型网络下载；缺失下载/HTTP 续传由离线测试与历史下载实测支持。没有比较 BF16 权重、最低显存、峰值显存或画面质量；不能用 58.662 与历史 99.251 秒声称确定的推理提速。浏览器 SSH / Cloudflare 对比单列，Chrome 拦截仍未解决。
+
+最终审查另以离线回归修正了旧服务健康掩盖新启动失败、失败 supervisor 清理旧请求服务、修改 SSH 端口遗漏原转发等边界。失败清理现在绑定本次 startup request 身份；显式用户 stop 继续关闭其 owned 服务。这些故障分支没有再次占用 GPU 验收。
+
+最终本机离线验收：188 项 unittest 全通过；固定 Ruff 0.16.0 的 isolated check / format、bootstrap Shell 语法、skill quick_validate、Markdown 链接/代码块与 git diff 检查均通过。主 Render 项目仅补实验文档，64 项 pytest、Ruff、mypy 全通过，接口未修改。
+
+### Architectural Decision
+
+Drive 作为持久模型缓存与资产存储，VM 本地磁盘作为本次运行的模型加载目录；复制与完整 SHA 共用一次读取流，同 VM 用严格文件身份 receipts 复用。终端界面协调已有基础设施命令，默认 SSH loopback，Cloudflare 仍需显式选择。本启动器与主项目的 Application / Domain、RenderWorker / StorageBackend 契约保持独立。
+
+## 2026-10-05 同一 CPU 的 SSH / Cloudflare 对比
+
+### Question / Goal
+
+对同一个 ComfyUI 后台比较 SSH 本地转发和临时公开 Cloudflare 入口，确认 Logo 等待是否包含网络传输因素，并分别验收浏览器任务。此测试不下载模型、不挂载 Drive、不占用 GPU。
+
+### Environment
+
+独立 CPU，CLI 0.7.4、固定 ComfyUI commit 与 cloudflared 2026.9.3，使用已公开基线 `e798dc6`，保持官方响应压缩开启。显式 public / ephemeral / cpu。SSH helper 使用官方 WebSocket ProxyCommand 与 OpenSSH，监听本机 127.0.0.1:8188，专用 key/known_hosts 与进程归属记录保存在 Git 外。设本会话 20 分钟关闭上限。页面对比使用同一个 Codex IAB；另用本机 Chrome 检查 localhost。
+
+### Steps
+
+1. 新 CPU 一次安装成功，启动 ComfyUI 和公开入口，建立 SSH 转发；helper 同时确认 owned listener 与 ComfyUI HTTP 健康。
+2. 为两个 origin 分别打开新的 IAB 标签。SSH 在 47.209 秒观察到编辑器；Cloudflare 在 62.307 和 131.154 秒仍为 Logo，在 206.242 秒观察到编辑器。它们是轮询观察的上界，不能当成精确首次可交互时间。
+3. 同机进行两轮短 HTTP 诊断，再进行两轮较暖的请求；完整读取 gzip 正文，记录状态、大小与时间。两条链路收到相同节点信息内容，均为 HTTP 200。
+4. 两个页面均通过 Ctrl+O 导入 smoke-ui、Run、Completed 和 Gallery 图片预览。Cloudflare 第二次提交复用了同后台已经计算的工作流，不能据此比较推理速度。
+5. DOM 观察到 128 个 modulepreload 链接。两页均记录过 `ComfyApp graph accessed before initialization`，所以不能用该消息单独归因 Cloudflare。
+6. Chrome 对新的 localhost 页面也返回 ERR_BLOCKED_BY_CLIENT；具体客户端设置/扩展原因未定位，没有关闭保护或绕过拦截。
+7. 显式停止 SSH 转发、启动器服务和该 CPU；CLI 确认 Session terminated，再移除属于它的 watchdog。没有停止其他会话。
+
+### Commands
+
+以下为脱敏复现示例；临时 URL、runtime 身份和认证状态不进入 Git。
+
+```bash
+colab --auth=oauth2 new -s "$CPU_SESSION"
+python3 scripts/colabctl.py -s "$CPU_SESSION" deploy
+python3 scripts/colabctl.py -s "$CPU_SESSION" install
+python3 scripts/colabctl.py -s "$CPU_SESSION" status
+python3 scripts/colabctl.py -s "$CPU_SESSION" start --cpu --ephemeral --public
+python3 scripts/ssh_forward.py -s "$CPU_SESSION" start \
+  --identity "$HOME/.ssh/colab_comfyui_launcher" --create-key
+python3 scripts/ssh_forward.py -s "$CPU_SESSION" status
+# 分别在浏览器打开最新 status 的公网 URL 与 http://127.0.0.1:8188。
+# 两页分别导入 smoke-ui.json，Run，检查 Completed 与 Gallery。
+python3 scripts/ssh_forward.py -s "$CPU_SESSION" stop
+python3 scripts/colabctl.py -s "$CPU_SESSION" stop
+colab --auth=oauth2 stop -s "$CPU_SESSION"
+```
+
+### Result
+
+| 同一后台请求/操作 | SSH localhost | Cloudflare |
+| --- | --- | --- |
+| 首页 HTML，4 次完整读取 | 0.535–1.334 秒 | 2.972–3.465 秒 |
+| object_info，最初 2 次 | 1.437 / 2.039 秒 | 14.439 / 11.783 秒 |
+| object_info，随后 2 次 | 1.499 / 2.338 秒 | 6.856 / 7.741 秒 |
+| 入口 JS，2 次 | 0.556 / 0.782 秒 | 2.899 / 2.945 秒 |
+| 编辑器观察时间上界 | 47.209 秒 | 206.242 秒 |
+| 导入 / Run / Completed / 预览 | 通过 | 通过，第二次任务有缓存 |
+
+节点信息为 1,913,711 字节，gzip 正文 214,746 字节；入口 JS 为 3,234 字节，Cloudflare 压缩正文 1,750 字节。SSH forward 的 listener/HTTP 真实就绪检查通过，停止后两者均为 false。
+
+### Known Limitations
+
+这组结果确认本轮公网路径的响应延迟和大正文传输比 SSH 慢。页面还需要加载许多前端模块，延迟可以累积；这是基于请求时间和 DOM 的解释，不是逐请求的完整关键路径分析。测试含浏览器与诊断并发、不同 origin 缓存及后台工作流缓存，不能承诺其他网络上的固定倍数。CPU 没有 H3 或 Drive，因此这轮 Logo 等待不能归因于 H3 权重下载/校验。
+
+Chrome localhost 仍被客户端拦截；IAB 成功不证明该 Chrome profile 可用。具体拦截原因和邮箱模式登录仍未确诊。无需更换隧道就可以消除所有客户端问题的说法不成立。
+
+### Architectural Decision
+
+加入独立的 localhost SSH 转发与 TUI 访问选择，保留 Cloudflare 的显式公开/邮箱模式。默认 local-only 可减少本轮实测的公网链路开销；它仍经 Colab WebSocket 跨网。服务只监听 VM loopback，SSH 只监听本机 loopback；停止转发与释放 VM 是不同操作。供应商与连接方式继续仅属于基础设施工具。
+
 ## 2026-10-04 首轮 G4 / CPU（历史）
 
 ### Question / Goal
