@@ -1,6 +1,6 @@
-"""Local, standard-library dashboard. Type an action code, then press Enter.
+"""Local startup wizard, with an optional advanced command dashboard.
 
-Authentication stays in the real terminal. Nothing is written to a dashboard log.
+Provider authentication stays interactive inside a dedicated terminal.
 Quit retains remote resources; release explicitly stops only the selected VM.
 """
 
@@ -25,7 +25,7 @@ import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STORAGE = "/content/drive/MyDrive/colab-comfyui-launcher-test"
@@ -47,11 +47,13 @@ class FormCancelled(DashboardError):
 
 
 def safe_error(value: object) -> str:
+    if "WebSocketConnectionClosedException" in str(value):
+        return "Colab connection closed while checking this instance. Inspect its current state before continuing; no creation was retried."
     text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(value))
     text = re.sub(r"https?://\S+", "[URL removed]", text)
     text = re.sub(r"[^\s@]+@[^\s@]+\.[^\s@]+", "[email removed]", text)
     text = re.sub(
-        r"(?i)(?:access_token|refresh_token|authorization|bearer|code|token)[=: ]+\S+",
+        r"(?i)\b(?:access_token|refresh_token|authorization|code|token)[\"']?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)|\bbearer\s+\S+",
         "[credential removed]",
         text,
     )
@@ -73,6 +75,7 @@ class Config:
     identity: str = ""
     create_key: bool = False
     verify_cache: bool = False
+    gpu: str = "G4"
 
 
 def require_session(config: Config) -> None:
@@ -84,6 +87,24 @@ def require_session(config: Config) -> None:
         )
     ):
         raise DashboardError("Choose a valid session name first.")
+
+
+def services_ready(config: Config, status: dict[str, Any]) -> bool:
+    startup = status.get("startup") or {}
+    mode = "local" if config.access == "local-only" else config.access
+    return (
+        status.get("comfyui_alive") is True
+        and status.get("http_ready") is True
+        and status.get("access_mode") == mode
+        and startup.get("ok") is True
+        and startup.get("status") == "started"
+        and startup.get("access_mode") == mode
+        and (
+            status.get("tunnel_alive") is False
+            if config.access == "local-only"
+            else status.get("tunnel_alive") is True and bool(status.get("url"))
+        )
+    )
 
 
 class Backend:
@@ -147,24 +168,18 @@ class Backend:
             if config.cpu:
                 argv.append("--cpu")
         elif action == "download":
+            if config.ephemeral:
+                raise DashboardError(
+                    "Temporary GPU models download directly during preparation; use Full startup / Prepare instead of a separate cache download."
+                )
+            argv.extend(["--max-seconds", "1800"])
+            argv.extend(["--models-root", config.storage_root.rstrip("/") + "/models"])
+        elif action == "prepare":
             argv.extend(["--max-seconds", "1800"])
             argv.extend(
                 ["--ephemeral"]
                 if config.ephemeral
-                else ["--models-root", config.storage_root.rstrip("/") + "/models"]
-            )
-        elif action == "prepare":
-            if config.ephemeral:
-                raise DashboardError(
-                    "Model preparation needs a persistent Drive cache; disable ephemeral mode."
-                )
-            argv.extend(
-                [
-                    "--cache-root",
-                    config.storage_root.rstrip("/") + "/models",
-                    "--max-seconds",
-                    "1800",
-                ]
+                else ["--cache-root", config.storage_root.rstrip("/") + "/models"]
             )
             if config.verify_cache:
                 argv.append("--verify-cache")
@@ -258,7 +273,9 @@ class Backend:
         require_session(config)
         arguments = ["new", "-s", config.session]
         if not config.cpu:
-            arguments.extend(["--gpu", "G4"])
+            if config.gpu not in ("T4", "L4", "G4", "H100", "A100"):
+                raise DashboardError("Choose a GPU variant supported by this CLI.")
+            arguments.extend(["--gpu", config.gpu])
         output = self.official(arguments, timeout=300)
         if "Session READY." not in output:
             raise DashboardError(
@@ -271,6 +288,119 @@ class Backend:
                 "Created session could not be verified; inspect sessions before retrying."
             )
         return selected
+
+    def inspect(self, config: Config) -> dict[str, Any]:
+        """Read and restore known configuration, without creating/stopping anything."""
+        require_session(config)
+        rows = self.session_rows(self.official(["status", "-s", config.session]))
+        provider = next((row for row in rows if row["name"] == config.session), None)
+        if provider is None:
+            raise DashboardError("Selected session could not be verified.")
+        candidate = replace(
+            config,
+            cpu=provider["hardware"] == "CPU",
+            gpu=provider["hardware"] if provider["hardware"] != "CPU" else config.gpu,
+        )
+        status = self.bridge(candidate, "status")
+        saved = status.get("configuration") or {}
+        known = (
+            isinstance(saved, dict)
+            and type(saved.get("ephemeral")) is bool
+            and type(saved.get("cpu")) is bool
+        )
+        if known and not saved["ephemeral"]:
+            root = saved.get("storage_root")
+            if root is None:
+                known = False
+            elif (
+                not isinstance(root, str)
+                or Path("/content/drive/MyDrive") not in Path(root).parents
+                or ".." in Path(root).parts
+            ):
+                raise DashboardError(
+                    "Stored Drive directory is invalid; choose a dedicated Drive directory before restarting."
+                )
+        if known:
+            mode = saved.get("access_mode")
+            if mode not in ("local", "public", "email"):
+                raise DashboardError(
+                    "Stored access configuration is invalid; inspect this session before restarting."
+                )
+            candidate.ephemeral = saved["ephemeral"]
+            if type(saved.get("cpu")) is bool:
+                candidate.cpu = saved["cpu"]
+            candidate.access = "local-only" if mode == "local" else mode
+            if not candidate.ephemeral and isinstance(saved.get("storage_root"), str):
+                candidate.storage_root = saved["storage_root"]
+        if candidate.access == "local-only":
+            forward = self.ssh(candidate, "discover")
+            if forward.get("found") is True:
+                port = forward.get("local_port")
+                identity = forward.get("identity")
+                if (
+                    forward.get("session") != candidate.session
+                    or type(port) is not int
+                    or not 1024 <= port <= 65535
+                    or forward.get("remote_port") != 8188
+                    or not isinstance(identity, str)
+                    or not Path(identity).is_absolute()
+                    or any(character in identity for character in "\x00\r\n%$")
+                ):
+                    raise DashboardError(
+                        "Owned SSH settings are invalid; inspect before reconnecting."
+                    )
+                candidate = replace(
+                    candidate, local_port=port, identity=identity, create_key=False
+                )
+        ssh = self.ssh(candidate, "status")
+        ready = (
+            known
+            and services_ready(candidate, status)
+            and (
+                candidate.access != "local-only"
+                or (ssh.get("running") is True and ssh.get("http_ready") is True)
+            )
+        )
+        return {
+            "config": candidate,
+            "status": status,
+            "ssh": ssh,
+            "provider": provider,
+            "configuration_known": known,
+            "ready": ready,
+        }
+
+    @staticmethod
+    def account_terminal(
+        _config: Config, on_event: Callable[[dict[str, Any]], None]
+    ) -> Any:
+        from provider_terminal import ProviderTerminal
+
+        # Resolve interactive account login using a read-only operation, before
+        # issuing any allocation command whose outcome must never be retried.
+        return ProviderTerminal(
+            ["colab", "--auth=oauth2", "sessions"], on_event, timeout=650
+        )
+
+    @staticmethod
+    def provider_terminal(
+        config: Config, on_event: Callable[[dict[str, Any]], None]
+    ) -> Any:
+        from provider_terminal import ProviderTerminal
+
+        require_session(config)
+        return ProviderTerminal(
+            [
+                "colab",
+                "--auth=oauth2",
+                "drivemount",
+                "-s",
+                config.session,
+                "/content/drive",
+            ],
+            on_event,
+            timeout=650,
+        )
 
     def release(self, config: Config) -> None:
         require_session(config)
@@ -296,6 +426,8 @@ class Worker:
         self.active_action: str | None = None
         self.active_config: Config | None = None
         self.pending_action: str | None = None
+        self.auth_terminal: Any = None
+        self.account_checked = False
         self.thread = threading.Thread(
             target=self._loop, daemon=True, name="launcher-dashboard"
         )
@@ -308,7 +440,12 @@ class Worker:
             if self.busy:
                 if self.pending_action is not None:
                     return False
-                if self.active_action == "pipeline" and action in ("stop", "release"):
+                if self.active_action in (
+                    "pipeline",
+                    "wizard_create",
+                    "wizard_resume",
+                    "mount",
+                ) and action in ("stop", "release"):
                     # Cleanup uses the operation's original session/SSH settings.
                     if (
                         self.active_config is None
@@ -328,6 +465,203 @@ class Worker:
         # Do not issue cleanup or VM stop when the UI closes.
         self.cancelled.set()
         self.operation_cancelled.set()
+        if self.auth_terminal is not None:
+            self.auth_terminal.close()
+
+    def send_auth(self, text: str = "") -> bool:
+        terminal = self.auth_terminal
+        if terminal is None:
+            return False
+        return bool(terminal.respond(text))
+
+    def _provider_embedded(
+        self,
+        config: Config,
+        factory: Callable[[Config, Callable[[dict[str, Any]], None]], Any],
+        label: str,
+    ) -> None:
+        self._check_cancelled()
+        self.events.put(("stage", label))
+        completed = threading.Event()
+        accepting = threading.Event()
+        accepting.set()
+        callback_lock = threading.Lock()
+        outcome: dict[str, Any] = {}
+        auth = {
+            "url": None,
+            "text": label,
+            "waiting": False,
+            "needs_code": False,
+        }
+
+        def accept_event(event: dict[str, Any]) -> None:
+            if not accepting.is_set():
+                return
+            kind = event.get("kind") or event.get("type")
+            if kind == "finished":
+                outcome.update(event)
+                completed.set()
+            elif kind == "auth_url":
+                auth["url"] = event.get("url")
+                self.events.put(("auth", dict(auth)))
+            elif kind in ("confirm_required", "code_required"):
+                auth.update(
+                    text=event.get("text", "Complete authorization in your browser"),
+                    waiting=True,
+                    needs_code=kind == "code_required",
+                )
+                self.events.put(("auth", dict(auth)))
+            elif kind == "output":
+                auth["text"] = event.get("text", "")
+                pending = getattr(self.auth_terminal, "pending", None)
+                auth.update(
+                    waiting=pending in ("confirm", "code"), needs_code=pending == "code"
+                )
+                self.events.put(("auth", dict(auth)))
+
+        def on_event(event: dict[str, Any]) -> None:
+            with callback_lock:
+                accept_event(event)
+
+        terminal = factory(config, on_event)
+        self.auth_terminal = terminal
+        try:
+            terminal.start()
+            while not completed.wait(0.2):
+                self._check_cancelled()
+            self._check_cancelled()
+            if (
+                outcome.get("returncode") != 0
+                or outcome.get("timed_out")
+                or outcome.get("cancelled")
+            ):
+                raise DashboardError(
+                    "Provider authorization did not complete; inspect or retry this authorization step."
+                )
+        finally:
+            with callback_lock:
+                accepting.clear()
+            terminal.close()
+            terminal.join(2)
+            auth.clear()
+            self.auth_terminal = None
+            self.events.put(("auth_clear", None))
+
+    def _ensure_account(self, config: Config) -> None:
+        if not self.account_checked:
+            self._provider_embedded(
+                config, self.backend.account_terminal, "checking Google account login"
+            )
+            self.account_checked = True
+
+    def _mount_embedded(self, config: Config) -> None:
+        if config.ephemeral:
+            return
+        current_drive = self._status(config).get("drive") or {}
+        if (
+            current_drive.get("mounted") is True
+            and current_drive.get("mydrive_ready") is True
+        ):
+            return
+        self._provider_embedded(
+            config, self.backend.provider_terminal, "authorizing Google Drive"
+        )
+        drive = self._status(config).get("drive") or {}
+        if drive.get("mounted") is not True or drive.get("mydrive_ready") is not True:
+            raise DashboardError(
+                "Provider command ended but Drive is not mounted; complete authorization and explicitly retry."
+            )
+        self.events.put(
+            ("notice", "Google Drive and MyDrive were verified. Continuing startup.")
+        )
+
+    def _smart_pipeline(self, config: Config) -> None:
+        self.events.put(("stage", "checking current runtime state"))
+        status = self._status(config)
+        saved = status.get("configuration") or {}
+        if (
+            saved
+            and (
+                saved.get("ephemeral") != config.ephemeral
+                or (
+                    not config.ephemeral
+                    and saved.get("storage_root") != config.storage_root
+                )
+                or saved.get("access_mode")
+                != ("local" if config.access == "local-only" else config.access)
+            )
+            and status.get("comfyui_alive") is True
+        ):
+            raise DashboardError(
+                "Existing services use different storage/access settings. Stop them explicitly before reconfiguring."
+            )
+        self._mount_embedded(config)
+        if status.get("deployed") is not True:
+            self._check_cancelled()
+            self.events.put(("stage", "deploying launcher"))
+            self.backend.bridge(config, "deploy")
+            status = self._status(config)
+        install = status.get("installation") or {}
+        if install.get("status") != "ready":
+            if install.get("status") == "unknown":
+                raise DashboardError(
+                    "Installation state is unknown; inspect this session before restarting installation."
+                )
+            if install.get("status") not in ("installing", "starting", "running"):
+                self._check_cancelled()
+                self.events.put(("stage", "installing ComfyUI environment"))
+                self.backend.bridge(config, "install")
+            self.events.put(("stage", "waiting for installation"))
+            status = self._wait(config, "installation", 960)
+        if not config.cpu and status.get("models_ready") is not True:
+            task = status.get("model_prepare") or {}
+            if not task.get("running"):
+                if task.get("status") in ("unknown", "interrupted"):
+                    raise DashboardError(
+                        "Model preparation state is uncertain; inspect this session before restarting it."
+                    )
+                self._check_cancelled()
+                self.events.put(
+                    (
+                        "stage",
+                        "downloading models to VM"
+                        if config.ephemeral
+                        else "preparing local models from Drive cache",
+                    )
+                )
+                self.backend.bridge(config, "prepare", download_missing=True)
+            else:
+                self.events.put(
+                    ("stage", "waiting for existing local model preparation")
+                )
+            status = self._wait(config, "model_prepare", 1860)
+        if not services_ready(config, status):
+            startup = status.get("startup") or {}
+            if (
+                status.get("comfyui_alive") is True
+                and startup.get("status") != "starting"
+            ):
+                raise DashboardError(
+                    "An existing service is not ready for this configuration; inspect or stop it before restarting."
+                )
+            if startup.get("status") != "starting":
+                self._check_cancelled()
+                self.events.put(("stage", "starting ComfyUI"))
+                self.backend.bridge(config, "start")
+            status = self._wait(config, "startup", 300)
+        if config.access == "local-only":
+            self._check_cancelled()
+            self.events.put(("stage", "connecting local SSH"))
+            ssh = self.backend.ssh(config, "status")
+            if not (ssh.get("running") is True and ssh.get("http_ready") is True):
+                self._check_cancelled()
+                ssh = self.backend.ssh(config, "start")
+            if not (ssh.get("running") is True and ssh.get("http_ready") is True):
+                raise DashboardError(
+                    "SSH forwarding was not verified ready; inspect the selected connection."
+                )
+            self.events.put(("ssh", ssh))
+        self.events.put(("notice", "ComfyUI is ready."))
 
     def _check_cancelled(self) -> None:
         if self.cancelled.is_set():
@@ -340,8 +674,30 @@ class Worker:
             )
 
     def _status(self, config: Config) -> dict[str, Any]:
-        self._check_cancelled()
-        status = self.backend.bridge(config, "status")
+        for attempt in range(3):
+            self._check_cancelled()
+            try:
+                status = self.backend.bridge(config, "status")
+                break
+            except DashboardError as exc:
+                if attempt == 2 or not any(
+                    marker in str(exc)
+                    for marker in (
+                        "WebSocketConnectionClosedException",
+                        "Colab connection closed while checking",
+                        "Local Colab command timed out",
+                        "Command timed out; its remote outcome is unknown",
+                    )
+                ):
+                    raise
+                self.events.put(
+                    (
+                        "notice",
+                        "Colab connection interrupted; checking the same runtime again. No startup command was repeated.",
+                    )
+                )
+                if self.operation_cancelled.wait(1):
+                    self._check_cancelled()
         self.events.put(("status", status))
         return status
 
@@ -375,7 +731,12 @@ class Worker:
             if stage == "installation":
                 done = value.get("status") == "ready"
             elif stage == "model_prepare":
-                done = value.get("status") == "succeeded" and not value.get("running")
+                done = (
+                    value.get("status") == "succeeded"
+                    and value.get("running") is False
+                    and result.get("ok") is True
+                    and status.get("models_ready") is True
+                )
             else:
                 supervisor_ready = (
                     value.get("ok") is True and value.get("status") == "started"
@@ -466,7 +827,20 @@ class Worker:
             try:
                 self._check_cancelled()
                 self.events.put(("stage", action))
-                if action == "pipeline":
+                if action in ("wizard_create", "wizard_resume", "inspect", "sessions"):
+                    self._ensure_account(config)
+                    self._check_cancelled()
+                if action in ("wizard_create", "wizard_resume"):
+                    if action == "wizard_create":
+                        self.events.put(("stage", "creating and verifying runtime"))
+                        provider = self.backend.create(config)
+                        self.events.put(("session", (config, provider)))
+                    self._smart_pipeline(config)
+                elif action == "inspect":
+                    self.events.put(("inspection", self.backend.inspect(config)))
+                elif action == "mount":
+                    self._mount_embedded(config)
+                elif action == "pipeline":
                     self._pipeline(config)
                 elif action == "sessions":
                     self.events.put(("sessions", self.backend.sessions()))
@@ -620,6 +994,7 @@ class DemoBackend:
                 "rate_bytes_per_second": 72 * 1024**2
                 if fraction not in (0, 1) and not ready
                 else 0,
+                "verification": "stream_sha256" if ready or fraction == 1 else None,
             }
             for path, size, fraction in files
         ]
@@ -630,7 +1005,11 @@ class DemoBackend:
                 "gpu_memory_mib": 97887,
                 "python": "3.13.15",
             },
-            "drive": {"mounted": True, "path": "/content/drive"},
+            "drive": {
+                "mounted": True,
+                "mydrive_ready": True,
+                "path": "/content/drive",
+            },
             "installation": {"status": "ready", "phase": "dependency_check"},
             "comfyui_alive": ready,
             "http_ready": ready,
@@ -701,7 +1080,13 @@ def clip_cells(value: object, width: int) -> str:
 
 
 class Theme:
-    """Orange/cyan accents with readable monochrome and basic-color fallbacks."""
+    """ComfyUI/Colab brand palette with monochrome/basic-color fallbacks."""
+
+    BRAND: ClassVar[dict[str, str]] = {
+        "comfy": "#F2FF59",
+        "title": "#E77012",
+        "accent": "#F9AA00",
+    }
 
     def __init__(self, color: bool = True):
         self.color = color
@@ -713,6 +1098,8 @@ class Theme:
             "bad": curses.A_BOLD,
             "muted": curses.A_DIM,
             "normal": curses.A_NORMAL,
+            "comfy": curses.A_BOLD,
+            "input": curses.A_BOLD,
         }
         self.unicode = "utf" in (sys.stdout.encoding or "").lower()
 
@@ -730,13 +1117,30 @@ class Theme:
             except curses.error:
                 pass
             extended = curses.COLORS >= 256
+            if extended and curses.can_change_color():
+                for slot, value in (
+                    (229, self.BRAND["comfy"]),
+                    (208, self.BRAND["title"]),
+                    (214, self.BRAND["accent"]),
+                ):
+                    rgb = tuple(
+                        round(int(value[index : index + 2], 16) * 1000 / 255)
+                        for index in (1, 3, 5)
+                    )
+                    try:
+                        curses.init_color(slot, *rgb)
+                    except curses.error:
+                        pass
             colors = [
                 ("title", 208 if extended else curses.COLOR_YELLOW),
-                ("accent", 81 if extended else curses.COLOR_CYAN),
-                ("good", 114 if extended else curses.COLOR_GREEN),
+                ("accent", 214 if extended else curses.COLOR_YELLOW),
+                ("good", 229 if extended else curses.COLOR_GREEN),
                 ("warn", 214 if extended else curses.COLOR_YELLOW),
                 ("bad", 203 if extended else curses.COLOR_RED),
                 ("muted", 245 if extended else curses.COLOR_WHITE),
+                ("normal", 252 if extended else curses.COLOR_WHITE),
+                ("comfy", 229 if extended else curses.COLOR_YELLOW),
+                ("input", 255 if extended else curses.COLOR_WHITE),
             ]
             for pair, (role, foreground) in enumerate(colors, 1):
                 curses.init_pair(pair, foreground, background)
@@ -1057,10 +1461,6 @@ class Dashboard:
     def _full_inputs(self, ask: Callable[[str], str] | None = None) -> None:
         require_session(self.config)
         self._configure(ask)
-        if self.config.ephemeral and not self.config.cpu:
-            raise DashboardError(
-                "Full H3 startup requires a Drive model cache; ephemeral mode is for CPU smoke testing."
-            )
         if not self.config.ephemeral:
             root = Path(self.config.storage_root)
             mydrive = Path("/content/drive/MyDrive")
@@ -1877,7 +2277,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--ephemeral",
         action="store_true",
-        help="Explicit VM-local assets for disposable CPU smoke tests",
+        help="Explicit VM-local models/assets, without Drive persistence",
+    )
+    parser.add_argument(
+        "--gpu", default="G4", choices=("G4", "H100", "A100", "L4", "T4")
+    )
+    parser.add_argument(
+        "--classic", action="store_true", help="Open the advanced action-code dashboard"
     )
     parser.add_argument(
         "--demo",
@@ -1904,8 +2310,35 @@ def main(argv: list[str] | None = None) -> int:
         storage_root=args.storage_root,
         cpu=args.cpu,
         ephemeral=args.ephemeral,
+        gpu=args.gpu,
     )
     backend = DemoBackend(args.demo_state) if args.demo else Backend()
+    if not args.classic:
+        sys.modules.setdefault("dashboard", sys.modules[__name__])
+        if str(ROOT / "scripts") not in sys.path:
+            sys.path.insert(0, str(ROOT / "scripts"))
+        from wizard import Wizard
+
+        wizard = Wizard(config, backend)
+        wizard.theme = Theme(color=not args.no_color)
+        try:
+            if not interactive:
+                print(wizard.snapshot())
+            elif os.environ.get("TERM", "dumb") == "dumb":
+                wizard.plain()
+            else:
+                try:
+                    curses.wrapper(wizard.run)
+                except curses.error:
+                    wizard.plain()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            wizard.worker.close()
+        print(
+            "Wizard closed. Any retained VM, services and SSH forwarding remain running."
+        )
+        return 0
     dashboard = Dashboard(config, backend)
     dashboard.theme = Theme(color=not args.no_color)
     if args.demo:

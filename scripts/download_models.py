@@ -276,12 +276,15 @@ class Progress:
                     "total_bytes": item["size_bytes"],
                     "rate_bytes_per_second": 0,
                     "elapsed_seconds": 0,
+                    "verification": None,
                 }
                 for item in items
             ],
         }
 
-    def update(self, item, phase, done, status="running", force=False):
+    def update(
+        self, item, phase, done, status="running", force=False, verification=None
+    ):
         now = time.monotonic()
         if self.current_path != item["path"]:
             self.current_started = now
@@ -313,6 +316,10 @@ class Progress:
             rate_bytes_per_second=rate,
             elapsed_seconds=round(elapsed, 3),
         )
+        if verification is not None:
+            entry["verification"] = verification
+        elif phase != "complete":
+            entry["verification"] = None
         self.value.update(
             file=item["path"],
             path=item["path"],
@@ -499,7 +506,14 @@ def download_file(
             receipts.record(final, item, expected=before)
             verification = "full_sha256"
         if progress:
-            progress.update(item, "complete", item["size_bytes"], "skipped", force=True)
+            progress.update(
+                item,
+                "complete",
+                item["size_bytes"],
+                "skipped",
+                force=True,
+                verification=verification,
+            )
         return {
             "path": item["path"],
             "status": "skipped",
@@ -629,7 +643,16 @@ def download_file(
     os.replace(partial, final)
     receipts.record(final, item)
     if progress:
-        progress.update(item, "complete", item["size_bytes"], "succeeded", force=True)
+        progress.update(
+            item,
+            "complete",
+            item["size_bytes"],
+            "succeeded",
+            force=True,
+            verification="stream_sha256"
+            if offset < item["size_bytes"]
+            else "full_sha256",
+        )
     return {
         "path": item["path"],
         "status": result_status,

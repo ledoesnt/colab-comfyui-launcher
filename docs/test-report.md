@@ -1,6 +1,61 @@
 # 实测记录
 
-以下分轮保留真实执行证据；历史轮次中的“未执行”只描述当时状态，最新验收边界见后续记录。
+以下分轮保留真实执行证据；最新验收见首节，历史轮次中的“未执行”只描述当时状态。
+
+## 2026-10-05 启动向导、屏内授权与两条真实 G4 存储流程
+
+### Question / Goal
+
+按已确认的流程改为上下选择、Enter 确认的完整启动向导：新建或已有实例 → GPU/CPU → GPU 型号 → Drive 或临时 VM 磁盘 → 摘要 → 授权 → 安装与逐模型准备 → ComfyUI 与 SSH → 就绪、退出保留或明确释放。采用 ComfyUI `#F2FF59`、Colab `#E77012` / `#F9AA00`；普通输入高对比，开始输入后占位提示消失，说明和授权留在右侧。本轮使用真实 Colab 验证，离线 Demo 不作为云端验收。
+
+### Environment
+
+本机 Linux、120×36 的真实 PTY，官方 Colab CLI 0.7.4。一个新 CPU 做编辑器、PNG 和恢复回归；两个新 G4 分别测试 Drive 与临时存储，实际 GPU 为 RTX PRO 6000 Blackwell Server Edition、97,887 MiB，远端 Python 3.13.15。GPU 使用已获授权，分别设置 45 分钟 owned-session 关闭上限。Drive 仅访问已有专用缓存和输出目录；四模型清单共 40,073,842,159 字节。本轮没有启动 Cloudflare 或修改 Chrome 扩展权限。
+
+### Steps
+
+1. 从真实向导创建 CPU。上下移动不会创建实例，Enter 后才执行；临时存储跳过 Drive 与 H3，实际部署、安装、启动并建立 SSH。输入端口时对照空字段占位与输入后显示，Esc 留在 TUI 中。
+2. IAB 导入 `workflows/smoke-ui.json`，点击 Run，核对 Completed 与 Gallery；实际图片 complete=true、64×64。退出保留后用最终版接回，恢复 CPU / 临时存储；停止服务保留 VM，Continue 只完成缺失步骤，随后明确释放 CPU。
+3. 在真实向导分别选择 GPU、G4、Drive / VM disk，确认配置后创建两台实例。Drive 需要人工 Google 授权；用户离开电脑导致首次等待超时，完成授权后显式接回同一实例、重试挂载，实际 mounted 与 MyDrive 检查通过。未重复创建 VM。
+4. 真实安装提交和只读状态查询遇到 CLI 超时 / WebSocket 关闭。错误留在右侧；检查远端状态后继续同一实例。只读状态最多尝试三次，写操作不因超时重发。已经运行的模型任务在退出 TUI 后继续，接回后等待原任务，不重复下载或复制。
+5. 临时分支直接下载四模型到 VM `runtime/models`；Drive 分支从已有缓存复制到同一 VM 本地模型目录。全部文件都是匹配清单大小的普通文件、非软链接，每个结果均为 `stream_sha256`；本轮不跳过首次内容校验、不额外从 Drive 完整读一次 SHA。
+6. 两分支均启动 ComfyUI 与 SSH。本轮 Chrome 成功打开 G4 的 8189 编辑器；Chrome 文件上传被扩展的文件访问权限阻止，保留设置，转用 IAB 完成导入、Run、Completed 与实际 PNG 解码。IAB 也显示随后生成的 H3 视频缩略图。
+7. 从高级操作分别实际提交 H3 API 测试。两任务完成后均校验存储文件与 HTTP 返回 SHA、视频/音频元数据及首帧解码；持久输出位于 Drive，临时输出位于该 VM。退出后无 `--ephemeral` / 端口参数接回最终版，正确恢复已有存储、GPU 与 8189，服务没有重启。
+8. Ready 显示真实 H3 结果。查看已有实例列表、End VM 的默认 Cancel、取消后仍可访问均实测；随后明确确认释放两台 owned G4，核对提供方会话与本机转发停止。逐步操作和截图保存在 Git 外。
+
+### Result
+
+| 检查 | 本轮实际结果 |
+| --- | --- |
+| 向导及按键 | 新建、型号、存储、摘要、屏内设置、恢复、已有实例列表和释放有真实 PTY 帧；上下选择，Enter 才执行 |
+| Drive 授权 | 子 PTY 留在后台；人工授权、同 VM 超时恢复、实际 MyDrive 检查通过；不保存授权截图或链接 |
+| Drive 模型准备 | 四文件从已有 Drive 缓存复制到 VM，同步 SHA 全通过；进度记录总耗时 726.705 秒 |
+| 临时模型准备 | 四文件直接下载到 VM，同步 SHA 全通过；进度记录总耗时 305.849 秒；Drive 未挂载 |
+| 模型加载 | 两分支的 model-paths 指向 VM 本地模型目录，四文件共 40.07 GB，regular=true、symlink=false |
+| 第二模型缓存 | 临时 assets/models 目录为空，模型文件总字节为 0；没有第二份 40 GB 权重 |
+| H3 临时输出 | succeeded，50.185 秒含媒体校验，575,001 字节 MP4，保存于 VM |
+| H3 持久输出 | succeeded，64.515 秒含媒体校验，575,001 字节 MP4，保存于 Drive |
+| H3 媒体 | 两文件均 864×480、24 fps、124 帧，约 5.167 秒；H.264 + AAC 立体声 32 kHz；音视频首帧实际解码 |
+| 浏览器 | Chrome SSH 编辑器加载；IAB 真正导入、Run、PNG 解码和 H3 缩略图；不把 API 测试当作所有浏览器模板通过 |
+| 退出及恢复 | 模型任务、VM、SSH 保留；最终版恢复专用 SSH 8189 与 key 路径，再校验 HTTP；已有服务不重复启动 |
+| 清理 | 本轮 CPU 与两台 owned G4 已释放；官方 sessions 为空；本机 8188 / 8189 的 owned SSH、HTTP、listener 均 false；保护计时器已取消 |
+| 离线检查 | 最终 390 项 unittest 全通过；Ruff check/format、bootstrap 语法、skill validation 与 diff 检查通过 |
+
+### Known Limitations
+
+本轮速度来自不同 VM 的 HTTP 下载与 Drive FUSE 复制路径，不能承诺临时模式总更快；此前同 VM 受控复制/SHA 对比仍见后文。网络状态查询可能较慢，TUI 显示最后核实时间及 stale，不保证固定十秒获得新状态。普通失败文字与凭据遮罩已修复，不把 `authorization did not complete` 当作凭据。
+
+两次释放前的远端服务清理命令超时，界面明确保留 Cleanup warning；随后官方 VM 释放与会话检查通过。本机 SSH 先行停止，最终 8188 / 8189 无 owned listener；没有将这次远端优雅清理标记成功，也没有因为清理超时留下收费 VM。首次最终检查时真实 SSH 占用了本地端口，390 项中一项端口测试跳过；释放后重新运行，390 项均通过、无跳过。
+
+只有 G4 与本清单实际验证；其他 GPU、Turbo LoRA、R2V、ControlNet 等模板未验证。用户图中 I2V 缺少约 1.82 GB Turbo LoRA，且尚未选择图片；基础四模型测试并不包含这些附加项。没有自动改变精度或下载更多模型。Cloudflare 的历史客户端拦截与邮箱登录仍未解决，本轮 SSH 成功不能推断它们已修复。
+
+终端 PNG 是真实 PTY 的 cell 状态渲染，网页 JPEG 是真实浏览器截图；它们不是手绘 mock-up。首次捕获器漏处理 ncurses 局部滚动，造成部分早期残影帧；修复捕获器后重新截取，图文说明排除无效帧。终端授权内容保持瞬时内存，不保存到新增截图或日志；官方 CLI 自己的历史记录不由启动器控制。
+
+Inspect 不保证修复所有异常状态：残留 installing、模型控制器 interrupted、旧 SSH 记录缺配置或多个转发需要明确处理，见 [恢复边界](startup-wizard.md)。本轮 CLI 账号已登录；首次账号 OAuth code 路径只有真实本地子 PTY 回归，没有退出用户账号进行云端重登。
+
+### Architectural Decision
+
+使用 Python 标准库的单帧 curses 向导和后台 Worker；授权由独立控制终端承接，主 TUI 不 endwin 切走。新增临时模型准备复用已有下载器及同 boot 验证记录；SSH 恢复仅读取工具私有状态、校验进程与监听所有权，不读私钥、不猜端口。保留高级接口和显式 `--classic`，不改主项目的 Domain 或 Render API。
 
 ## 2026-10-05 输入确认、屏内交互与新建 CPU 回归
 

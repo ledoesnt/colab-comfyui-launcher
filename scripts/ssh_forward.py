@@ -50,7 +50,9 @@ def port(value):
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("-s", "--session", required=True)
-    cli.add_argument("action", choices=("start", "status", "stop", "cleanup"))
+    cli.add_argument(
+        "action", choices=("start", "status", "stop", "cleanup", "discover")
+    )
     cli.add_argument("--local-port", type=port, default=8188)
     cli.add_argument("--remote-port", type=port, default=8188)
     cli.add_argument(
@@ -90,6 +92,51 @@ def private_dir(path):
         raise ForwardError(
             "Local state/key directory must be owned by you and mode 700"
         )
+
+
+def inspect_private_dir(path):
+    """Validate existing metadata without creating directories or changing modes."""
+    info = path.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o077
+    ):
+        raise ForwardError(
+            "Local SSH state directory is not your private regular directory"
+        )
+
+
+def load_private_state(path):
+    """Read only the tool's small metadata; never a key or provider snapshot."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return {}
+    with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+            or info.st_size > 1024 * 1024
+        ):
+            raise ForwardError(
+                "Local SSH state file is not your private regular metadata"
+            )
+        try:
+            value = json.load(stream)
+        except (ValueError, UnicodeError):
+            raise ForwardError(
+                "Local SSH state metadata is unreadable; inspect before reconnecting"
+            ) from None
+    if not isinstance(value, dict):
+        raise ForwardError("Local SSH state metadata must be an object")
+    return value
+
+
+def state_name(session, local_port):
+    return hashlib.sha256(f"{session}:{local_port}".encode()).hexdigest()[:24]
 
 
 def private_write(path, value):
@@ -399,6 +446,87 @@ def status(args, state):
     }
 
 
+def discover(args):
+    """Restore one live, owned forward for this session, with no state mutation."""
+    missing = {
+        "ok": True,
+        "found": False,
+        "session": args.session,
+        "running": False,
+        "http_ready": False,
+        "listening_owned": False,
+    }
+    try:
+        inspect_private_dir(args.state_dir)
+    except FileNotFoundError:
+        return missing
+    matches = []
+    for directory in args.state_dir.iterdir():
+        if not re.fullmatch(r"[0-9a-f]{24}", directory.name):
+            continue
+        inspect_private_dir(directory)
+        state = load_private_state(directory / "forward.json")
+        local_port = state.get("local_port")
+        if type(local_port) is not int or not 1024 <= local_port <= 65535:
+            if state.get("session") == args.session:
+                raise ForwardError(
+                    "Recorded SSH port is invalid; inspect before reconnecting"
+                )
+            continue
+        if directory.name != state_name(args.session, local_port):
+            if state.get("session") == args.session:
+                raise ForwardError(
+                    "Recorded SSH session/port does not match its state directory; inspect before reconnecting"
+                )
+            continue
+        owned = state.get("process")
+        if not alive(owned):
+            continue
+        if state.get("session") != args.session or not isinstance(
+            state.get("identity"), str
+        ):
+            raise ForwardError(
+                "Live legacy SSH metadata lacks session/key settings; stop the old forward with its known port, then explicitly restart it"
+            )
+        try:
+            identity = absolute_path(state["identity"])
+        except argparse.ArgumentTypeError:
+            raise ForwardError(
+                "Recorded SSH key path is invalid; inspect before reconnecting"
+            ) from None
+        remote_port = state.get("remote_port")
+        if type(remote_port) is not int or not 1024 <= remote_port <= 65535:
+            raise ForwardError(
+                "Recorded SSH remote port is invalid; inspect before reconnecting"
+            )
+        if not owned_listener(owned, local_port):
+            raise ForwardError(
+                "Recorded live SSH process has no owned listener; inspect or stop it before reconnecting"
+            )
+        matches.append(
+            {
+                "ok": True,
+                "found": True,
+                "session": args.session,
+                "local_port": local_port,
+                "remote_port": remote_port,
+                "identity": str(identity),
+                "running": True,
+                "listening_owned": True,
+                "url": f"http://127.0.0.1:{local_port}",
+            }
+        )
+    if len(matches) > 1:
+        raise ForwardError(
+            "Multiple owned SSH forwards exist for this session; choose or stop them explicitly before reconnecting"
+        )
+    if not matches:
+        return missing
+    result = matches[0]
+    result["http_ready"] = healthy(result["local_port"])
+    return result
+
+
 def start(args, directory, state_path):
     if alive(load_json(state_path).get("process")):
         raise ForwardError("This local forward is already running; use status or stop")
@@ -444,6 +572,8 @@ def start(args, directory, state_path):
             raise ForwardError("Could not record an owned SSH process identity")
         owned = {**info, "boot_id": boot_id()}
         state = {
+            "session": args.session,
+            "identity": str(args.identity),
             "process": owned,
             "local_port": args.local_port,
             "remote_port": args.remote_port,
@@ -480,8 +610,10 @@ def execute(args):
         raise ForwardError("--create-key is only valid with explicit start")
     if not math.isfinite(args.startup_seconds) or not 0 < args.startup_seconds <= 120:
         raise ForwardError("startup-seconds must be positive and no more than 120")
+    if args.action == "discover":
+        return discover(args)
     private_dir(args.state_dir)
-    name = hashlib.sha256(f"{args.session}:{args.local_port}".encode()).hexdigest()[:24]
+    name = state_name(args.session, args.local_port)
     directory = args.state_dir / name
     private_dir(directory)
     lock_fd = os.open(

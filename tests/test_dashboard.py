@@ -108,8 +108,9 @@ class BackendTests(unittest.TestCase):
         self.backend.bridge(self.config, "prepare", download_missing=True)
         self.assertIn("--download-missing", self.command())
         self.config.ephemeral = True
-        with self.assertRaisesRegex(dashboard.DashboardError, "persistent"):
-            self.backend.bridge(self.config, "prepare")
+        self.backend.bridge(self.config, "prepare")
+        self.assertIn("--ephemeral", self.command())
+        self.assertNotIn("--cache-root", self.command())
 
     def test_download_and_email_are_not_shell_interpolated(self):
         self.config.storage_root += "/space and $(not-a-shell)"
@@ -435,7 +436,12 @@ class WorkerTests(unittest.TestCase):
                 {"ok": True, "model_prepare": {"status": "running", "running": True}},
                 {
                     "ok": True,
-                    "model_prepare": {"status": "succeeded", "running": False},
+                    "models_ready": True,
+                    "model_prepare": {
+                        "status": "succeeded",
+                        "running": False,
+                        "result": {"ok": True},
+                    },
                 },
                 {
                     "ok": True,
@@ -920,6 +926,27 @@ class DisplayTests(unittest.TestCase):
         self.assertNotIn("allowed@example.com", error)
         self.assertNotIn("secret-value", error)
 
+    def test_failure_keeps_authorization_instructions_and_redacts_key_values(self):
+        message = (
+            "Provider authorization did not complete; inspect or retry this session."
+        )
+        self.assertEqual(dashboard.safe_error(message), message)
+        error = dashboard.safe_error(
+            'token=secret-one code: secret-two "access_token": "secret-three"'
+        )
+        for secret in ("secret-one", "secret-two", "secret-three"):
+            self.assertNotIn(secret, error)
+
+    def test_ephemeral_download_rejects_creating_a_duplicate_model_cache(self):
+        backend = dashboard.Backend(run=mock.Mock())
+        with self.assertRaisesRegex(
+            dashboard.DashboardError, "directly during preparation"
+        ):
+            backend.bridge(
+                dashboard.Config(session="fixture", ephemeral=True), "download"
+            )
+        backend.run.assert_not_called()
+
     def test_help_exits_without_tty_or_provider_calls(self):
         with (
             mock.patch.object(dashboard.sys, "stdout"),
@@ -1291,10 +1318,10 @@ class VisualTests(unittest.TestCase):
         self.assertIn("FAIL", screen.text)
         self.assertIn("checksum mismatch", screen.text)
 
-    def test_palette_uses_orange_cyan_and_basic_color_fallback(self):
-        for available, orange, cyan in (
-            (256, 208, 81),
-            (8, dashboard.curses.COLOR_YELLOW, dashboard.curses.COLOR_CYAN),
+    def test_palette_uses_colab_orange_yellow_and_basic_color_fallback(self):
+        for available, orange, yellow in (
+            (256, 208, 214),
+            (8, dashboard.curses.COLOR_YELLOW, dashboard.curses.COLOR_YELLOW),
         ):
             with (
                 self.subTest(colors=available),
@@ -1309,6 +1336,9 @@ class VisualTests(unittest.TestCase):
                     mock.patch.object(dashboard.curses, "start_color"),
                     mock.patch.object(dashboard.curses, "use_default_colors"),
                     mock.patch.object(
+                        dashboard.curses, "can_change_color", return_value=False
+                    ),
+                    mock.patch.object(
                         dashboard.curses, "COLORS", available, create=True
                     ),
                     mock.patch.object(dashboard.curses, "init_pair") as pairs,
@@ -1320,7 +1350,7 @@ class VisualTests(unittest.TestCase):
                 ):
                     theme.initialize()
                 self.assertIn(mock.call(1, orange, -1), pairs.call_args_list)
-                self.assertIn(mock.call(2, cyan, -1), pairs.call_args_list)
+                self.assertIn(mock.call(2, yellow, -1), pairs.call_args_list)
                 self.assertNotEqual(theme.roles["title"], theme.roles["accent"])
 
     def test_no_color_setting_avoids_color_calls(self):
@@ -1361,7 +1391,7 @@ class VisualTests(unittest.TestCase):
             mock.patch.object(dashboard.subprocess, "run") as command,
             mock.patch.object(dashboard.webbrowser, "open") as browser,
         ):
-            self.assertEqual(dashboard.main(["--demo"]), 0)
+            self.assertEqual(dashboard.main(["--demo", "--classic"]), 0)
         wrapper.assert_not_called()
         command.assert_not_called()
         browser.assert_not_called()
@@ -1385,7 +1415,7 @@ class VisualTests(unittest.TestCase):
             ),
             mock.patch.object(dashboard.subprocess, "run") as command,
         ):
-            self.assertEqual(dashboard.main(["--demo"]), 0)
+            self.assertEqual(dashboard.main(["--demo", "--classic"]), 0)
         command.assert_not_called()
         self.assertIn("Text mode", output.getvalue())
 

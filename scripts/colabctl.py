@@ -204,6 +204,8 @@ def runtime_result(payload, timeout=50):
         if payload['action'] == 'status':
             unknown_services = services_record.exists()
             unknown_installation = unknown_services or Path('/content/colab-comfyui-runtime/install.json').exists()
+            drive_mounted = os.path.ismount('/content/drive')
+            mydrive = Path('/content/drive/MyDrive')
             return {
                 'ok': True, 'deployed': False,
                 'deployment': {'status': 'not_deployed'},
@@ -213,8 +215,11 @@ def runtime_result(payload, timeout=50):
                 'tunnel_alive': None if unknown_services else False,
                 'http_ready': None if unknown_services else False,
                 'models_ready': False, 'url': None,
+                'configuration': None,
                 'runtime': {'python': sys.version.split()[0]},
-                'drive': {'mounted': os.path.ismount('/content/drive'), 'path': '/content/drive'},
+                'drive': {'mounted': drive_mounted,
+                          'mydrive_ready': bool(drive_mounted and mydrive.is_dir() and not mydrive.is_symlink()),
+                          'path': '/content/drive'},
                 'next': 'Session exists; deploy the launcher before installation or service actions.',
             }
         if payload['action'] == 'stop' and not services_record.exists():
@@ -331,8 +336,12 @@ def background_arguments(payload):
         if payload.get('verify_cache'):
             arguments.append('--verify-cache')
     elif action == 'prepare':
+        if payload.get('ephemeral') and payload.get('cache_root'):
+            raise RuntimeError('--ephemeral cannot be combined with --cache-root.')
         if payload.get('cache_root'):
             arguments.extend(['--cache-root', payload['cache_root']])
+        if payload.get('ephemeral'):
+            arguments.append('--ephemeral')
         if payload.get('verify_cache'):
             arguments.append('--verify-cache')
         if payload.get('download_missing'):
@@ -683,19 +692,25 @@ def parser() -> argparse.ArgumentParser:
         help="Rehash existing Drive files instead of using verified metadata receipts",
     )
     prepare = actions.add_parser(
-        "prepare", help="Copy Drive models to VM disk and verify them during the copy"
+        "prepare",
+        help="Prepare verified models on VM disk from Drive or direct download",
     )
     prepare.add_argument("--max-seconds", type=positive_seconds, default=1800.0)
     prepare.add_argument("--cache-root", help="Absolute Drive models cache directory")
     prepare.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help="Use only runtime/models, without mounting Drive or a second cache copy",
+    )
+    prepare.add_argument(
         "--verify-cache",
         action="store_true",
-        help="Also rehash the Drive source before copying",
+        help="Rehash the Drive source, or VM models when --ephemeral is selected",
     )
     prepare.add_argument(
         "--download-missing",
         action="store_true",
-        help="Download missing pinned files into Drive before copying; existing cache is verified during copy",
+        help="Download missing pinned files into Drive cache, or directly to VM with --ephemeral",
     )
     render = actions.add_parser(
         "render", help="Start bounded execution of the deployed H3 API workflow"
@@ -730,11 +745,18 @@ def main(argv: list[str] | None = None) -> int:
                 verify_cache=arguments.verify_cache,
             )
         elif arguments.action == "prepare":
+            if arguments.ephemeral and arguments.cache_root:
+                print(
+                    "--ephemeral cannot be combined with --cache-root.",
+                    file=sys.stderr,
+                )
+                return 2
             if arguments.cache_root and not arguments.cache_root.startswith("/"):
                 print("Cache root must be an absolute runtime path.", file=sys.stderr)
                 return 2
             payload.update(
                 cache_root=arguments.cache_root,
+                ephemeral=arguments.ephemeral,
                 verify_cache=arguments.verify_cache,
                 download_missing=arguments.download_missing,
             )

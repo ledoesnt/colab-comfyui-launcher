@@ -327,9 +327,81 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(spawn.call_count, 1)
         self.assertEqual(result["access_mode"], "local")
         self.assertIsNone(result["url"])
+        state = runtime.read_json(runtime.STATE)
+        self.assertIs(state["cpu"], True)
+        self.assertEqual(
+            runtime.recorded_configuration(state),
+            {
+                "source": "services",
+                "cpu": True,
+                "ephemeral": True,
+                "storage_root": str(self.base / "ephemeral-assets"),
+                "access_mode": "local",
+            },
+        )
         paths = json.loads((self.base / "model-paths.yaml").read_text())
         self.assertEqual(paths["launcher"]["base_path"], str(self.base / "models"))
         self.assertNotIn("ephemeral-assets", paths["launcher"]["base_path"])
+
+    def test_configuration_recovery_never_guesses_missing_or_legacy_booleans(self):
+        self.assertIsNone(runtime.recorded_configuration({}))
+        result = runtime.recorded_configuration(
+            {"storage_root": "/content/drive/MyDrive/launcher", "access_mode": "local"}
+        )
+        self.assertIsNone(result["cpu"])
+        self.assertIsNone(result["ephemeral"])
+        self.assertEqual(result["access_mode"], "local")
+        result = runtime.recorded_configuration(
+            {
+                "storage_root": "relative/path",
+                "cpu": "false",
+                "ephemeral": 1,
+                "access_mode": "unknown",
+            }
+        )
+        self.assertIsNone(result["storage_root"])
+        self.assertIsNone(result["cpu"])
+        self.assertIsNone(result["ephemeral"])
+        self.assertIsNone(result["access_mode"])
+
+    def test_status_mount_readiness_requires_real_mydrive_and_mount(self):
+        mydrive = self.base / "drive" / "MyDrive"
+
+        def path(value):
+            return mydrive if value == "/content/drive/MyDrive" else Path(value)
+
+        with (
+            mock.patch.object(runtime, "Path", side_effect=path),
+            mock.patch.object(runtime, "healthy", return_value=False),
+            mock.patch.object(runtime, "local_models_ready", return_value=False),
+            mock.patch.object(runtime, "hardware_info", return_value={}),
+            mock.patch.object(
+                runtime.os.path, "ismount", return_value=False
+            ) as mounted,
+        ):
+            mydrive.mkdir(parents=True)
+            self.assertFalse(runtime.status(self.args)["drive"]["mydrive_ready"])
+            mounted.return_value = True
+            self.assertTrue(runtime.status(self.args)["drive"]["mydrive_ready"])
+            mydrive.rmdir()
+            self.assertFalse(runtime.status(self.args)["drive"]["mydrive_ready"])
+            outside = self.base / "outside-drive"
+            outside.mkdir()
+            mydrive.symlink_to(outside, target_is_directory=True)
+            self.assertFalse(runtime.status(self.args)["drive"]["mydrive_ready"])
+
+    def test_fresh_missing_install_status_has_no_fabricated_configuration(self):
+        (self.base / "install.json").unlink()
+        with (
+            mock.patch.object(runtime, "healthy", return_value=False),
+            mock.patch.object(runtime, "local_models_ready", return_value=False),
+            mock.patch.object(runtime, "hardware_info", return_value={}),
+            mock.patch.object(runtime.os.path, "ismount", return_value=False),
+        ):
+            result = runtime.status(self.args)
+        self.assertIsNone(result["configuration"])
+        self.assertEqual(result["installation"], {})
+        self.assertFalse(result["comfyui_alive"])
 
     def test_gpu_start_requires_verified_local_models(self):
         self.args.cpu = False

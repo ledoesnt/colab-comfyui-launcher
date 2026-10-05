@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy pinned Drive model caches to VM disk with one streaming SHA256 pass."""
+"""Prepare pinned local models by copying Drive or explicitly downloading to VM."""
 
 import hashlib
 import importlib.util
@@ -90,7 +90,14 @@ def copy_file(
         source_verified = True
     if cache.file_size(final) is not None:
         if local_receipts.matches(final, item) and source_verified:
-            progress.update(item, "complete", item["size_bytes"], "skipped", force=True)
+            progress.update(
+                item,
+                "complete",
+                item["size_bytes"],
+                "skipped",
+                force=True,
+                verification="verified_receipt_metadata",
+            )
             return {
                 "path": item["path"],
                 "status": "skipped",
@@ -121,7 +128,14 @@ def copy_file(
             expected=local_before,
             source={"stat": {name: before[name] for name in ("size", "mtime_ns")}},
         )
-        progress.update(item, "complete", item["size_bytes"], "skipped", force=True)
+        progress.update(
+            item,
+            "complete",
+            item["size_bytes"],
+            "skipped",
+            force=True,
+            verification="full_sha256",
+        )
         return {
             "path": item["path"],
             "status": "skipped",
@@ -195,7 +209,14 @@ def copy_file(
         item,
         source={"stat": {name: before[name] for name in ("size", "mtime_ns")}},
     )
-    progress.update(item, "complete", done, "succeeded", force=True)
+    progress.update(
+        item,
+        "complete",
+        done,
+        "succeeded",
+        force=True,
+        verification="stream_sha256",
+    )
     return {
         "path": item["path"],
         "status": "copied",
@@ -205,53 +226,59 @@ def copy_file(
     }
 
 
+def prepare_ephemeral(args, manifest, local, deadline, progress):
+    """Download into the one local model directory, with boot-bound receipts."""
+    with cache.root_lock(local):
+        receipts = cache.Receipts(
+            local, manifest["repo_id"], manifest["revision"], boot_id()
+        )
+        results = []
+        for item in manifest["files"]:
+            final = local / item["path"]
+            cache.check_path(final, local)
+            if cache.file_size(final) is None and not getattr(
+                args, "download_missing", False
+            ):
+                raise cache.DownloadError(
+                    "Local model is missing; use --download-missing to download to VM"
+                )
+            results.append(
+                cache.download_file(
+                    local,
+                    manifest["repo_id"],
+                    manifest["revision"],
+                    item,
+                    deadline,
+                    receipts,
+                    getattr(args, "verify_cache", False),
+                    progress,
+                )
+            )
+    return results
+
+
 def run(args):
     with cache.time_budget(args.max_seconds) as deadline:
         manifest = cache.load_manifest(args.manifest)
-        source = cache.models_root(args.cache_root, False)
+        ephemeral = getattr(args, "ephemeral", False)
+        if ephemeral and args.cache_root is not None:
+            raise cache.DownloadError(
+                "--ephemeral cannot be combined with --cache-root"
+            )
+        source = None if ephemeral else cache.models_root(args.cache_root, False)
         local = local_models_root(getattr(args, "local_models_root", None))
         progress = cache.Progress(
             getattr(args, "progress_file", None), "prepare", manifest["files"]
         )
         try:
-            with cache.root_lock(source), cache.root_lock(local):
-                source_receipts = cache.Receipts(
-                    source, manifest["repo_id"], manifest["revision"]
+            if ephemeral:
+                results = prepare_ephemeral(args, manifest, local, deadline, progress)
+            else:
+                results = prepare_drive(
+                    args, manifest, source, local, deadline, progress
                 )
-                local_receipts = cache.Receipts(
-                    local, manifest["repo_id"], manifest["revision"], boot_id()
-                )
-                results = []
-                for item in manifest["files"]:
-                    source_file = source / item["path"]
-                    cache.check_path(source_file, source)
-                    cache_status = "existing"
-                    if cache.file_size(source_file) is None and getattr(
-                        args, "download_missing", False
-                    ):
-                        downloaded = cache.download_file(
-                            source,
-                            manifest["repo_id"],
-                            manifest["revision"],
-                            item,
-                            deadline,
-                            source_receipts,
-                            False,
-                            progress,
-                        )
-                        cache_status = downloaded["status"]
-                    prepared = copy_file(
-                        source,
-                        local,
-                        item,
-                        deadline,
-                        source_receipts,
-                        local_receipts,
-                        progress,
-                        getattr(args, "verify_cache", False),
-                    )
-                    prepared["cache_status"] = cache_status
-                    results.append(prepared)
+            if not local_cache_ready(local, args.manifest):
+                raise cache.DownloadError("Prepared local model receipts are not ready")
             progress.finish(True)
         except BaseException:
             progress.finish(False)
@@ -260,11 +287,55 @@ def run(args):
             "ok": True,
             "repo_id": manifest["repo_id"],
             "revision": manifest["revision"],
-            "cache_root": str(source),
+            "cache_root": None if ephemeral else str(source),
             "models_root": str(local),
+            "ephemeral": ephemeral,
+            "models_ready": True,
             "files": results,
             "total_size_bytes": sum(item["size_bytes"] for item in manifest["files"]),
         }
+
+
+def prepare_drive(args, manifest, source, local, deadline, progress):
+    with cache.root_lock(source), cache.root_lock(local):
+        source_receipts = cache.Receipts(
+            source, manifest["repo_id"], manifest["revision"]
+        )
+        local_receipts = cache.Receipts(
+            local, manifest["repo_id"], manifest["revision"], boot_id()
+        )
+        results = []
+        for item in manifest["files"]:
+            source_file = source / item["path"]
+            cache.check_path(source_file, source)
+            cache_status = "existing"
+            if cache.file_size(source_file) is None and getattr(
+                args, "download_missing", False
+            ):
+                downloaded = cache.download_file(
+                    source,
+                    manifest["repo_id"],
+                    manifest["revision"],
+                    item,
+                    deadline,
+                    source_receipts,
+                    False,
+                    progress,
+                )
+                cache_status = downloaded["status"]
+            prepared = copy_file(
+                source,
+                local,
+                item,
+                deadline,
+                source_receipts,
+                local_receipts,
+                progress,
+                getattr(args, "verify_cache", False),
+            )
+            prepared["cache_status"] = cache_status
+            results.append(prepared)
+    return results
 
 
 def main(argv=None):
@@ -272,6 +343,11 @@ def main(argv=None):
     parser.add_argument("--manifest", type=Path, default=cache.DEFAULT_MANIFEST)
     parser.add_argument(
         "--cache-root", type=Path, help="Pinned model cache under mounted Drive/MyDrive"
+    )
+    parser.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help="Prepare only VM models, without Drive or a second cache copy",
     )
     parser.add_argument(
         "--local-models-root",
@@ -282,12 +358,12 @@ def main(argv=None):
     parser.add_argument(
         "--verify-cache",
         action="store_true",
-        help="Force a separate full Drive SHA pass before preparing",
+        help="Force full SHA on Drive cache, or on VM models with --ephemeral",
     )
     parser.add_argument(
         "--download-missing",
         action="store_true",
-        help="Explicitly download absent pinned Drive cache files, then copy and hash locally",
+        help="Explicitly download missing pinned files into Drive cache, or directly to VM with --ephemeral",
     )
     parser.add_argument(
         "--progress-file",

@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -131,11 +132,21 @@ class PrepareModelsTests(unittest.TestCase):
             return original(path, flags, *args, **kwargs)
 
         phases = []
+        copy_verifications = []
         update = cache.Progress.update
 
         def tracking_progress(progress, item, phase, *args, **kwargs):
             phases.append(phase)
-            return update(progress, item, phase, *args, **kwargs)
+            result = update(progress, item, phase, *args, **kwargs)
+            if phase == "copy":
+                copy_verifications.append(
+                    next(
+                        value["verification"]
+                        for value in progress.value["files"]
+                        if value["path"] == item["path"]
+                    )
+                )
+            return result
 
         with (
             mock.patch.object(cache.os, "open", side_effect=tracking_open),
@@ -160,6 +171,8 @@ class PrepareModelsTests(unittest.TestCase):
         self.assertEqual((self.local_root / item["path"]).read_bytes(), DATA)
         self.assertIn("download", phases)
         self.assertIn("copy", phases)
+        self.assertTrue(copy_verifications)
+        self.assertTrue(all(value is None for value in copy_verifications))
         snapshot = json.loads(
             (self.local_root.parent / "prepare-progress.json").read_text()
         )
@@ -363,6 +376,255 @@ class PrepareModelsTests(unittest.TestCase):
         ):
             self.run_prepare()
         self.assertFalse(self.final.exists())
+
+
+class EphemeralModelsTests(unittest.TestCase):
+    def setUp(self):
+        PrepareModelsTests.setUp(self)
+        self.args.ephemeral = True
+        self.args.cache_root = None
+        self.args.download_missing = True
+        patch = mock.patch.object(
+            cache.os.path,
+            "ismount",
+            side_effect=AssertionError("No Drive mount checks"),
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_prepare(self):
+        return preparer.run(self.args)
+
+    def response(self, data=DATA, status=200, headers=None):
+        response = io.BytesIO(data)
+        response.status = status
+        response.headers = headers or {"Content-Length": str(len(data))}
+        response.geturl = lambda: "https://fixture.invalid/blob"
+        self.http.side_effect = None
+        self.http.return_value = response
+
+    def progress(self):
+        return json.loads(
+            (self.local_root.parent / "prepare-progress.json").read_text()
+        )
+
+    def test_downloads_once_to_final_models_without_copy_hash_or_drive_receipt(self):
+        self.response()
+        with (
+            mock.patch.object(
+                preparer, "copy_file", side_effect=AssertionError("No copy")
+            ),
+            mock.patch.object(
+                cache, "hash_file", side_effect=AssertionError("No second hash")
+            ),
+        ):
+            result = self.run_prepare()
+        self.assertTrue(result["ephemeral"])
+        self.assertTrue(result["models_ready"])
+        self.assertIsNone(result["cache_root"])
+        self.assertEqual(result["models_root"], str(self.local_root))
+        self.assertEqual(result["files"][0]["verification"], "stream_sha256")
+        self.assertEqual(self.final.read_bytes(), DATA)
+        self.assertEqual(self.source.read_bytes(), DATA)
+        self.assertFalse((self.source_root / cache.RECEIPT_NAME).exists())
+        self.assertFalse((self.local_root.parent / "ephemeral-assets").exists())
+        self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+        entry = self.progress()["files"][0]
+        self.assertEqual(entry["phase"], "complete")
+        self.assertEqual(entry["done_bytes"], len(DATA))
+        self.assertEqual(entry["verification"], "stream_sha256")
+        receipt = json.loads((self.local_root / cache.RECEIPT_NAME).read_text())
+        self.assertEqual(
+            next(iter(receipt["records"].values()))["boot_id"], "fixture-boot"
+        )
+
+    def test_same_vm_receipt_reuse_does_not_read_content_or_network(self):
+        self.response()
+        self.run_prepare()
+        self.http.reset_mock()
+        self.http.side_effect = AssertionError("No network on receipt reuse")
+        with mock.patch.object(
+            cache, "hash_file", side_effect=AssertionError("No model reads")
+        ):
+            result = self.run_prepare()
+        self.assertEqual(
+            result["files"][0]["verification"], "verified_receipt_metadata"
+        )
+        self.assertEqual(
+            self.progress()["files"][0]["verification"], "verified_receipt_metadata"
+        )
+        self.http.assert_not_called()
+
+    def test_boot_change_requires_actual_local_hash_then_refreshes_receipt(self):
+        self.response()
+        self.run_prepare()
+        self.http.reset_mock()
+        with (
+            mock.patch.object(preparer, "boot_id", return_value="new-boot"),
+            mock.patch.object(cache, "hash_file", wraps=cache.hash_file) as hashing,
+        ):
+            self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+            result = self.run_prepare()
+            self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+        hashing.assert_called_once()
+        self.assertEqual(hashing.call_args.args[0], self.final)
+        self.assertEqual(result["files"][0]["verification"], "full_sha256")
+        self.http.assert_not_called()
+
+    def test_explicit_audit_hashes_local_bytes_without_touching_drive(self):
+        self.response()
+        self.run_prepare()
+        self.http.reset_mock()
+        self.args.verify_cache = True
+        with mock.patch.object(cache, "hash_file", wraps=cache.hash_file) as hashing:
+            result = self.run_prepare()
+        hashing.assert_called_once()
+        self.assertEqual(hashing.call_args.args[0], self.final)
+        self.assertEqual(result["files"][0]["verification"], "full_sha256")
+        self.http.assert_not_called()
+
+    def test_missing_file_without_explicit_download_fails_before_network(self):
+        self.args.download_missing = False
+        with self.assertRaisesRegex(cache.DownloadError, "download-missing"):
+            self.run_prepare()
+        self.assertEqual(self.progress()["status"], "failed")
+        self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+        self.http.assert_not_called()
+
+    def test_corrupt_body_stays_partial_without_verified_receipt(self):
+        self.response(b"X" * len(DATA))
+        with self.assertRaisesRegex(cache.DownloadError, "SHA256"):
+            self.run_prepare()
+        self.assertFalse(self.final.exists())
+        self.assertTrue(self.partial.exists())
+        self.assertFalse((self.local_root / cache.RECEIPT_NAME).exists())
+        self.assertEqual(self.progress()["status"], "failed")
+        self.assertIsNone(self.progress()["files"][0]["verification"])
+        self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+
+    def test_resume_hashes_retained_prefix_then_streams_remaining_bytes(self):
+        offset = 10
+        self.final.parent.mkdir(parents=True)
+        self.partial.write_bytes(DATA[:offset])
+        self.response(
+            DATA[offset:],
+            206,
+            {
+                "Content-Length": str(len(DATA) - offset),
+                "Content-Range": f"bytes {offset}-{len(DATA) - 1}/{len(DATA)}",
+            },
+        )
+        with mock.patch.object(cache, "hash_file", wraps=cache.hash_file) as hashing:
+            result = self.run_prepare()
+        hashing.assert_called_once()
+        self.assertEqual(hashing.call_args.args[0], self.partial)
+        self.assertEqual(self.http.call_args.args[0].get_header("Range"), "bytes=10-")
+        self.assertEqual(result["files"][0]["status"], "resumed")
+        self.assertEqual(self.final.read_bytes(), DATA)
+        self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+
+    def test_partial_body_never_publishes_a_final_model(self):
+        self.response(DATA[:-1], headers={"Content-Length": str(len(DATA))})
+        with self.assertRaisesRegex(cache.DownloadError, "incomplete"):
+            self.run_prepare()
+        self.assertFalse(self.final.exists())
+        self.assertEqual(self.partial.read_bytes(), DATA[:-1])
+        self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+
+    def test_last_model_failure_leaves_overall_readiness_false(self):
+        item = dict(self.item, path="vae/other.safetensors")
+        manifest = json.loads(self.manifest.read_text())
+        manifest["files"].append(item)
+        manifest["total_size_bytes"] += len(DATA)
+        self.manifest.write_text(json.dumps(manifest))
+
+        def response(request, **kwargs):
+            stream = io.BytesIO(
+                DATA
+                if request.full_url.endswith(self.item["path"])
+                else b"X" * len(DATA)
+            )
+            stream.status = 200
+            stream.headers = {"Content-Length": str(len(DATA))}
+            stream.geturl = lambda: "https://fixture.invalid/blob"
+            return stream
+
+        self.http.side_effect = response
+        with self.assertRaisesRegex(cache.DownloadError, "SHA256"):
+            self.run_prepare()
+        self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+        progress = self.progress()
+        self.assertEqual(progress["status"], "failed")
+        self.assertEqual(progress["files"][0]["verification"], "stream_sha256")
+        self.assertEqual(progress["files"][1]["status"], "failed")
+        self.assertIsNone(progress["files"][1]["verification"])
+
+    def test_existing_corrupt_local_file_is_not_replaced_or_downloaded(self):
+        self.final.parent.mkdir(parents=True)
+        self.final.write_bytes(b"X" * len(DATA))
+        with self.assertRaisesRegex(cache.DownloadError, "not overwritten"):
+            self.run_prepare()
+        self.assertEqual(self.final.read_bytes(), b"X" * len(DATA))
+        self.http.assert_not_called()
+
+    def test_symlinks_and_non_dedicated_local_paths_are_rejected(self):
+        outside = self.content / "outside-model.bin"
+        outside.write_bytes(DATA)
+        self.final.parent.mkdir(parents=True)
+        self.final.symlink_to(outside)
+        with self.assertRaisesRegex(cache.DownloadError, "symlinks"):
+            self.run_prepare()
+        self.assertEqual(outside.read_bytes(), DATA)
+        self.args.local_models_root = self.content / "other-models"
+        with self.assertRaisesRegex(cache.DownloadError, "dedicated"):
+            self.run_prepare()
+        self.assertFalse(self.args.local_models_root.exists())
+        self.http.assert_not_called()
+
+    def test_cache_root_conflict_fails_before_local_directory_or_network(self):
+        self.args.cache_root = self.source_root
+        with self.assertRaisesRegex(cache.DownloadError, "cannot be combined"):
+            self.run_prepare()
+        self.assertFalse(self.local_root.exists())
+        self.http.assert_not_called()
+
+    def test_local_model_lock_blocks_download_before_http(self):
+        self.local_root.mkdir(parents=True)
+        with (
+            cache.root_lock(self.local_root),
+            self.assertRaisesRegex(cache.DownloadError, "Another model"),
+        ):
+            self.run_prepare()
+        self.http.assert_not_called()
+
+    def test_cli_ephemeral_interface_returns_actual_readiness(self):
+        self.response()
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            status = preparer.main(
+                ["--manifest", str(self.manifest), "--ephemeral", "--download-missing"]
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual(status, 0)
+        self.assertTrue(result["models_ready"])
+        self.assertIsNone(result["cache_root"])
+
+    def test_ephemeral_deadline_bounds_blocked_download_and_keeps_partial(self):
+        self.response()
+        self.args.max_seconds = 0.02
+
+        def blocked_read(*args, **kwargs):
+            time.sleep(0.1)
+            return DATA
+
+        self.http.return_value.read = blocked_read
+        with self.assertRaisesRegex(cache.DownloadError, "deadline"):
+            self.run_prepare()
+        self.assertFalse(self.final.exists())
+        self.assertTrue(self.partial.exists())
+        self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+        self.assertEqual(self.progress()["status"], "failed")
+        self.assertIsNone(self.progress()["files"][0]["verification"])
 
 
 if __name__ == "__main__":

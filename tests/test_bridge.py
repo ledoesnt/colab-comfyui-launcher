@@ -351,11 +351,39 @@ class UndeployedRuntimeTests(unittest.TestCase):
         for field in ("comfyui_alive", "tunnel_alive", "http_ready", "models_ready"):
             self.assertIs(result[field], False)
         self.assertIsNone(result["startup"])
+        self.assertIsNone(result["configuration"])
+        self.assertFalse(result["drive"]["mydrive_ready"])
         for task in ("model_download", "model_prepare", "render"):
             self.assertFalse(result[task]["running"])
             self.assertEqual(result[task]["status"], "not_started")
         self.assertEqual(self.snapshot(), before)
         self.assertFalse((self.root / "content").exists())
+        self.assert_no_process_action()
+
+    def test_fresh_status_checks_real_mydrive_without_creating_it(self):
+        mydrive = self.namespace["Path"]("/content/drive/MyDrive")
+        with mock.patch.object(self.namespace["os"].path, "ismount", return_value=True):
+            self.assertFalse(
+                self.namespace["runtime_action"]({"action": "status"})["drive"][
+                    "mydrive_ready"
+                ]
+            )
+            self.assertFalse(mydrive.exists())
+            mydrive.mkdir(parents=True)
+            self.assertTrue(
+                self.namespace["runtime_action"]({"action": "status"})["drive"][
+                    "mydrive_ready"
+                ]
+            )
+            mydrive.rmdir()
+            outside = self.root / "elsewhere"
+            outside.mkdir()
+            mydrive.symlink_to(outside, target_is_directory=True)
+            self.assertFalse(
+                self.namespace["runtime_action"]({"action": "status"})["drive"][
+                    "mydrive_ready"
+                ]
+            )
         self.assert_no_process_action()
 
     def test_historical_service_record_keeps_liveness_unknown_without_runtime_code(
@@ -477,6 +505,74 @@ class UndeployedRuntimeTests(unittest.TestCase):
 
 
 class BackgroundArgumentsTests(unittest.TestCase):
+    def test_ephemeral_prepare_payload_and_remote_arguments_use_vm_only(self):
+        with (
+            mock.patch.object(
+                bridge, "execute_remote", return_value={"ok": True}
+            ) as execute,
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(
+                bridge.main(
+                    [
+                        "-s",
+                        "owned",
+                        "prepare",
+                        "--ephemeral",
+                        "--download-missing",
+                        "--max-seconds",
+                        "120",
+                    ]
+                ),
+                0,
+            )
+        payload = execute.call_args.args[1]
+        self.assertEqual(payload["max_seconds"], 120)
+        self.assertTrue(payload["ephemeral"])
+        self.assertIsNone(payload["cache_root"])
+        namespace = {}
+        exec(bridge.REMOTE_HELPERS, namespace)  # noqa: S102
+        with mock.patch.object(namespace["Path"], "is_file", return_value=True):
+            arguments = namespace["background_arguments"](payload)
+        self.assertIn("--ephemeral", arguments)
+        self.assertIn("--download-missing", arguments)
+        self.assertNotIn("--cache-root", arguments)
+        self.assertFalse(any("ephemeral-assets" in argument for argument in arguments))
+
+    def test_conflicting_prepare_mode_fails_before_any_remote_operation(self):
+        with (
+            mock.patch.object(bridge, "execute_remote") as execute,
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            self.assertEqual(
+                bridge.main(
+                    [
+                        "-s",
+                        "owned",
+                        "prepare",
+                        "--ephemeral",
+                        "--cache-root",
+                        "/content/drive/MyDrive/cache/models",
+                    ]
+                ),
+                2,
+            )
+        execute.assert_not_called()
+        namespace = {}
+        exec(bridge.REMOTE_HELPERS, namespace)  # noqa: S102
+        with (
+            mock.patch.object(namespace["Path"], "is_file", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "cannot be combined"),
+        ):
+            namespace["background_arguments"](
+                {
+                    "action": "prepare",
+                    "max_seconds": 120,
+                    "ephemeral": True,
+                    "cache_root": "/content/drive/MyDrive/cache/models",
+                }
+            )
+
     def test_start_requires_one_access_mode(self):
         for access in ([], ["--public", "--allowed-email", "tester@example.invalid"]):
             with (

@@ -372,6 +372,9 @@ class ForwardTests(unittest.TestCase):
             forward.start(self.args, self.base, self.base / "forward.json")
         kill.assert_called_once_with(self.owned)
         self.assertFalse((self.base / "proxy-session.json").exists())
+        recorded = json.loads((self.base / "forward.json").read_text())
+        self.assertEqual(recorded["session"], self.args.session)
+        self.assertEqual(recorded["identity"], str(self.args.identity))
 
     def test_main_does_not_print_provider_error_details(self):
         output = io.StringIO()
@@ -385,6 +388,198 @@ class ForwardTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertNotIn("fixture-secret-token", output.getvalue())
         self.assertFalse(json.loads(output.getvalue())["ok"])
+
+
+class DiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        ForwardTests.setUp(self)
+        self.args.action = "discover"
+        self.processes = {self.owned["pid"]: self.owned}
+        patches = (
+            mock.patch.object(forward, "boot_id", return_value="fixture-boot"),
+            mock.patch.object(
+                forward, "process_info", side_effect=lambda pid: self.processes.get(pid)
+            ),
+            mock.patch.object(forward, "owned_listener", return_value=True),
+            mock.patch.object(forward, "healthy", return_value=True),
+            mock.patch.object(
+                forward.subprocess,
+                "run",
+                side_effect=AssertionError("Discovery cannot call any CLI"),
+            ),
+            mock.patch.object(
+                forward.subprocess,
+                "Popen",
+                side_effect=AssertionError("Discovery cannot start processes"),
+            ),
+            mock.patch.object(
+                forward,
+                "ensure_key",
+                side_effect=AssertionError("Discovery cannot read or create keys"),
+            ),
+            mock.patch.object(
+                forward,
+                "kill_owned",
+                side_effect=AssertionError("Discovery cannot stop processes"),
+            ),
+        )
+        for patch in patches:
+            value = patch.start()
+            self.addCleanup(patch.stop)
+            if getattr(value, "_mock_name", None) == "healthy":
+                self.healthy = value
+
+    def write_state(self, local_port=8189, session=None, **changes):
+        session = session or self.args.session
+        forward.private_dir(self.args.state_dir)
+        directory = self.args.state_dir / forward.state_name(session, local_port)
+        forward.private_dir(directory)
+        state = {
+            "session": session,
+            "identity": str(self.args.identity),
+            "local_port": local_port,
+            "remote_port": 8188,
+            "process": self.owned,
+        }
+        state.update(changes)
+        forward.private_write(directory / "forward.json", state)
+        return directory / "forward.json"
+
+    def snapshot(self):
+        return {
+            str(path.relative_to(self.base)): (path.stat().st_mode, path.read_bytes())
+            for path in self.base.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+
+    def test_missing_state_returns_no_config_and_creates_nothing(self):
+        with mock.patch.object(
+            forward, "private_dir", side_effect=AssertionError("No mkdir")
+        ):
+            result = forward.execute(self.args)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["found"])
+        self.assertNotIn("local_port", result)
+        self.assertNotIn("identity", result)
+        self.assertFalse(self.args.state_dir.exists())
+
+    def test_owned_custom_port_and_identity_are_recovered_without_any_writes(self):
+        self.write_state()
+        before = self.snapshot()
+        self.args.local_port = 9191
+        self.args.identity = self.base / "different-unsaved-key"
+        result = forward.execute(self.args)
+        self.assertTrue(result["found"])
+        self.assertTrue(result["listening_owned"])
+        self.assertTrue(result["http_ready"])
+        self.assertEqual(result["local_port"], 8189)
+        self.assertEqual(result["remote_port"], 8188)
+        self.assertEqual(result["identity"], str(self.base / "key"))
+        self.assertEqual(result["url"], "http://127.0.0.1:8189")
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((self.base / "key").exists())
+
+    def test_other_session_forward_is_not_adopted_or_probed(self):
+        self.write_state(session="unrelated-session")
+        result = forward.execute(self.args)
+        self.assertFalse(result["found"])
+        self.healthy.assert_not_called()
+
+    def test_reused_pid_boot_or_process_group_never_authorizes_restore(self):
+        for changes in (
+            {"start_ticks": "different-start"},
+            {"boot_id": "different-boot"},
+            {"pgid": self.owned["pid"] + 1},
+        ):
+            with self.subTest(changes=changes):
+                if "boot_id" in changes:
+                    self.write_state(process={**self.owned, **changes})
+                else:
+                    self.write_state()
+                    self.processes[self.owned["pid"]] = {**self.owned, **changes}
+                self.assertFalse(forward.execute(self.args)["found"])
+                self.processes[self.owned["pid"]] = self.owned
+        self.healthy.assert_not_called()
+
+    def test_two_valid_owned_forwards_fail_instead_of_selecting_one(self):
+        self.write_state(local_port=8189)
+        self.write_state(local_port=8190)
+        with self.assertRaisesRegex(forward.ForwardError, "Multiple"):
+            forward.execute(self.args)
+        self.healthy.assert_not_called()
+
+    def test_live_legacy_metadata_requires_explicit_known_port_recovery(self):
+        state_path = self.write_state()
+        state = json.loads(state_path.read_text())
+        for field in ("session", "identity"):
+            state.pop(field)
+        forward.private_write(state_path, state)
+        with self.assertRaisesRegex(forward.ForwardError, "legacy.*known port"):
+            forward.execute(self.args)
+        self.healthy.assert_not_called()
+
+    def test_alive_process_without_its_owned_listener_is_not_restored(self):
+        self.write_state()
+        with (
+            mock.patch.object(forward, "owned_listener", return_value=False),
+            self.assertRaisesRegex(forward.ForwardError, "no owned listener"),
+        ):
+            forward.execute(self.args)
+        self.healthy.assert_not_called()
+
+    def test_stale_metadata_does_not_restore_a_dead_process(self):
+        self.write_state()
+        self.processes.clear()
+        result = forward.execute(self.args)
+        self.assertFalse(result["found"])
+        self.healthy.assert_not_called()
+
+    def test_live_unhealthy_forward_keeps_its_recorded_configuration(self):
+        self.write_state()
+        self.healthy.return_value = False
+        result = forward.execute(self.args)
+        self.assertTrue(result["found"])
+        self.assertTrue(result["running"])
+        self.assertFalse(result["http_ready"])
+        self.assertEqual(result["local_port"], 8189)
+
+    def test_inconsistent_path_port_and_key_metadata_fail_closed(self):
+        for changes in (
+            {"local_port": "8189"},
+            {"local_port": 8190},
+            {"remote_port": 0},
+            {"identity": "relative-key"},
+        ):
+            with self.subTest(changes=changes):
+                self.write_state(**changes)
+                with self.assertRaises(forward.ForwardError):
+                    forward.execute(self.args)
+        self.healthy.assert_not_called()
+
+    def test_private_directory_file_and_symlink_guards_are_read_only(self):
+        state_path = self.write_state()
+        state_path.chmod(0o644)
+        with self.assertRaisesRegex(forward.ForwardError, "private"):
+            forward.execute(self.args)
+        state_path.chmod(0o600)
+        directory = state_path.parent
+        directory.chmod(0o755)
+        with self.assertRaisesRegex(forward.ForwardError, "private"):
+            forward.execute(self.args)
+        directory.chmod(0o700)
+        outside = self.base / "outside-metadata"
+        state_path.rename(outside)
+        state_path.symlink_to(outside)
+        with self.assertRaises(OSError):
+            forward.execute(self.args)
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o600)
+        self.healthy.assert_not_called()
+
+    def test_discovery_only_outputs_public_recorded_fields(self):
+        self.write_state(token="fixture-secret-token")
+        result = forward.execute(self.args)
+        self.assertNotIn("fixture-secret-token", json.dumps(result))
+        self.assertNotIn("process", result)
 
 
 if __name__ == "__main__":

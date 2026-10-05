@@ -10,11 +10,13 @@ python3 scripts/dashboard.py
 
 这是独立的基础设施工具，不依赖 `video-render-lab` 的 Render API。2026-10-05 已确认四个模型均从 VM 本地磁盘加载，H3 音视频生成、输出保存及释放 G4 后从 Drive 取回通过。最新整套 40.07 GB 计时：先复制、落盘再本地 SHA 共 439.911 秒，其中本地 SHA 26.875 秒；同机随后同步复制校验共 367.357 秒。固定执行顺序和暖缓存影响比较，不能承诺固定提速。前轮同 VM receipt 元数据复用为 0.055 秒。
 
-最新版 TUI 已用真实 CPU 验证 `C` 创建、屏内配置与完整启动、PNG、停止、退出保留及 VM 释放；所有动作都需 Enter 确认。63 张真实终端帧和 3 张网页截图保存于 Git 外，离线 Demo 另有布局回归。**此前同一 CPU 上 SSH 和临时公开入口均通过 IAB 浏览器导入、Run 和图片预览；该轮 SSH 加载更快。后续用户日常 Chrome 手动打开 SSH 入口正常，受控 Chrome 标签仍被客户端拦截；邮箱模式登录尚未通过。** 浏览器测试使用无模型 PNG；H3 用 G4 API 验证。详见 [实测记录](docs/test-report.md) 与 [H3 调查](docs/colab-h3-research.md)。
+最新版上下选择向导已实际验证新建 CPU、两台 G4 的 Drive / 临时存储分支、四模型逐文件进度、SSH、退出保留与接回；G4 两分支均完成 H3 API 音视频生成，Drive 输出落盘通过。临时分支直接下载同步 SHA 用时 305.849 秒，Drive 分支复制同步 SHA 为 726.705 秒；来自不同 VM 和传输路径，不能作为固定速度比较。操作截图和逐步 Markdown 保存于 Git 外。
+
+本轮真实 Chrome 成功打开 G4 的 SSH 编辑器；IAB 实际导入、Run 并预览 PNG，也显示 H3 产物。Chrome 的测试文件上传需要扩展文件访问权限，本轮没有修改该权限。此前 Cloudflare 的客户端拦截原因尚未排清，邮箱登录未通过。H3 模型推理与媒体校验通过 API 工作流完成，不能据此宣称所有浏览器模板通过。详见 [实测记录](docs/test-report.md) 与 [H3 调查](docs/colab-h3-research.md)。
 
 ## 准备
 
-- 本机 Linux。启动器脚本与离线测试支持 Python 3.10+；官方 `google-colab-cli==0.7.4` 的独立工具环境需要 Python 3.12+。先完成 CLI 的 Google OAuth 登录。
+- 本机 Linux。启动器脚本与离线测试支持 Python 3.10+；官方 `google-colab-cli==0.7.4` 的独立工具环境需要 Python 3.12+。向导会检查 CLI 登录，必要时引导完成 Google OAuth。
 - Colab 账号有可用资源。GPU 类型和计费随账号及供应变化；先查看 `colab --auth=oauth2 usage`。Colab 对主要通过 Web UI / SSH 使用 runtime 的限制见[官方 FAQ](https://research.google.com/colaboratory/faq.html)；使用符合要求的付费资源。
 - 使用邮箱模式时，准备一个能收取 Cloudflare 登录验证码的邮箱；公开模式不需要邮箱。Google Drive 按提供方实际提示完成人工授权；不保存或重放授权链接。
 - 默认仅启用官方 ComfyUI 节点，不安装第三方 Manager 或未知自定义节点。
@@ -29,11 +31,24 @@ colab --auth=oauth2 sessions
 
 ## 终端界面
 
-界面采用暖橙强调色、青色模型卡片、状态颜色和字节进度条；宽屏左右分区，80×24 紧凑排列。**先输入一个操作码，再按 Enter 执行**；只输入字母不会触发操作，大小写有不同含义，例如 `C` 创建 CPU、`c` 配置，`H` 停止 SSH、`h` 启动 SSH。
+默认是逐步启动向导，采用 ComfyUI `#F2FF59`、Colab `#E77012` / `#F9AA00` 配色。**上下选择，Enter 确认**；移动选中项不会执行操作。Esc 返回或取消输入；PgUp / PgDn 翻看右侧详情。输入字段为空时显示默认值，开始输入后提示消失，普通输入使用高对比文字。
 
-全屏界面中，`Esc` 清除未提交的操作码，Backspace 删除一个字符；`Tab` 直接切换菜单与详情，`PgUp` / `PgDn` 直接翻页，查看四个模型的完整文件名与进度。这些导航键无需 Enter。配置和会话选择在界面内输入，Enter 提交，空输入保留提示中的默认值或取消选择，`Esc` 取消当前表单。仍使用 Python 标准库，无需安装额外 TUI 依赖。
+首次使用：
 
-先看离线界面，不分配 Colab、不访问凭据、不打开浏览器：
+1. 选择 **Create a new runtime**，选择 GPU 或 CPU；GPU 再选择型号。G4 是本项目已测型号，其余型号的 H3 兼容性未验证。
+2. 选择 **Google Drive** 或 **VM disk**。前者长期缓存模型和保存输出；后者跳过挂载，直接下载到 VM，释放后不保留模型与输出。
+3. 检查配置摘要，再确认创建。首次缺少专用 SSH key 时，明确选择创建或填写已有 key 路径；不会覆盖已有 key。
+4. 若官方 CLI 登录或 Drive 挂载要求授权，右侧显示本轮链接和操作提示，选择 **Open authorization in browser**。按提供方要求完成后，选择 **I have authorized · continue**；若官方 CLI 要求 code，在屏内遮罩输入。子终端保持在后台，不切走 TUI；实际挂载和 MyDrive 检查通过才继续。
+5. 自动部署、安装、准备 GPU 模型并启动 ComfyUI。右侧显示每个文件的下载、复制或校验进度；CPU 跳过 H3。下载和复制同步计算 SHA256，已有同 VM 验证记录复用会明确标注没有新计算 SHA。
+6. 自动建立 SSH 转发并验证本机 HTTP；出现 **ComfyUI is ready** 后选择 **Open ComfyUI in browser**。
+
+**View existing runtimes** 会先核对真实状态、恢复已有配置，再显示概览或继续缺少的步骤。不会因为 CLI 超时自动重复新建。配置未知时重新选择存储；已有运行服务的存储和访问模式不能直接覆盖。更改已运行 SSH 的端口或 key 前，先到 Advanced actions 停止旧转发。
+
+同一实例的唯一有效 owned SSH 转发会恢复实际端口和 key 路径，再检查本机 HTTP；不会静默回到 8188。多个转发或旧版本缺少配置的活跃记录需明确处理：用已知端口停止旧转发，再继续向导。只读状态查询遇到连接关闭或本机命令超时最多尝试三次；创建、安装、准备等写操作不因此重复提交。
+
+Ready 页面可以打开浏览器、**Exit and keep resources**、**End this VM** 或查看其他实例。Exit 保留 VM、已运行服务、转发和远端任务；End this VM 有独立确认，默认选中 Cancel，且只清理选中的实例。启动期间请求释放会取消后续协调并串行清理原实例。挂载、启动失败或状态未知时停在错误页，先 Inspect 再处理，不自动重试未知结果。
+
+离线预览不创建 Colab、不访问凭据、不打开浏览器：
 
 ```bash
 python3 scripts/dashboard.py --demo
@@ -41,32 +56,17 @@ python3 scripts/dashboard.py --demo --demo-state ready
 python3 scripts/dashboard.py --demo --demo-state error
 ```
 
-Demo 只允许 `Tab`、翻页等浏览操作，以及 `q` + Enter 退出；创建、启动和释放操作均禁用。彩色界面要求交互终端与 `TERM` 支持；`--no-color` 或 `NO_COLOR` 环境变量关闭配色。`TERM=dumb` 或 curses 初始化失败时退回无 ANSI 的文字交互，输入整行操作码后按 Enter；非交互 Demo 只打印一次快照。
+Demo 是只读 fixture，可预览导航、输入与进度，不作为云端成功证据。`--no-color` 或 `NO_COLOR` 关闭配色。`TERM=dumb` 或 curses 不可用时退回数字选项 + Enter 的文字界面；需输入敏感授权 code 时使用全屏终端。非交互 Demo 只输出一次快照。支持 Python 3.10+，只使用标准库，不需额外 TUI 框架。
 
-启动 `dashboard.py` 后，输入 `n` + Enter 新建 G4、`C` + Enter 新建 CPU，或 `e` + Enter 选择已有会话。输入 `c` + Enter 配置专用 Drive 目录、访问方式和本机 SSH 端口；默认目录是 `/content/drive/MyDrive/colab-comfyui-launcher-test`，可改为自己的专用目录。配置、选择和普通创建、释放过程均留在 TUI，后台操作通过状态卡片报告结果。
+需要旧操作码界面时显式运行 `python3 scripts/dashboard.py --classic`；`f` 是完整部署/安装/准备/启动流程，`m` 单独挂载，`H` 停止 SSH，`s` 停服务保留 VM，`X` 释放 VM，`q` 保留资源退出。这些操作码都需 Enter。新向导用 **Advanced actions** 管理单独步骤，正常启动无需记操作码。
 
-新建 VM 后的 `not_deployed` 是正常状态：VM 已就绪，launcher 尚未部署。输入 `d` + Enter 只部署脚本，或 `f` + Enter 进行完整启动；创建 VM 和查看这一状态不要求挂载 Drive。只做 CPU 页面和 PNG 测试时，可在 `c` 配置中把 Storage 设为 `ephemeral`、CPU mode 设为 `yes`，再执行 `f` + Enter，无需 Drive 或 H3 模型。
+完整导航和两条存储分支见 [启动流程图](docs/startup-wizard.md)。
 
-输入 `f` + Enter 执行完整启动流程：在界面内确认配置，使用持久存储时人工挂载 Drive，然后部署、安装并等待完成；GPU 模式继续下载缺失的模型缓存、复制并校验到 VM，CPU 模式跳过 H3 准备。服务就绪后，默认 `local-only` 模式启动 SSH 转发。界面显示安装阶段、逐文件进度、速率、服务状态和访问地址；输入 `o` + Enter 打开就绪的访问地址。
+### H3 模板提示缺模型
 
-Drive 挂载是交互例外：`m` + Enter，或完整流程中的 Drive 步骤，会暂时切回真实终端。按提供方显示的提示在终端和浏览器完成人工授权，再返回 TUI；界面不会代填授权信息或捕获验证码、认证链接。选择 `ephemeral` 时跳过这一步。
+当前 40.07 GB 清单含基础 FL2VA、Qwen 文本编码器、视频 VAE 和音频 VAE，项目的 `workflows/h3-api.json` 用这四个文件运行基础文本生成视频测试。它没有囊括所有 H3 模板的可选权重。
 
-SSH 默认密钥路径是 `~/.ssh/colab_comfyui_launcher`。该密钥缺失时，配置会询问是否在 SSH 启动时创建；只有明确回答 `yes` 才创建专用无口令 Ed25519 密钥。已有密钥不会被覆盖；已有加密密钥不会被修改，后台转发不支持其交互口令输入。
-
-更改本机 SSH 端口或密钥前，界面会实时检查旧配置的转发。已运行或状态无法确认时拒绝修改；先输入 `H` + Enter 关闭原转发，再重新配置。切换访问模式也需先停止已运行服务，完整流程不会把旧服务健康当成新启动成功。
-
-| 操作码（输入后按 Enter） | 操作 |
-| --- | --- |
-| `n` / `C` / `e` | 新建 G4 / 新建 CPU / 选择已有会话 |
-| `c` / `m` / `f` | 配置 / 人工挂载 Drive / 完整启动流程 |
-| `d` / `i` / `w` / `p` / `a` | 部署 / 安装 / 仅下载缓存 / 准备本地模型 / 启动服务 |
-| `h` / `H` | 启动 / 停止本机 SSH 转发 |
-| `o` / `r` / `t` | 打开浏览器 / H3 API 渲染 / PNG smoke 测试 |
-| `s` | 停止转发和服务，保留 VM |
-| `X` | 停止转发和服务，并释放选中的 VM |
-| `q` | 退出界面，保留 VM、已启动服务和转发 |
-
-自动状态刷新期间可排入一次手动操作；完整流程等待期间输入 `s` + Enter 或 `X` + Enter，可中断后续启动并串行清理该流程原会话。正在执行的短 CLI 命令会先返回。`q` + Enter 退出界面并保留计算资源、服务和转发；进行中的远端任务也可能继续运行。完整流程失败或超时会停止协调，不自动重试未知状态的操作。返回界面查看状态后再处理，用 `X` + Enter 释放自己创建或明确获授权停止的会话。
+官方 I2V 模板可能提示缺少 `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors`（约 1.82 GB），这是用于加速的 Turbo LoRA。可按[官方指南](https://docs.comfy.org/tutorials/video/minimax/minimax-h3)选择基础模式或补充对应 LoRA；本启动器尚未验证 Turbo 工作流，不自动下载这份附加权重。`Missing Inputs` 则表示 I2V 还没有选择输入图片。R2V 等其他模式也可能需要各自的生成模型，不能把四模型测试通过理解为所有模板均可直接运行。
 
 ## 手动启动
 
@@ -94,6 +94,13 @@ GPU 服务启动前必须准备本地 H3 模型。下面一个后台任务会下
 python3 scripts/colabctl.py -s "$SESSION" prepare \
   --download-missing --cache-root "$STORAGE_ROOT/models" --max-seconds 1800
 python3 scripts/colabctl.py -s "$SESSION" status
+```
+
+若已明确选择临时 VM 存储，跳过 Drive，改用下面命令；权重直接下载到 VM 模型目录并同步 SHA，不另外保存一份 40 GB 临时缓存。启动时同样加 `--ephemeral`。
+
+```bash
+python3 scripts/colabctl.py -s "$SESSION" prepare \
+  --ephemeral --download-missing --max-seconds 1800
 ```
 
 等待 `model_prepare.running: false`、`model_prepare.status: succeeded`、`model_prepare.result.ok: true` 和 `models_ready: true`，再启动 GPU 服务。逐文件进度位于 `model_prepare.progress`。只有 `started` 表示后台任务已接受，不能当成模型已经就绪。

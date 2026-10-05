@@ -231,6 +231,7 @@ def start(args):
     state = {
         "storage_root": str(root),
         "ephemeral": args.ephemeral,
+        "cpu": args.cpu,
         "started_at": time.time(),
         "access_mode": "local" if local_only else ("public" if public else "email"),
         "local_models_root": str(model_root),
@@ -352,8 +353,29 @@ def start(args):
         raise
 
 
+def recorded_configuration(state):
+    """Expose only recorded settings; absent legacy fields require user choice."""
+    if not state:
+        return None
+    access = state.get("access_mode")
+    root = state.get("storage_root")
+    return {
+        "source": "services",
+        "ephemeral": state.get("ephemeral")
+        if type(state.get("ephemeral")) is bool
+        else None,
+        "cpu": state.get("cpu") if type(state.get("cpu")) is bool else None,
+        "storage_root": root
+        if isinstance(root, str) and Path(root).is_absolute()
+        else None,
+        "access_mode": access if access in ("local", "public", "email") else None,
+    }
+
+
 def status(_args):
     state = read_json(STATE)
+    drive_mounted = os.path.ismount("/content/drive")
+    mydrive = Path("/content/drive/MyDrive")
     return {
         "ok": True,
         "installation": read_json(BASE / "install.json"),
@@ -363,12 +385,16 @@ def status(_args):
         "url": state.get("url"),
         "storage_root": state.get("storage_root"),
         "access_mode": state.get("access_mode"),
+        "configuration": recorded_configuration(state),
         "local_models_root": state.get("local_models_root", str(BASE / "models")),
         "models_ready": local_models_ready(),
         "model_loading": state.get("model_loading"),
         "runtime": hardware_info(),
         "drive": {
-            "mounted": os.path.ismount("/content/drive"),
+            "mounted": drive_mounted,
+            "mydrive_ready": bool(
+                drive_mounted and mydrive.is_dir() and not mydrive.is_symlink()
+            ),
             "path": "/content/drive",
         },
     }
