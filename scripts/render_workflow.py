@@ -10,7 +10,9 @@ import math
 import os
 import re
 import signal
+import stat
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -22,9 +24,17 @@ BASE = Path("/content/colab-comfyui-runtime")
 CONTENT_ROOT = Path("/content")
 DRIVE_MOUNT = CONTENT_ROOT / "drive"
 ORIGIN = "http://127.0.0.1:8188"
-DEFAULT_WORKFLOW = Path(__file__).resolve().parents[1] / "workflows/h3-api.json"
+DEFAULT_WORKFLOW = Path(__file__).resolve().parents[1] / "workflows/h3-i2v-api.json"
 DEFAULT_RESULT = BASE / "render-result.json"
 CHUNK_BYTES = 4 * 1024 * 1024
+I2V_INPUT_NAME = "launcher-h3-i2v-example.png"
+I2V_INPUT_URL = (
+    "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/"
+    "0e5c5efb32ba6f3365d6da07da64aaf668157042/"
+    "input/transparent_rgb_gaming_mouse.png"
+)
+I2V_INPUT_SIZE = 1_383_312
+I2V_INPUT_SHA256 = "49696748d2fff0e8c9b63c7173c6d6282b70eac0195def5b39402f9564410e75"
 
 
 def load_runtime():
@@ -154,8 +164,176 @@ def load_workflow(path):
     return workflow, hashlib.sha256(data).hexdigest()
 
 
+def uses_example_input(workflow):
+    return any(
+        isinstance(node, dict)
+        and node.get("class_type") == "LoadImage"
+        and isinstance(node.get("inputs"), dict)
+        and node["inputs"].get("image") == I2V_INPUT_NAME
+        for node in workflow.values()
+    )
+
+
+def verify_example_input(path, deadline):
+    """Read only the dedicated regular fixture; never repair or replace it."""
+    try:
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != I2V_INPUT_SIZE:
+                raise RenderError("Existing I2V example image has an unexpected size")
+            digest, size = hash_stream(stream, deadline)
+    except OSError:
+        raise RenderError("I2V example image is not a readable regular file") from None
+    if size != I2V_INPUT_SIZE or digest != I2V_INPUT_SHA256:
+        raise RenderError("Existing I2V example image failed SHA256 verification")
+    return {
+        "filename": I2V_INPUT_NAME,
+        "bytes": size,
+        "sha256": digest,
+        "verification": "sha256",
+        "action": "reused",
+    }
+
+
+def prepare_example_input(workflow, output_root, deadline):
+    """Prepare the pinned template asset only when its reserved name is used."""
+    if not uses_example_input(workflow):
+        return None
+    deadline.remaining()
+    root = Path(output_root).parent.resolve()
+    input_root = root / "input"
+    if input_root.is_symlink() or not input_root.resolve().is_relative_to(root):
+        raise RenderError("Owned input directory is a symlink or escapes storage")
+    try:
+        input_root.mkdir(exist_ok=True)
+    except OSError:
+        raise RenderError("Owned input directory is unavailable") from None
+    path = input_root / I2V_INPUT_NAME
+    if path.is_symlink():
+        raise RenderError("I2V example image must not be a symlink")
+    if path.exists():
+        return verify_example_input(path, deadline)
+    temporary = None
+    reservation = None
+    try:
+        descriptor, filename = tempfile.mkstemp(
+            dir=input_root, prefix=".launcher-h3-i2v-", suffix=".partial"
+        )
+        temporary = Path(filename)
+        digest = hashlib.sha256()
+        size = 0
+        request = urllib.request.Request(
+            I2V_INPUT_URL, headers={"Accept-Encoding": "identity"}
+        )
+        with (
+            os.fdopen(descriptor, "wb") as target,
+            urllib.request.urlopen(
+                request, timeout=min(15, deadline.remaining())
+            ) as response,
+        ):
+            while True:
+                deadline.remaining()
+                chunk = response.read(min(CHUNK_BYTES, I2V_INPUT_SIZE - size + 1))
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > I2V_INPUT_SIZE:
+                    raise RenderError(
+                        "Downloaded I2V example image exceeds pinned size"
+                    )
+                digest.update(chunk)
+                target.write(chunk)
+            if size != I2V_INPUT_SIZE or digest.hexdigest() != I2V_INPUT_SHA256:
+                raise RenderError(
+                    "Downloaded I2V example image failed size/SHA256 verification"
+                )
+            target.flush()
+            os.fsync(target.fileno())
+        deadline.remaining()
+        # O_EXCL protects existing filenames without relying on Drive hardlinks.
+        try:
+            descriptor = os.open(
+                path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+            )
+        except FileExistsError:
+            return verify_example_input(path, deadline)
+        with os.fdopen(descriptor, "wb") as reserved:
+            metadata = os.fstat(reserved.fileno())
+            reservation = (metadata.st_dev, metadata.st_ino)
+        metadata = path.lstat()
+        if (metadata.st_dev, metadata.st_ino) != reservation:
+            raise RenderError("I2V example image changed before publication")
+        os.replace(temporary, path)
+        temporary = None
+        reservation = None
+        return {
+            "filename": I2V_INPUT_NAME,
+            "bytes": size,
+            "sha256": digest.hexdigest(),
+            "verification": "sha256",
+            "action": "downloaded",
+        }
+    except (urllib.error.URLError, OSError):
+        raise RenderError("Cannot prepare the pinned I2V example image") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        if reservation is not None:
+            with contextlib.suppress(OSError):
+                metadata = path.lstat()
+                if (metadata.st_dev, metadata.st_ino) == reservation:
+                    path.unlink()
+
+
+def autogrow_input_schema(descriptor, prefix):
+    """Match the pinned V3 Autogrow names/prefix templates, without a parent value."""
+    metadata = descriptor[1] if len(descriptor) > 1 else None
+    template = metadata.get("template") if isinstance(metadata, dict) else None
+    if not isinstance(template, dict):
+        raise RenderError("ComfyUI returned an unsupported Autogrow schema")
+    names = template.get("names")
+    if names is None:
+        name_prefix = template.get("prefix")
+        maximum = template.get("max")
+        if (
+            not isinstance(name_prefix, str)
+            or type(maximum) is not int
+            or not 1 <= maximum <= 100
+        ):
+            raise RenderError("ComfyUI returned an unsupported Autogrow template")
+        names = [f"{name_prefix}{index}" for index in range(maximum)]
+    minimum = template.get("min")
+    if (
+        not isinstance(names, list)
+        or len(names) > 100
+        or not all(isinstance(name, str) and name for name in names)
+        or len(set(names)) != len(names)
+        or type(minimum) is not int
+        or not 0 <= minimum <= len(names)
+        or not isinstance(template.get("input"), dict)
+    ):
+        raise RenderError("ComfyUI returned an unsupported Autogrow template")
+    child = None
+    template_required = False
+    for category in ("required", "optional"):
+        fields = template["input"].get(category, {})
+        if not isinstance(fields, dict):
+            raise RenderError("ComfyUI returned an unsupported Autogrow input")
+        if fields:
+            child = next(iter(fields.values()))
+            template_required = category == "required"
+            break
+    if not isinstance(child, (list, tuple)) or not child:
+        raise RenderError("ComfyUI returned an unsupported Autogrow input")
+    result = {"required": {}, "optional": {}}
+    for index, name in enumerate(names):
+        category = "required" if template_required and index < minimum else "optional"
+        result[category][prefix + name] = child
+    return result
+
+
 def finalized_input_schema(schema, inputs, prefix=""):
-    """Expand selected V3 DynamicCombo branches using API dot-separated inputs."""
+    """Expand the pinned V3 DynamicCombo and Autogrow API dot-separated inputs."""
     finalized = {"required": {}, "optional": {}}
     for category in ("required", "optional"):
         fields = schema.get(category, {})
@@ -169,6 +347,11 @@ def finalized_input_schema(schema, inputs, prefix=""):
             ):
                 raise RenderError("ComfyUI returned an unsupported input descriptor")
             full_name = prefix + name
+            if descriptor[0] == "COMFY_AUTOGROW_V3":
+                children = autogrow_input_schema(descriptor, full_name + ".")
+                for child_category, declarations in finalized.items():
+                    declarations.update(children[child_category])
+                continue
             finalized[category][full_name] = descriptor
             if descriptor[0] != "COMFY_DYNAMICCOMBO_V3":
                 continue
@@ -203,6 +386,7 @@ def finalized_input_schema(schema, inputs, prefix=""):
 
 def validate_workflow(workflow, info):
     save_nodes = []
+    output_nodes = []
     for node_id, node in workflow.items():
         if not isinstance(node_id, str) or not isinstance(node, dict):
             raise RenderError("Workflow node IDs and objects are invalid")
@@ -214,6 +398,38 @@ def validate_workflow(workflow, info):
             or not isinstance(inputs, dict)
         ):
             raise RenderError("A required workflow node is unavailable or malformed")
+        if kind == "SaveVideo":
+            save_nodes.append(node_id)
+        if kind == "SaveVideo" or info[kind].get("output_node") is True:
+            output_nodes.append(node_id)
+    if not save_nodes:
+        raise RenderError("Workflow must contain a SaveVideo output node")
+
+    # Official UI exports include disconnected draft nodes. ComfyUI checks all
+    # node classes, but validates inputs only for ancestors of output nodes.
+    reachable = set()
+    pending = output_nodes[:]
+    while pending:
+        node_id = pending.pop()
+        if node_id in reachable:
+            continue
+        reachable.add(node_id)
+        for value in workflow[node_id]["inputs"].values():
+            if (
+                isinstance(value, list)
+                and len(value) == 2
+                and isinstance(value[0], str)
+                and type(value[1]) is int
+            ):
+                if value[0] not in workflow:
+                    raise RenderError("Workflow has an invalid node output link")
+                pending.append(value[0])
+
+    for node_id, node in workflow.items():
+        if node_id not in reachable:
+            continue
+        kind = node["class_type"]
+        inputs = node["inputs"]
         schema = finalized_input_schema(info[kind].get("input", {}), inputs)
         required = schema.get("required", {})
         optional = schema.get("optional", {})
@@ -259,10 +475,6 @@ def validate_workflow(workflow, info):
             if field_type == "STRING" and not isinstance(value, str):
                 raise RenderError("Workflow string input has an invalid type")
             # DynamicCombo objects are validated authoritatively by POST /prompt.
-        if kind == "SaveVideo":
-            save_nodes.append(node_id)
-    if not save_nodes:
-        raise RenderError("Workflow must contain a SaveVideo output node")
     return save_nodes
 
 
@@ -502,6 +714,11 @@ def render(args, report):
             raise RenderError("Owned ComfyUI service is not alive")
         output_root = owned_storage(state)
         workflow, workflow_sha = load_workflow(args.workflow)
+        if uses_example_input(workflow):
+            report.update(status="preparing_input")
+            report.update(
+                example_input=prepare_example_input(workflow, output_root, deadline)
+            )
         http_json("/system_stats", deadline)
         save_nodes = validate_workflow(workflow, http_json("/object_info", deadline))
         report.update(

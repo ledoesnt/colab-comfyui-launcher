@@ -39,14 +39,14 @@ def local_models_root(path=None):
     return cache.models_root(selected, True)
 
 
-def local_cache_ready(root, manifest_path):
+def local_cache_ready(root, manifest_path, extra_manifest_paths=()):
     """Small metadata checks only; intended for the service's pre-start guard."""
     try:
         expected = cache.CONTENT_ROOT / "colab-comfyui-runtime" / "models"
         if Path(root) != expected or not expected.is_dir():
             return False
         cache.check_path(expected, expected.parent)
-        manifest = cache.load_manifest(manifest_path)
+        manifest = cache.load_manifests(manifest_path, extra_manifest_paths)
         receipts = cache.Receipts(
             expected, manifest["repo_id"], manifest["revision"], boot_id()
         )
@@ -259,7 +259,8 @@ def prepare_ephemeral(args, manifest, local, deadline, progress):
 
 def run(args):
     with cache.time_budget(args.max_seconds) as deadline:
-        manifest = cache.load_manifest(args.manifest)
+        extra_manifests = getattr(args, "extra_manifest", ())
+        manifest = cache.load_manifests(args.manifest, extra_manifests)
         ephemeral = getattr(args, "ephemeral", False)
         if ephemeral and args.cache_root is not None:
             raise cache.DownloadError(
@@ -277,7 +278,7 @@ def run(args):
                 results = prepare_drive(
                     args, manifest, source, local, deadline, progress
                 )
-            if not local_cache_ready(local, args.manifest):
+            if not local_cache_ready(local, args.manifest, extra_manifests):
                 raise cache.DownloadError("Prepared local model receipts are not ready")
             progress.finish(True)
         except BaseException:
@@ -287,6 +288,7 @@ def run(args):
             "ok": True,
             "repo_id": manifest["repo_id"],
             "revision": manifest["revision"],
+            "sources": manifest["sources"],
             "cache_root": None if ephemeral else str(source),
             "models_root": str(local),
             "ephemeral": ephemeral,
@@ -341,6 +343,13 @@ def prepare_drive(args, manifest, source, local, deadline, progress):
 def main(argv=None):
     parser = cache.JsonArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=cache.DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--extra-manifest",
+        type=Path,
+        action="append",
+        default=[],
+        help="Append a pinned model manifest; repeat for additional repositories",
+    )
     parser.add_argument(
         "--cache-root", type=Path, help="Pinned model cache under mounted Drive/MyDrive"
     )

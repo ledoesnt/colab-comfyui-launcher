@@ -295,6 +295,30 @@ class WorkerTests(unittest.TestCase):
             "only-selected-session",
         )
 
+    def test_ssh_start_refreshes_remote_state_before_completing_action(self):
+        fresh = {"comfyui_alive": True, "http_ready": True}
+        self.backend.bridge.return_value = fresh
+        self.backend.ssh.return_value = {
+            "running": True,
+            "http_ready": True,
+            "url": "http://127.0.0.1:8188",
+        }
+        self.assertTrue(self.worker.submit("ssh_start", self.config))
+        self.finish()
+        self.backend.ssh.assert_called_once_with(self.config, "start")
+        self.backend.bridge.assert_called_once_with(self.config, "status")
+        events = self.events()
+        self.assertEqual(
+            [kind for kind, _ in events], ["stage", "ssh", "status", "done"]
+        )
+        self.assertEqual(events[2], ("status", fresh))
+
+    def test_ssh_stop_refreshes_remote_state_without_stopping_remote_services(self):
+        self.assertTrue(self.worker.submit("ssh_stop", self.config))
+        self.finish()
+        self.backend.ssh.assert_called_once_with(self.config, "stop")
+        self.backend.bridge.assert_called_once_with(self.config, "status")
+
     def test_one_manual_render_waits_for_status_without_overlap_or_duplicate(self):
         entered, resume = threading.Event(), threading.Event()
         observed = []

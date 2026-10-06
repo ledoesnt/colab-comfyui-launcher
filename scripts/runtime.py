@@ -221,6 +221,10 @@ def start(args):
         "checkpoints",
         "loras",
         "clip_vision",
+        "embeddings",
+        "controlnet",
+        "upscale_models",
+        "style_models",
     ):
         if (model_root / category).is_symlink():
             raise ValueError("Local model categories must not be symlinks")
@@ -236,6 +240,9 @@ def start(args):
         "access_mode": "local" if local_only else ("public" if public else "email"),
         "local_models_root": str(model_root),
         "model_loading": "local_disk",
+        "model_search_categories": [
+            key for key in paths["launcher"] if key not in ("base_path", "is_default")
+        ],
         "startup_request_id": getattr(args, "request_id", None) or uuid.uuid4().hex,
     }
     progress = BASE / "startup-progress.json"
@@ -389,6 +396,7 @@ def status(_args):
         "local_models_root": state.get("local_models_root", str(BASE / "models")),
         "models_ready": local_models_ready(),
         "model_loading": state.get("model_loading"),
+        "model_search_categories": state.get("model_search_categories"),
         "runtime": hardware_info(),
         "drive": {
             "mounted": drive_mounted,

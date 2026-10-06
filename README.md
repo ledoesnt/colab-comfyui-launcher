@@ -8,11 +8,11 @@ python3 scripts/dashboard.py
 
 默认通过 `local-only` 服务与 SSH 转发，在本机 `http://127.0.0.1:8188` 访问。也可以显式选择 `--public` Cloudflare 临时公开网址，或 `--allowed-email` 邮箱登录；不会自动公开服务。SSH 模式需要专用密钥，创建密钥必须由你明确选择。
 
-这是独立的基础设施工具，不依赖 `video-render-lab` 的 Render API。2026-10-05 已确认四个模型均从 VM 本地磁盘加载，H3 音视频生成、输出保存及释放 G4 后从 Drive 取回通过。最新整套 40.07 GB 计时：先复制、落盘再本地 SHA 共 439.911 秒，其中本地 SHA 26.875 秒；同机随后同步复制校验共 367.357 秒。固定执行顺序和暖缓存影响比较，不能承诺固定提速。前轮同 VM receipt 元数据复用为 0.055 秒。
+这是独立的基础设施工具，不依赖 `video-render-lab` 的 Render API。2026-10-06 在真实 G4 上完成官方 Popular H3 I2V 浏览器基础 / 8 步 Turbo 两次生成、音视频校验、六模型准备、同 VM 模型维护及工作流服务重启恢复。六文件约 42.03 GB 全量直接下载并校验用时 405.142 秒；同四文件 Drive 首次复制 792.101 秒、直接下载 387.167 秒。两路并发样本比串行缩短约四分之一，Drive 暖缓存样本则更快；这些固定顺序实测不能作为新 VM 的速度保证。最后一次重启后的 API 回归在 120 秒上限内未完成，记录为超时；本轮 G4 和 SSH 已释放。详见 [本轮记录](docs/test-report.md)。
 
-最新版上下选择向导已实际验证新建 CPU、两台 G4 的 Drive / 临时存储分支、四模型逐文件进度、SSH、退出保留与接回；G4 两分支均完成 H3 API 音视频生成，Drive 输出落盘通过。临时分支直接下载同步 SHA 用时 305.849 秒，Drive 分支复制同步 SHA 为 726.705 秒；来自不同 VM 和传输路径，不能作为固定速度比较。操作截图和逐步 Markdown 保存于 Git 外。
+2026-10-05 的历史向导验证覆盖新建 CPU、两台 G4 的 Drive / 临时存储分支、四模型逐文件进度、SSH、退出保留与接回；两分支完成原 T2V API 音视频生成。临时下载为 305.849 秒，Drive 复制为 726.705 秒，来自不同 VM。另一次历史同机先复制再本地 SHA 共 439.911 秒，其中本地 SHA 26.875 秒；随后同步复制校验为 367.357 秒，受顺序和暖缓存影响。逐步操作截图和 Markdown 保存在 Git 外。
 
-本轮真实 Chrome 成功打开 G4 的 SSH 编辑器；IAB 实际导入、Run 并预览 PNG，也显示 H3 产物。Chrome 的测试文件上传需要扩展文件访问权限，本轮没有修改该权限。此前 Cloudflare 的客户端拦截原因尚未排清，邮箱登录未通过。H3 模型推理与媒体校验通过 API 工作流完成，不能据此宣称所有浏览器模板通过。详见 [实测记录](docs/test-report.md) 与 [H3 调查](docs/colab-h3-research.md)。
+本轮 IAB 在 SSH 本地网址完成 Popular I2V 的实际上传、Run、视频预览与保存。受控 Chrome 标签仍报 `ERR_BLOCKED_BY_CLIENT`，其拦截来源未确定；本轮没有修改扩展或安全设置。此前 Cloudflare 邮箱登录未通过。仅已实际执行的模板计入验收。详见 [实测记录](docs/test-report.md) 与 [H3 调查](docs/colab-h3-research.md)。
 
 ## 准备
 
@@ -68,6 +68,7 @@ Demo 是只读 fixture，可预览导航、输入与进度，不作为云端成�
 | --- | --- |
 | Inspect current runtime | 查询真实状态，恢复已保存的配置与本机 SSH 转发信息。 |
 | Authorize / check Google Drive | 检查 Drive；需要时在屏内引导授权，已挂载则跳过。VM disk 模式直接跳过，不切换存储模式。 |
+| Prepare / refresh models | 把本机最新模型清单部署到当前 GPU 实例，准备并验证新增模型，保留服务与 SSH；已有任务先等待，不重复提交。 |
 | Run a PNG smoke test | 运行无模型的 64×64 PNG 工作流，检查执行、输出获取与存储一致性；CPU 也可使用。 |
 | Render the H3 API test | 执行项目固定的 H3 视频测试并校验媒体和存储输出；需要 GPU、已准备的模型和运行中的 ComfyUI。 |
 | Stop services · retain VM | 先停止本机 owned SSH 转发，再停止启动器服务；保留 VM。 |
@@ -79,11 +80,23 @@ Demo 是只读 fixture，可预览导航、输入与进度，不作为云端成�
 
 完整导航和两条存储分支见 [启动流程图](docs/startup-wizard.md)。
 
-### H3 模板提示缺模型
+### H3 I2V 模板与追加模型
 
-当前 40.07 GB 清单含基础 FL2VA、Qwen 文本编码器、视频 VAE 和音频 VAE，项目的 `workflows/h3-api.json` 用这四个文件运行基础文本生成视频测试。它没有囊括所有 H3 模板的可选权重。
+当前默认清单在原四个基础模型上增加官方 I2V 模板需要的 Turbo LoRA，以及模板说明中列出的可选风格 embedding，共六个文件、42,030,547,279 字节（约 42.03 GB）。原来的 FL2VA INT8、Qwen NVFP4、视频 VAE INT8 和音频 VAE FP32 精度保持不变。
 
-官方 I2V 模板可能提示缺少 `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors`（约 1.82 GB），这是用于加速的 Turbo LoRA。可按[官方指南](https://docs.comfy.org/tutorials/video/minimax/minimax-h3)选择基础模式或补充对应 LoRA；本启动器尚未验证 Turbo 工作流，不自动下载这份附加权重。`Missing Inputs` 则表示 I2V 还没有选择输入图片。R2V 等其他模式也可能需要各自的生成模型，不能把四模型测试通过理解为所有模板均可直接运行。
+`minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors` 位于 VM 的 `loras`；`minimaxh3_art_is_explosion.safetensors` 位于 `embeddings`，后者仅是可选风格 token。通过 extra model paths 注册到 ComfyUI，因此物理路径无需在 ComfyUI 源码目录里面，模型始终从 VM 本地读取。`Missing Inputs` 表示仍须选择输入图片。R2V 等其他模式可能需要另一套模型。
+
+浏览器测试使用 **Templates → Popular → MiniMax H3: Image to Video**；仓库保存了完全一致的 [UI 模板](workflows/h3-i2v-ui.json)。模板来源、输入图片、参数和测试方式见 [I2V 说明](docs/h3-i2v.md)。原 T2V API 工作流仍保留为 `workflows/h3-api.json`。
+
+后续模型追加到 [models/extra.json](models/extra.json)，不同 Hugging Face 仓库各建一个 `models/extra-名称.json`。清单固定仓库 revision、文件路径、大小与 SHA256；在已启动的 TUI 中选择 **Advanced actions → Prepare / refresh models** 即可应用到同一 VM，再刷新 ComfyUI 模型列表。已验证的原模型会复用同 VM receipt。详见 [追加模型说明](docs/models.md)。下载权重不会自动安装它所需的自定义节点。
+
+当前 Colab 属于 self-hosted 网页版，模板的 Download 按钮通常把模型下载到你电脑的浏览器，不能替启动器把文件放到 Colab；ComfyUI Desktop 才有直接安装到服务端的流程，见[官方模板说明](https://docs.comfy.org/interface/features/template)。因此优先通过清单准备模型，既可在启动前，也可在启动后执行。
+
+### 保存和重新打开工作流
+
+本轮界面通过顶部 **Graph 旁的下拉箭头 → Save As** 保存服务端工作流，下一次从左侧 **Workflows** 双击名称打开；其他版本可能放在 File 菜单。Drive 模式路径是所选专用目录下的 `user/default/workflows`，默认完整路径为 `/content/drive/MyDrive/colab-comfyui-launcher-test/user/default/workflows`；再次挂载同一 Drive、使用同一存储目录即可找回。输入图片在存储根的 `input`，生成结果在 `output`；工作流 JSON 不包含完整权重或输入图片。本轮实际验证了同 VM 服务重启后的重新打开，尚未测试新 VM 恢复这个 I2V 工作流。
+
+VM disk 模式对应 `/content/colab-comfyui-runtime/ephemeral-assets/user/default/workflows`，只在当前 VM 内保留。**Export** 将 JSON 下载到你自己的电脑，重新导入可用 File → Open 或 Ctrl+O。没有明确 Save 的浏览器草稿不作为长期备份。界面操作见[官方说明](https://docs.comfy.org/interface/overview)。
 
 ## 手动启动
 
@@ -113,7 +126,7 @@ python3 scripts/colabctl.py -s "$SESSION" prepare \
 python3 scripts/colabctl.py -s "$SESSION" status
 ```
 
-若已明确选择临时 VM 存储，跳过 Drive，改用下面命令；权重直接下载到 VM 模型目录并同步 SHA，不另外保存一份 40 GB 临时缓存。启动时同样加 `--ephemeral`。
+若已明确选择临时 VM 存储，跳过 Drive，改用下面命令；权重直接下载到 VM 模型目录并同步 SHA，不另外保存一份完整权重缓存。启动时同样加 `--ephemeral`。
 
 ```bash
 python3 scripts/colabctl.py -s "$SESSION" prepare \
@@ -189,7 +202,7 @@ python3 scripts/colabctl.py -s "$SESSION" start \
 
 ## MiniMax H3
 
-[官方 FAQ](https://design.minimax.io/h3)明确支持 Colab GPU runtime；本项目已核对 G4 实际为约 96 GB 的 RTX PRO 6000 Blackwell。模型文件清单见 [models/h3.json](models/h3.json)，固定 4 个文件的 revision、大小和 SHA256，约 40.07 GB，已真实下载并通过全部校验。[workflows/h3-api.json](workflows/h3-api.json) 已完成真实推理：864×480、124 帧、24 fps、20 步、seed 20261004，生成约 5.17 秒、带立体声音频的 MP4；历史轮次生成与校验用时 99.251 秒。
+[官方 FAQ](https://design.minimax.io/h3)明确支持 Colab GPU runtime；本项目已核对 G4 实际为约 96 GB 的 RTX PRO 6000 Blackwell。当前 [models/h3.json](models/h3.json) 固定六个文件的 revision、大小和 SHA256，约 42.03 GB，已真实准备并通过校验。历史四文件基线约 40.07 GB；[workflows/h3-api.json](workflows/h3-api.json) 已完成真实 T2V 推理：864×480、124 帧、24 fps、20 步、seed 20261004，生成约 5.17 秒、带立体声音频的 MP4；该历史轮次生成与校验用时 99.251 秒。当前默认 I2V 的浏览器验收与 API 超时分别见[本轮记录](docs/test-report.md)。
 
 H3 使用有地域和商业条件的社区许可证；本项目的 MIT 许可证只覆盖自己的脚本。下载、部署前阅读 [H3 说明](docs/h3.md)。不能单凭云节点名字自动判断使用主体是否获授权；也不能以文件可下载代替许可证说明。H3 基础权重与托管的 2K 流程有不同边界。
 
@@ -210,7 +223,7 @@ python3 scripts/colabctl.py -s "$SESSION" status
 - 首次 `prepare` 把每个 Drive 文件复制到 VM `.partial`，在同一读取流中计算完整 SHA256，匹配后才发布本地文件，并写入两端的 verified receipt。旧缓存没有 receipt 时，也直接用这一遍复制流建立校验记录。
 - Drive receipt 绑定清单 repo/revision/path/size/SHA 与文件 size/mtime；本地 receipt 还绑定当前 boot ID、device/inode/mtime/ctime。同一 VM 的文件身份全部匹配时可跳过复制和内容读取。结果 `verification: verified_receipt_metadata` 表示之前完整校验与本次元数据匹配，**不是本次重新完整 SHA 校验**。
 - receipt 缺失或元数据变化时进行完整验证或拒绝；尺寸、SHA 错误的已有成品不会被覆盖。需要主动完整重查 Drive 时，给 `download` 或 `prepare` 添加 `--verify-cache`；对 `prepare` 而言这会增加一次完整 Drive 读取。
-- 新 VM 仍须读取、复制约 40.07 GB，并在复制时校验；前轮 prepare 实测 516.032 秒。同 VM 完整身份匹配后的复用为 0.055 秒，不是重新读取 40 GB。此设计减少重复读取，不保证其他 Drive 吞吐或启动耗时。本地复制中断的 `.partial` 下次从头重复制，HTTP 下载续传是另一个步骤。
+- 新 VM 仍须读取、复制当前清单的全部文件（默认约 42.03 GB），并在复制时校验；历史四文件 40.07 GB 的 prepare 实测 516.032 秒，该历史同 VM 完整身份匹配后的复用为 0.055 秒，不是重新完整读取。此设计减少重复读取，不保证其他 Drive 吞吐或启动耗时。本地复制中断的 `.partial` 下次从头重复制，HTTP 下载续传是另一个步骤。
 
 后续在另一新 G4 用相同 8 MiB chunk 做两种完整路径：先复制落盘 412.971 秒、随后本地完整 SHA 26.875 秒，总 439.911 秒；同机排第二的复制时同步 SHA 总 367.357 秒，四个模型均通过。未清缓存或反转整套顺序，复制阶段本身也有吞吐差异，不能把总差全部归因于省去 SHA 的读取。保留默认同步完整校验；详见 [计时口径和小文件补充](docs/test-report.md)。
 

@@ -342,6 +342,22 @@ class RuntimeSafetyTests(unittest.TestCase):
         paths = json.loads((self.base / "model-paths.yaml").read_text())
         self.assertEqual(paths["launcher"]["base_path"], str(self.base / "models"))
         self.assertNotIn("ephemeral-assets", paths["launcher"]["base_path"])
+        self.assertEqual(paths["launcher"]["embeddings"], "embeddings")
+
+    def test_embedding_search_path_cannot_redirect_model_loading_to_storage(self):
+        model_root = self.base / "models"
+        model_root.mkdir()
+        external = self.base / "external-model-storage"
+        external.mkdir()
+        (model_root / "embeddings").symlink_to(external, target_is_directory=True)
+        self.args.allowed_email = None
+        self.args.local_only = True
+        with (
+            mock.patch.object(runtime, "spawn") as spawn,
+            self.assertRaisesRegex(ValueError, "must not be symlinks"),
+        ):
+            runtime.start(self.args)
+        spawn.assert_not_called()
 
     def test_configuration_recovery_never_guesses_missing_or_legacy_booleans(self):
         self.assertIsNone(runtime.recorded_configuration({}))

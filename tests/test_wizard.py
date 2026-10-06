@@ -199,6 +199,45 @@ class WizardTests(unittest.TestCase):
         self.assertTrue(config.cpu)
         self.assertNotIn("release", [item[0] for item in self.worker.submitted])
 
+    def test_runtime_list_wait_is_visible_above_menu_and_in_detail_panel(self):
+        self.choose("existing")
+        self.worker.busy = True
+        self.ui.operation_started = 30
+        self.ui.theme.roles["accent"] = 123
+        screen = Frame()
+        with (
+            mock.patch.object(wizard.time, "monotonic", return_value=42),
+            mock.patch.object(wizard.curses, "doupdate"),
+        ):
+            self.ui._draw(screen)
+        banner = "".join(screen.rows[2])
+        self.assertIn("Loading runtimes from Colab", banner)
+        self.assertIn("12s elapsed", banner)
+        self.assertEqual(screen.attributes[2][1], 123)
+        right = "\n".join("".join(row[44:]) for row in screen.rows[:12])
+        self.assertIn("IN PROGRESS", right)
+        self.assertIn("Waiting for the provider reply", right)
+        self.assertEqual([action for action, _ in self.worker.submitted], ["sessions"])
+
+    def test_selected_choice_help_uses_distinct_blue_heading_and_body_roles(self):
+        self.ui.theme.roles.update(info_heading=123, info=456, accent=789)
+        screen = Frame()
+        with mock.patch.object(wizard.curses, "doupdate"):
+            self.ui._draw(screen)
+        for label, expected in (
+            ("ABOUT THIS CHOICE", 123),
+            ("Choose compute and storage", 456),
+            ("Next / status", 789),
+        ):
+            match = [
+                (index, "".join(row).index(label))
+                for index, row in enumerate(screen.rows)
+                if label in "".join(row)
+            ]
+            self.assertEqual(len(match), 1)
+            row, column = match[0]
+            self.assertEqual(screen.attributes[row][column], expected)
+
     def test_existing_runtime_named_quit_is_inspected_instead_of_exiting(self):
         self.emit("sessions", [{"name": "quit", "hardware": "G4"}])
         self.assertTrue(self.choose("session:quit"))
@@ -210,6 +249,81 @@ class WizardTests(unittest.TestCase):
         self.assertIn("No active", self.ui.notice)
         self.choose("back")
         self.assertEqual(self.ui.page, "home")
+        self.assertEqual(self.worker.submitted, [])
+
+    def test_verified_list_absence_clears_runtime_proof_but_retains_settings(self):
+        for rows in ([], [{"name": "other-runtime", "hardware": "CPU"}]):
+            with self.subTest(rows=rows):
+                config = dashboard.Config(
+                    session="closed-runtime", ephemeral=True, local_port=8288
+                )
+                self.ui.config = replace(config)
+                self.ready_status()
+                self.ui.status.update(
+                    installation={"status": "ready"}, models_ready=True
+                )
+                self.ui.provider = {"name": config.session, "hardware": "G4"}
+                self.ui.updated = 42
+                self.ui.resume = self.ui.observe_runtime = True
+                self.ui.required_model_categories = {"embeddings"}
+                self.ui.model_paths_need_restart = True
+                self.ui.model_registration_notice = "Old paths require registration."
+                self.ui.cleanup_warning = "Previous local cleanup needs attention."
+
+                self.emit("sessions", rows)
+
+                self.assertEqual(self.ui.config, config)
+                self.assertEqual(self.ui.status, {})
+                self.assertEqual(self.ui.ssh, {})
+                self.assertEqual(self.ui.provider, {})
+                self.assertEqual(self.ui.updated, 0)
+                self.assertFalse(self.ui.resume)
+                self.assertFalse(self.ui.observe_runtime)
+                self.assertIsNone(self.ui.required_model_categories)
+                self.assertFalse(self.ui.model_paths_need_restart)
+                self.assertEqual(self.ui.model_registration_notice, "")
+                self.assertIn("cleanup", self.ui.cleanup_warning)
+                self.assertEqual(self.ui._complete_steps(), set())
+                self.assertFalse(self.ui._ready())
+                self.assertEqual(self.worker.submitted, [])
+
+    def test_verified_list_with_selected_runtime_retains_current_proof(self):
+        self.ui.config.session = "still-running"
+        self.ui.config.ephemeral = True
+        self.ready_status()
+        self.ui.provider = {"name": "still-running", "hardware": "G4"}
+        self.ui.updated = 42
+        self.ui.resume = self.ui.observe_runtime = True
+        self.ui.required_model_categories = {"vae"}
+        self.ui.model_registration_notice = "Retain current context."
+        status, ssh, provider = self.ui.status, self.ui.ssh, self.ui.provider
+
+        self.emit("sessions", [{"name": "still-running", "hardware": "G4"}])
+
+        self.assertIs(self.ui.status, status)
+        self.assertIs(self.ui.ssh, ssh)
+        self.assertIs(self.ui.provider, provider)
+        self.assertEqual(self.ui.updated, 42)
+        self.assertTrue(self.ui.resume)
+        self.assertTrue(self.ui.observe_runtime)
+        self.assertEqual(self.ui.required_model_categories, {"vae"})
+        self.assertEqual(self.ui.model_registration_notice, "Retain current context.")
+        self.assertTrue(self.ui._ready())
+        self.assertEqual(self.worker.submitted, [])
+
+    def test_failed_session_list_does_not_withdraw_previous_runtime_proof(self):
+        self.ui.config.session = "unknown-result"
+        self.ready_status()
+        self.ui.updated = 42
+        status, ssh = self.ui.status, self.ui.ssh
+
+        self.emit("error", "Provider session list could not be verified.")
+
+        self.assertIs(self.ui.status, status)
+        self.assertIs(self.ui.ssh, ssh)
+        self.assertEqual(self.ui.updated, 42)
+        self.assertEqual(self.ui.config.session, "unknown-result")
+        self.assertIn("could not be verified", self.ui.error)
         self.assertEqual(self.worker.submitted, [])
 
     def test_ready_inspection_restores_configuration_without_starting(self):
@@ -667,6 +781,85 @@ finally:
         self.assertIn("no longer verified", self.ui.notice)
         self.assertEqual(self.worker.submitted, [])
 
+    def test_overviews_refresh_known_runtime_without_restarting_services(self):
+        self.ui.config.session = "selected"
+        self.ui.observe_runtime = True
+        for page in ("summary", "advanced", "ready"):
+            with self.subTest(page=page):
+                self.ui._page(page)
+                self.ui.last_refresh = 0
+                with mock.patch.object(wizard.time, "monotonic", return_value=42):
+                    self.ui._refresh()
+                self.assertEqual(self.worker.submitted[-1][0], "status")
+                self.assertEqual(self.ui.page, page)
+        self.assertEqual(
+            [action for action, _ in self.worker.submitted], ["status"] * 3
+        )
+
+    def test_unknown_configuration_and_busy_list_never_poll_or_promote_ready(self):
+        self.ui.config.session = "selected"
+        self.ready_status()
+        for page in ("summary", "advanced", "storage", "listing", "failure"):
+            with self.subTest(page=page):
+                self.ui._page(page)
+                self.ui._refresh()
+                self.emit("done", "status")
+                self.assertEqual(self.ui.page, page)
+        self.assertEqual(self.worker.submitted, [])
+
+    def test_fresh_remote_and_ssh_events_mark_startup_complete_without_reload(self):
+        self.ui.config.session = "selected"
+        self.ui.observe_runtime = True
+        self.ui.resume = True
+        self.ui._page("summary")
+        self.ready_status()
+        ready = self.ui.status
+        ssh = self.ui.ssh
+        self.ui.status, self.ui.ssh = {"http_ready": False}, {"running": False}
+        self.assertNotIn("startup", self.ui._complete_steps())
+        self.emit("ssh", ssh)
+        self.assertNotIn("startup", self.ui._complete_steps())
+        self.emit("status", ready)
+        self.emit("done", "status")
+        self.assertEqual(self.ui.page, "ready")
+        self.assertIn("startup", self.ui._complete_steps())
+        self.ui.theme.roles["comfy"] = 123
+        screen = Frame()
+        with mock.patch.object(wizard.curses, "doupdate"):
+            self.ui._draw(screen)
+        self.assertIn("+ ComfyUI + SSH", "".join(screen.rows[11]))
+        self.assertEqual(screen.attributes[11][2], 123)
+        self.assertEqual(self.worker.submitted, [])
+
+    def test_ssh_probe_failure_invalidates_previous_ready_snapshot(self):
+        self.ui.observe_runtime = True
+        self.ui._page("ready")
+        self.ready_status()
+        self.emit("ssh_error", "fixture status check failed")
+        self.assertFalse(self.ui._ready())
+        self.assertNotIn("startup", self.ui._complete_steps())
+        self.emit("done", "status")
+        self.assertEqual(self.ui.page, "summary")
+        self.assertIn("no longer verified", self.ui.notice)
+
+    def test_background_poll_does_not_replace_the_last_startup_stage(self):
+        self.ui.stage = "connecting local SSH"
+        self.emit("stage", "status")
+        self.assertEqual(self.ui.stage, "connecting local SSH")
+
+    def test_editing_configuration_disables_old_snapshot_promotion(self):
+        self.ui.config.session = "selected"
+        self.ui.observe_runtime = True
+        self.ui.config.storage_root = "/content/drive/MyDrive/old"
+        self.ready_status()
+        self.ui._input("storage_root", "settings")
+        self.ui.input_value = "/content/drive/MyDrive/new"
+        self.ui._key("\n")
+        self.assertFalse(self.ui.observe_runtime)
+        self.ui._page("summary")
+        self.emit("done", "status")
+        self.assertEqual(self.ui.page, "summary")
+
     def test_run_shortens_escape_delay_and_preserves_arrow_navigation(self):
         screen = Frame()
         screen.timeout = mock.Mock()
@@ -732,6 +925,188 @@ finally:
             self.choose("start")
         self.assertEqual(ui.page, "summary")
         self.assertEqual(self.worker.submitted, [])
+
+    def test_new_flow_replaces_old_session_list_notice_and_step_context(self):
+        self.ui.notice = (
+            "No active named runtimes. Return and choose Create a new runtime."
+        )
+        self.ui.stage = "listing sessions"
+        self.choose("new")
+        self.assertEqual(self.ui.page, "hardware")
+        self.assertNotIn("No active", self.ui.notice)
+        self.assertEqual(self.ui.stage, "Choose compute hardware")
+        self.choose("gpu")
+        self.assertIn("GPU type", self.ui.notice)
+        self.choose("G4")
+        self.assertIn("models and outputs", self.ui.notice)
+        self.choose("ephemeral")
+        self.assertIn("Review", self.ui.notice)
+
+    def test_cleanup_warning_survives_new_flow_notice_with_released_runtime_name(self):
+        self.ui.config.session = "previous-runtime"
+        self.emit("released", (replace(self.ui.config), "Service cleanup timed out"))
+        self.choose("new")
+        details = "\n".join(text for text, _role in self.ui._details(60))
+        self.assertIn("Previous cleanup warning", details)
+        self.assertIn("Released previous-runtime", details)
+        self.assertIn("Service cleanup timed out", details)
+        self.assertNotIn("Selected VM released", self.ui.notice)
+
+    def test_refresh_models_uses_enter_and_explains_same_runtime_operation_in_blue(
+        self,
+    ):
+        self.ui.config = replace(self.ui.config, session="selected", cpu=False)
+        self.ui.observe_runtime = True
+        self.ui._page("advanced")
+        keys = [choice.key for choice in self.ui._choices()]
+        self.ui.selected = keys.index("prepare_refresh")
+        self.assertEqual(self.worker.submitted, [])
+        details = self.ui._details(80)
+        self.assertTrue(
+            any(
+                role == "info_heading" and "Prepare / refresh models" in text
+                for text, role in details
+            )
+        )
+        self.assertIn("extra.json", "\n".join(text for text, _role in details))
+        self.ui._key("\n")
+        self.assertEqual(self.worker.submitted[-1][0], "prepare_refresh")
+        self.assertEqual(self.worker.submitted[-1][1].session, "selected")
+        self.assertEqual(self.ui.page, "pipeline")
+
+    def test_refresh_models_requires_known_gpu_runtime_before_submission(self):
+        for cpu, observed, session in (
+            (True, True, "selected"),
+            (False, False, "selected"),
+            (False, True, ""),
+        ):
+            with self.subTest(cpu=cpu, observed=observed, session=session):
+                self.ui.config = replace(self.ui.config, session=session, cpu=cpu)
+                self.ui.observe_runtime = observed
+                self.ui._page("advanced")
+                self.choose("prepare_refresh")
+                self.assertEqual(self.worker.submitted, [])
+                self.assertIn("GPU runtime" if cpu else "Inspect", self.ui.notice)
+
+    def test_model_refresh_busy_does_not_show_ready_from_previous_service_snapshot(
+        self,
+    ):
+        self.ready_status()
+        self.assertTrue(self.ui._ready())
+        self.ui.last_operation = "prepare_refresh"
+        self.worker.busy = True
+        self.assertFalse(self.ui._ready())
+        self.assertIsNone(self.ui._url())
+        self.ui.status["models_ready"] = True
+        self.ui.status["model_prepare"] = {"running": True}
+        self.assertNotIn("models", self.ui._complete_steps())
+        self.worker.busy = False
+        self.ui.status["model_prepare"]["running"] = False
+        self.ui._page("pipeline")
+        self.emit(
+            "notice",
+            "Model lists prepared and verified. Refresh ComfyUI to see new models.",
+        )
+        self.emit("done", "prepare_refresh")
+        self.assertEqual(self.ui.page, "ready")
+        self.assertIn("Refresh ComfyUI", self.ui.notice)
+
+    def test_cpu_models_step_is_explicitly_skipped_instead_of_verified(self):
+        self.ui.config.cpu = True
+        self.ui.status["models_ready"] = True
+        self.assertNotIn("models", self.ui._complete_steps())
+        screen = Frame()
+        with mock.patch.object(wizard.curses, "doupdate"):
+            self.ui._draw(screen)
+        self.assertIn("Models · skipped on CPU", screen.text)
+        self.ui._page("summary")
+        self.assertIn(
+            "Models: Skipped in CPU mode",
+            "\n".join(text for text, _role in self.ui._details(80)),
+        )
+
+    def test_verified_files_with_missing_model_registration_require_explicit_restart(
+        self,
+    ):
+        self.ready_status()
+        self.ui._page("pipeline")
+        self.ui.status["model_search_categories"] = ["loras"]
+        self.emit("model_registration", ["loras", "embeddings"])
+        self.emit(
+            "notice",
+            "Files verified; Stop services then Continue missing startup steps.",
+        )
+        self.emit("done", "prepare_refresh")
+        self.assertEqual(self.ui.page, "summary")
+        self.assertFalse(self.ui._ready())
+        self.assertTrue(self.ui.model_paths_need_restart)
+        self.assertIn("embeddings", self.ui.model_registration_notice)
+        self.assertIn("Stop services", self.ui.notice)
+        self.assertEqual(self.worker.submitted, [])
+        self.emit(
+            "status",
+            {
+                **self.ui.status,
+                "comfyui_alive": False,
+                "http_ready": False,
+                "model_search_categories": None,
+            },
+        )
+        self.assertIn(
+            "Continue missing startup steps", self.ui.model_registration_notice
+        )
+        self.assertNotIn("Choose Stop services", self.ui.model_registration_notice)
+        status = {
+            **self.ui.status,
+            "comfyui_alive": True,
+            "http_ready": True,
+            "model_search_categories": ["loras", "embeddings"],
+        }
+        self.emit("status", status)
+        self.assertFalse(self.ui.model_paths_need_restart)
+        self.assertEqual(self.ui.model_registration_notice, "")
+        self.assertTrue(self.ui._ready())
+
+    def test_unknown_old_process_model_paths_are_not_claimed_ready_and_scope_resets(
+        self,
+    ):
+        self.ready_status()
+        self.ui.config.session = "old-runtime"
+        self.emit("model_registration", ["vae"])
+        self.assertFalse(self.ui._ready())
+        self.assertIn("unknown", self.ui.model_registration_notice)
+        self.ui._page("home")
+        self.choose("new")
+        self.assertFalse(self.ui.model_paths_need_restart)
+        self.assertIsNone(self.ui.required_model_categories)
+        self.assertEqual(self.ui.model_registration_notice, "")
+
+    def test_bad_gpu_model_list_is_shown_before_allocating_a_name_or_submitting_startup(
+        self,
+    ):
+        self.choose("new")
+        self.choose("gpu")
+        self.choose("G4")
+        self.choose("ephemeral")
+        with mock.patch.object(
+            wizard,
+            "validate_model_plan",
+            side_effect=wizard.DashboardError("Unsupported local model category"),
+        ):
+            self.choose("start")
+        self.assertEqual(self.ui.page, "summary")
+        self.assertEqual(self.ui.config.session, "")
+        self.assertEqual(self.worker.submitted, [])
+        self.assertIn("Unsupported", self.ui.error)
+        self.assertIn("No startup action", self.ui.notice)
+
+    def test_gpu_summary_displays_current_merged_model_count_and_bytes(self):
+        self.ui._page("summary")
+        module = dashboard._model_manifest_module()
+        manifest = module.load_manifests(module.DEFAULT_MANIFEST)
+        details = "\n".join(text for text, _role in self.ui._details(80))
+        self.assertIn(f"{len(manifest['files'])} pinned model files", details)
+        self.assertIn(f"{manifest['total_size_bytes'] / 1_000_000_000:.2f} GB", details)
 
 
 if __name__ == "__main__":

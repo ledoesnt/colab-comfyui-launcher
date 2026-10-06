@@ -9,6 +9,7 @@ import signal
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -656,6 +657,7 @@ class BackgroundArgumentsTests(unittest.TestCase):
         render = bridge.parser().parse_args(["-s", "owned", "render"])
         self.assertEqual(download.max_seconds, 1800)
         self.assertEqual(render.max_seconds, 900)
+        self.assertEqual(render.workflow, "h3-i2v-api.json")
         namespace = {}
         exec(bridge.REMOTE_HELPERS, namespace)  # noqa: S102
         with mock.patch.object(namespace["Path"], "is_file", return_value=True):
@@ -663,9 +665,25 @@ class BackgroundArgumentsTests(unittest.TestCase):
                 {"action": "render", "max_seconds": 90}
             )
         self.assertIn(
-            "/content/colab-comfyui-launcher/workflows/h3-api.json", arguments
+            "/content/colab-comfyui-launcher/workflows/h3-i2v-api.json", arguments
         )
         self.assertIn("/content/colab-comfyui-runtime/.venv/bin/python", arguments)
+
+    def test_render_only_selects_supported_deployed_workflows(self):
+        namespace = {}
+        exec(bridge.REMOTE_HELPERS, namespace)  # noqa: S102
+        with mock.patch.object(namespace["Path"], "is_file", return_value=True):
+            arguments = namespace["background_arguments"](
+                {"action": "render", "max_seconds": 90, "workflow": "h3-api.json"}
+            )
+            self.assertIn(
+                "/content/colab-comfyui-launcher/workflows/h3-api.json", arguments
+            )
+            for workflow in ("../private.json", "/tmp/workflow.json", "smoke-ui.json"):
+                with self.subTest(workflow=workflow), self.assertRaises(RuntimeError):
+                    namespace["background_arguments"](
+                        {"action": "render", "max_seconds": 90, "workflow": workflow}
+                    )
 
     def test_prepare_and_local_only_contracts(self):
         with (
@@ -703,6 +721,55 @@ class BackgroundArgumentsTests(unittest.TestCase):
         ):
             self.assertEqual(bridge.main(["-s", "owned", "start", "--local-only"]), 0)
         self.assertTrue(execute.call_args.args[1]["local_only"])
+
+
+class ArchiveSelectionTests(unittest.TestCase):
+    def test_provider_read_timeout_has_a_concise_uncertain_result(self):
+        detail = bridge.sanitize_failure(
+            "traceback private runtime host\nReadTimeout: read timeout=10"
+        )
+        self.assertIn("result is unknown", detail)
+        self.assertIn("Inspect the existing runtime", detail)
+        self.assertNotIn("private runtime host", detail)
+
+    def test_deployment_records_current_selection_and_ignores_reserved_local_index(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            (root / "models").mkdir()
+            (root / "workflows").mkdir()
+            for name in (
+                "bootstrap.sh",
+                "runtime.py",
+                "download_models.py",
+                "prepare_models.py",
+                "render_workflow.py",
+            ):
+                (root / "scripts" / name).write_text("fixture")
+            for name in ("h3.json", "extra.json", "extra-added.json"):
+                (root / "models" / name).write_text("{}")
+            (root / "models/selected-extra-manifests.json").write_text("untrusted")
+            archive = root / "deployment.zip"
+            with mock.patch.object(bridge, "PROJECT_ROOT", root):
+                bridge.build_archive(archive)
+                with zipfile.ZipFile(archive) as bundle:
+                    selection = json.loads(
+                        bundle.read("models/selected-extra-manifests.json")
+                    )
+                self.assertEqual(
+                    selection,
+                    {"version": 1, "files": ["extra-added.json", "extra.json"]},
+                )
+                (root / "models/extra-added.json").unlink()
+                bridge.build_archive(archive)
+            with zipfile.ZipFile(archive) as bundle:
+                selection = json.loads(
+                    bundle.read("models/selected-extra-manifests.json")
+                )
+                self.assertNotIn("models/extra-added.json", bundle.namelist())
+            self.assertEqual(selection, {"version": 1, "files": ["extra.json"]})
 
 
 if __name__ == "__main__":

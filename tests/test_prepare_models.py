@@ -84,6 +84,186 @@ class PrepareModelsTests(unittest.TestCase):
     def run_prepare(self):
         return preparer.run(self.args)
 
+    def write_extra_manifest(self):
+        item = dict(
+            self.item,
+            path="loras/extra.safetensors",
+            source_path="weights/extra.safetensors",
+        )
+        extra = self.content / "extra.json"
+        extra.write_text(
+            json.dumps(
+                {
+                    "repo_id": "Fixture-Org/Other-Model",
+                    "revision": "b" * 40,
+                    "files": [item],
+                }
+            )
+        )
+        return extra, item
+
+    def test_added_drive_model_preserves_core_receipts_and_merged_readiness(self):
+        self.run_prepare()
+        extra, item = self.write_extra_manifest()
+        additional = self.source_root / item["path"]
+        additional.parent.mkdir()
+        additional.write_bytes(DATA)
+        self.assertFalse(
+            preparer.local_cache_ready(self.local_root, self.manifest, [extra])
+        )
+        self.args.extra_manifest = [extra]
+        with mock.patch.object(
+            cache, "hash_file", side_effect=AssertionError("No base model reread")
+        ):
+            result = self.run_prepare()
+        self.assertEqual(
+            result["files"][0]["verification"], "verified_receipt_metadata"
+        )
+        self.assertEqual(result["files"][1]["verification"], "stream_sha256")
+        self.assertEqual((self.local_root / item["path"]).read_bytes(), DATA)
+        self.assertTrue(
+            preparer.local_cache_ready(self.local_root, self.manifest, [extra])
+        )
+        self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+        self.http.assert_not_called()
+
+    def test_default_extra_manifest_is_included_in_the_readiness_guard(self):
+        self.run_prepare()
+        extra, item = self.write_extra_manifest()
+        additional = self.source_root / item["path"]
+        additional.parent.mkdir()
+        additional.write_bytes(DATA)
+        with (
+            mock.patch.object(cache, "DEFAULT_MANIFEST", self.manifest),
+            mock.patch.object(cache, "DEFAULT_EXTRA_MANIFEST", extra),
+        ):
+            self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+            result = self.run_prepare()
+            self.assertEqual(len(result["files"]), 2)
+            self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+
+    def test_discovered_repository_lists_share_readiness_and_preserve_base_receipts(
+        self,
+    ):
+        self.run_prepare()
+        extra, item = self.write_extra_manifest()
+        # Move the helper fixture to the discoverable file name, keeping the
+        # common extra.json empty and including another repository separately.
+        extra.rename(self.content / "extra-one.json")
+        extra.write_text(
+            json.dumps(
+                {
+                    "repo_id": "Fixture-Org/Other-Model",
+                    "revision": "b" * 40,
+                    "files": [],
+                }
+            )
+        )
+        other = dict(self.item, path="vae/extra.safetensors")
+        (self.content / "extra-two.json").write_text(
+            json.dumps(
+                {
+                    "repo_id": "Fixture-Org/Third-Model",
+                    "revision": "c" * 40,
+                    "files": [other],
+                }
+            )
+        )
+        for selected in (item, other):
+            source = self.source_root / selected["path"]
+            source.parent.mkdir()
+            source.write_bytes(DATA)
+        with (
+            mock.patch.object(cache, "DEFAULT_MANIFEST", self.manifest),
+            mock.patch.object(cache, "DEFAULT_EXTRA_MANIFEST", extra),
+        ):
+            self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+            with mock.patch.object(
+                cache, "hash_file", side_effect=AssertionError("No base reread")
+            ):
+                result = self.run_prepare()
+            self.assertEqual(len(result["files"]), 3)
+            self.assertEqual(
+                result["files"][0]["verification"], "verified_receipt_metadata"
+            )
+            self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+            for selected in (item, other):
+                self.assertEqual(
+                    (self.local_root / selected["path"]).read_bytes(), DATA
+                )
+            self.final.write_bytes(b"X" * len(DATA))
+            self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+        self.http.assert_not_called()
+
+    def test_registry_removal_excludes_stale_extra_from_readiness_without_deleting_weights(
+        self,
+    ):
+        self.run_prepare()
+        extra, item = self.write_extra_manifest()
+        selected = self.content / "extra-selected.json"
+        extra.rename(selected)
+        (self.source_root / item["path"]).parent.mkdir()
+        (self.source_root / item["path"]).write_bytes(DATA)
+        registry = self.content / "selected-extra-manifests.json"
+        registry.write_text(json.dumps({"version": 1, "files": [selected.name]}))
+        with mock.patch.object(cache, "DEFAULT_MANIFEST", self.manifest):
+            self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+            self.run_prepare()
+            self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+            registry.write_text(json.dumps({"version": 1, "files": []}))
+            selected.write_text("stale unselected metadata is invalid")
+            self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+            self.assertEqual((self.local_root / item["path"]).read_bytes(), DATA)
+            registry.write_text(
+                json.dumps({"version": 1, "files": ["extra-missing.json"]})
+            )
+            self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+        self.http.assert_not_called()
+
+    def test_extra_model_ephemeral_download_has_one_local_copy(self):
+        extra, item = self.write_extra_manifest()
+        self.args.extra_manifest = [extra]
+        self.args.ephemeral = True
+        self.args.cache_root = None
+        self.args.download_missing = True
+
+        def response(*_args, **_kwargs):
+            value = io.BytesIO(DATA)
+            value.status = 200
+            value.headers = {"Content-Length": str(len(DATA))}
+            value.geturl = lambda: "https://fixture.invalid/blob"
+            return value
+
+        self.http.side_effect = response
+        result = self.run_prepare()
+        self.assertEqual(len(result["files"]), 2)
+        self.assertEqual(
+            self.http.call_args.args[0].full_url,
+            "https://huggingface.co/Fixture-Org/Other-Model/resolve/"
+            + "b" * 40
+            + "/weights/extra.safetensors",
+        )
+        self.assertEqual((self.local_root / item["path"]).read_bytes(), DATA)
+        self.assertFalse((self.source_root / item["path"]).exists())
+        self.assertFalse(
+            (self.content / "colab-comfyui-runtime/ephemeral-assets/models").exists()
+        )
+        self.assertTrue(
+            preparer.local_cache_ready(self.local_root, self.manifest, [extra])
+        )
+
+    def test_extra_manifest_collision_stops_before_copy_or_download(self):
+        extra, _item = self.write_extra_manifest()
+        value = json.loads(extra.read_text())
+        value["files"][0]["path"] = self.item["path"]
+        extra.write_text(json.dumps(value))
+        self.args.extra_manifest = [extra]
+        with self.assertRaises(cache.DownloadError):
+            self.run_prepare()
+        self.assertFalse(self.local_root.exists())
+        self.assertEqual(self.source.read_bytes(), DATA)
+        self.http.assert_not_called()
+
     def test_legacy_cache_is_copied_once_and_both_receipts_are_published(self):
         opened = []
         original = os.open

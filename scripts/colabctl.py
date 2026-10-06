@@ -34,6 +34,11 @@ class BridgeError(Exception):
 def sanitize_failure(value: str) -> str:
     """Keep useful diagnostics while removing URLs and common secret forms."""
     value = ANSI.sub("", value)
+    if "ReadTimeout" in value:
+        return (
+            "The Colab provider request timed out; its result is unknown. "
+            "Inspect the existing runtime before retrying an operation."
+        )
     value = re.sub(r"https?://[^\s\"'<>]+", "[redacted URL]", value)
     value = re.sub(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b", "[redacted email]", value)
     value = re.sub(
@@ -347,7 +352,10 @@ def background_arguments(payload):
         if payload.get('download_missing'):
             arguments.append('--download-missing')
     else:
-        arguments.extend(['--workflow', '/content/colab-comfyui-launcher/workflows/h3-api.json',
+        workflow = payload.get('workflow', 'h3-i2v-api.json')
+        if workflow not in ('h3-api.json', 'h3-i2v-api.json'):
+            raise RuntimeError('Choose a deployed launcher H3 workflow.')
+        arguments.extend(['--workflow', '/content/colab-comfyui-launcher/workflows/' + workflow,
                           '--result-file', str(state / 'render-progress.json')])
     return arguments
 
@@ -575,12 +583,33 @@ def build_archive(destination: Path) -> str:
         PROJECT_ROOT / "scripts/prepare_models.py",
         PROJECT_ROOT / "scripts/render_workflow.py",
     ]
-    files.extend(sorted((PROJECT_ROOT / "models").glob("*.json")))
+    selection_name = "selected-extra-manifests.json"
+    files.extend(
+        sorted(
+            path
+            for path in (PROJECT_ROOT / "models").glob("*.json")
+            if path.name != selection_name
+        )
+    )
     files.extend(sorted((PROJECT_ROOT / "workflows").glob("*.json")))
+    selected = [
+        path.name
+        for path in files
+        if path.parent == PROJECT_ROOT / "models"
+        and (path.name == "extra.json" or path.name.startswith("extra-"))
+    ]
+    if any(
+        not re.fullmatch(r"extra(?:-[A-Za-z0-9._-]+)?\.json", name) for name in selected
+    ):
+        raise BridgeError(
+            "Extra manifest names must use extra.json or extra-NAME.json."
+        )
+    selection_data = json.dumps({"version": 1, "files": sorted(selected)})
     root = PROJECT_ROOT.resolve()
     if (
-        len(files) > 200
+        len(files) + 1 > 200
         or sum(path.stat().st_size for path in files if path.is_file())
+        + len(selection_data.encode())
         > 10 * 1024 * 1024
     ):
         raise BridgeError("Deployment sources exceed the code-only archive limit.")
@@ -599,6 +628,10 @@ def build_archive(destination: Path) -> str:
                     "Deployment sources must contain only small code/configuration files."
                 )
             archive.write(path, path.relative_to(PROJECT_ROOT).as_posix())
+        archive.writestr(
+            "models/" + selection_name,
+            selection_data,
+        )
     return hashlib.sha256(destination.read_bytes()).hexdigest()
 
 
@@ -716,6 +749,12 @@ def parser() -> argparse.ArgumentParser:
         "render", help="Start bounded execution of the deployed H3 API workflow"
     )
     render.add_argument("--max-seconds", type=positive_seconds, default=900.0)
+    render.add_argument(
+        "--workflow",
+        choices=("h3-i2v-api.json", "h3-api.json"),
+        default="h3-i2v-api.json",
+        help="Official I2V template test (default), or the original T2V test",
+    )
     for action in ("status", "smoke", "stop"):
         actions.add_parser(
             action,
@@ -735,6 +774,8 @@ def main(argv: list[str] | None = None) -> int:
         payload["install_timeout"] = arguments.install_timeout
     elif arguments.action in ("download", "prepare", "render"):
         payload["max_seconds"] = arguments.max_seconds
+        if arguments.action == "render":
+            payload["workflow"] = arguments.workflow
         if arguments.action == "download":
             if arguments.models_root and not arguments.models_root.startswith("/"):
                 print("Models root must be an absolute runtime path.", file=sys.stderr)

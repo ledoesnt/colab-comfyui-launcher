@@ -31,6 +31,7 @@ def ready_status(config=None):
         "drive": {"mounted": True, "mydrive_ready": True},
         "installation": {"status": "ready"},
         "models_ready": True,
+        "model_search_categories": sorted(dashboard.MODEL_SEARCH_CATEGORIES),
         "comfyui_alive": True,
         "http_ready": True,
         "access_mode": mode,
@@ -462,6 +463,264 @@ class PipelineTests(unittest.TestCase):
         self.backend.bridge.assert_not_called()
         self.worker._wait.assert_not_called()
 
+    def test_refresh_models_deploys_and_prepares_same_vm_without_service_restart(self):
+        for ephemeral in (True, False):
+            with self.subTest(ephemeral=ephemeral):
+                self.backend.reset_mock()
+                self.worker._status.reset_mock()
+                self.worker._wait.reset_mock()
+                config = dashboard.replace(self.config, ephemeral=ephemeral)
+                self.worker._status.return_value = ready_status(config)
+                self.worker._prepare_refresh(config)
+                self.assertEqual(
+                    self.backend.bridge.call_args_list,
+                    [
+                        mock.call(config, "deploy"),
+                        mock.call(config, "prepare", download_missing=True),
+                    ],
+                )
+                self.worker._wait.assert_called_once_with(config, "model_prepare", 1860)
+                self.worker._status.assert_has_calls([mock.call(config)] * 2)
+                self.backend.ssh.assert_called_once_with(config, "status")
+                self.backend.create.assert_not_called()
+                self.backend.release.assert_not_called()
+                self.worker._mount_embedded.assert_not_called()
+
+    def test_refresh_waits_for_existing_preparation_without_redeploy_or_submit(self):
+        status = ready_status(self.config)
+        status["model_prepare"] = {"running": True, "status": "running"}
+        self.worker._status.return_value = status
+        self.worker._prepare_refresh(self.config)
+        self.backend.bridge.assert_not_called()
+        self.worker._wait.assert_called_once_with(self.config, "model_prepare", 1860)
+        self.assertTrue(
+            any(
+                kind == "notice" and "not redeployed" in value
+                for kind, value in self.worker.events.queue
+            )
+        )
+        self.backend.ssh.assert_called_once_with(self.config, "status")
+
+    def test_refresh_requires_known_matching_gpu_configuration_before_mutation(self):
+        changes = (
+            (
+                "GPU runtime",
+                {
+                    "configuration": {
+                        "cpu": True,
+                        "ephemeral": True,
+                        "access_mode": "local",
+                    }
+                },
+            ),
+            ("unknown", {"configuration": {}}),
+            (
+                "settings",
+                {
+                    "configuration": {
+                        "cpu": False,
+                        "ephemeral": False,
+                        "storage_root": dashboard.DEFAULT_STORAGE,
+                        "access_mode": "local",
+                    }
+                },
+            ),
+            (
+                "settings",
+                {
+                    "configuration": {
+                        "cpu": False,
+                        "ephemeral": True,
+                        "access_mode": "public",
+                    }
+                },
+            ),
+            ("uncertain", {"model_prepare": {"running": False, "status": "unknown"}}),
+            (
+                "uncertain",
+                {"model_prepare": {"running": False, "status": "interrupted"}},
+            ),
+            ("already running", {"model_download": {"running": True}}),
+            ("installation", {"installation": {"status": "installing"}}),
+        )
+        for message, fields in changes:
+            with self.subTest(fields=fields):
+                self.worker._status.return_value = {
+                    **ready_status(self.config),
+                    **fields,
+                }
+                with self.assertRaisesRegex(dashboard.DashboardError, message):
+                    self.worker._prepare_refresh(self.config)
+        self.backend.bridge.assert_not_called()
+        self.backend.ssh.assert_not_called()
+        self.worker._wait.assert_not_called()
+        self.backend.create.assert_not_called()
+        self.backend.release.assert_not_called()
+
+    def test_refresh_drive_requires_ready_mount_and_dedicated_known_root(self):
+        config = dashboard.replace(self.config, ephemeral=False)
+        for fields, message in (
+            ({"drive": {"mounted": False}}, "Drive is not ready"),
+            (
+                {"drive": {"mounted": True, "mydrive_ready": False}},
+                "Drive is not ready",
+            ),
+        ):
+            with self.subTest(fields=fields):
+                self.worker._status.return_value = {**ready_status(config), **fields}
+                with self.assertRaisesRegex(dashboard.DashboardError, message):
+                    self.worker._prepare_refresh(config)
+        for root in (
+            "/content/models",
+            "/content/drive/MyDrive",
+            "/content/drive/MyDrive/a/../b",
+        ):
+            with self.subTest(root=root):
+                candidate = dashboard.replace(config, storage_root=root)
+                self.worker._status.return_value = ready_status(candidate)
+                with self.assertRaisesRegex(
+                    dashboard.DashboardError, "directory is invalid"
+                ):
+                    self.worker._prepare_refresh(candidate)
+        self.backend.bridge.assert_not_called()
+        self.worker._wait.assert_not_called()
+
+    def test_refresh_requires_service_registration_for_missing_or_unknown_paths(self):
+        for registered in (
+            None,
+            [],
+            [
+                category
+                for category in dashboard.MODEL_SEARCH_CATEGORIES
+                if category != "vae"
+            ],
+        ):
+            with self.subTest(registered=registered):
+                self.backend.reset_mock()
+                status = ready_status(self.config)
+                status["model_search_categories"] = registered
+                self.worker._status.return_value = status
+                self.worker._prepare_refresh(self.config)
+                notice = list(self.worker.events.queue)[-1][1]
+                self.assertIn("verified", notice)
+                self.assertIn("Stop services", notice)
+                self.assertIn("Continue missing startup steps", notice)
+                self.assertIn("Browser refresh alone is insufficient", notice)
+                self.assertEqual(
+                    [call.args[1] for call in self.backend.bridge.call_args_list],
+                    ["deploy", "prepare"],
+                )
+                self.backend.ssh.assert_called_once_with(self.config, "status")
+                self.backend.create.assert_not_called()
+                self.backend.release.assert_not_called()
+
+    def test_refresh_current_registered_process_only_needs_browser_refresh(self):
+        self.worker._prepare_refresh(self.config)
+        notice = list(self.worker.events.queue)[-1][1]
+        self.assertIn("Refresh ComfyUI", notice)
+        self.assertNotIn("Stop services", notice)
+        self.assertTrue(
+            any(
+                kind == "model_registration"
+                for kind, _value in self.worker.events.queue
+            )
+        )
+
+    def test_refresh_unsupported_category_or_invalid_local_list_is_rejected_before_deploy(
+        self,
+    ):
+        reader = mock.Mock()
+        reader.load_manifests.return_value = {
+            "files": [{"path": "unregistered/model.safetensors"}]
+        }
+        with mock.patch.object(
+            dashboard, "_model_manifest_module", return_value=reader
+        ):
+            with self.assertRaisesRegex(dashboard.DashboardError, "not registered"):
+                self.worker._prepare_refresh(self.config)
+            reader.load_manifests.side_effect = ValueError("Invalid fixture list")
+            with self.assertRaisesRegex(
+                dashboard.DashboardError, "Invalid local model list"
+            ):
+                self.worker._prepare_refresh(self.config)
+        self.backend.bridge.assert_not_called()
+        self.backend.ssh.assert_not_called()
+        self.worker._wait.assert_not_called()
+
+    def test_normal_gpu_startup_preflight_rejects_bad_lists_before_transfers(self):
+        with mock.patch.object(
+            dashboard,
+            "validate_model_plan",
+            side_effect=dashboard.DashboardError("Unsupported model category"),
+        ):
+            for operation in (self.worker._smart_pipeline, self.worker._pipeline):
+                with (
+                    self.subTest(operation=operation.__name__),
+                    self.assertRaisesRegex(dashboard.DashboardError, "Unsupported"),
+                ):
+                    operation(self.config)
+        self.worker._mount_embedded.assert_not_called()
+        self.backend.bridge.assert_not_called()
+        self.backend.ssh.assert_not_called()
+        self.backend.create.assert_not_called()
+
+    def test_cpu_startup_skips_gpu_model_preflight(self):
+        config = dashboard.replace(self.config, cpu=True)
+        self.worker._status.return_value = ready_status(config)
+        with mock.patch.object(
+            dashboard,
+            "validate_model_plan",
+            side_effect=AssertionError("CPU does not require model manifests"),
+        ) as validation:
+            self.worker._smart_pipeline(config)
+        validation.assert_not_called()
+        self.backend.bridge.assert_not_called()
+
+    def test_refresh_failure_does_not_restart_or_repeat_unknown_mutations(self):
+        for failure_at in ("deploy", "prepare", "wait"):
+            with self.subTest(failure_at=failure_at):
+                self.backend.reset_mock()
+                self.worker._wait.reset_mock()
+                self.worker._status.return_value = ready_status(self.config)
+                error = dashboard.DashboardError(
+                    "Model operation failed; outcome unknown"
+                )
+
+                def bridge(
+                    _config, action, *, expected=failure_at, failure=error, **_kwargs
+                ):
+                    if action == expected:
+                        raise failure
+                    return {"ok": True}
+
+                self.backend.bridge.side_effect = bridge
+                self.worker._wait.side_effect = error if failure_at == "wait" else None
+                with self.assertRaises(dashboard.DashboardError) as caught:
+                    self.worker._prepare_refresh(self.config)
+                self.assertIs(caught.exception, error)
+                self.assertEqual(
+                    [call.args[1] for call in self.backend.bridge.call_args_list],
+                    ["deploy"] if failure_at == "deploy" else ["deploy", "prepare"],
+                )
+                self.backend.ssh.assert_not_called()
+                self.backend.create.assert_not_called()
+                self.backend.release.assert_not_called()
+
+    def test_refresh_verifies_final_readiness_and_clears_failed_ssh_probe(self):
+        good = ready_status(self.config)
+        bad = {**good, "models_ready": False}
+        self.worker._status.side_effect = [good, bad]
+        with self.assertRaisesRegex(dashboard.DashboardError, "readiness changed"):
+            self.worker._prepare_refresh(self.config)
+        self.backend.ssh.assert_not_called()
+        self.worker._status.side_effect = None
+        self.worker._status.return_value = good
+        self.backend.ssh.side_effect = dashboard.DashboardError("SSH status failed")
+        self.worker._prepare_refresh(self.config)
+        self.assertIn(
+            ("ssh_error", "SSH status failed"), list(self.worker.events.queue)
+        )
+
     def test_unhealthy_existing_service_is_not_restarted(self):
         status = ready_status(self.config)
         status["http_ready"] = False
@@ -625,6 +884,79 @@ class PipelineTests(unittest.TestCase):
         )
         self.worker.clock.assert_called_once_with()
         self.backend.bridge.assert_not_called()
+
+
+class ModelRefreshWorkerTests(unittest.TestCase):
+    def test_gpu_create_preflight_rejects_before_any_vm_allocation(self):
+        backend = mock.Mock(spec=dashboard.Backend)
+        config = dashboard.Config(session="not-allocated", ephemeral=True)
+        worker = dashboard.Worker(backend)
+        worker.account_checked = True
+        self.addCleanup(worker.close)
+        with mock.patch.object(
+            dashboard,
+            "validate_model_plan",
+            side_effect=dashboard.DashboardError("Invalid pinned model list"),
+        ):
+            for action in ("wizard_create", "new"):
+                self.assertTrue(worker.submit(action, config))
+                errors = []
+                for _ in range(10):
+                    kind, value = worker.events.get(timeout=1)
+                    if kind == "error":
+                        errors.append(value)
+                    if kind == "done":
+                        self.assertEqual(value, action)
+                        break
+                else:
+                    self.fail("Preflight rejection did not complete")
+                self.assertEqual(errors, ["Invalid pinned model list"])
+        backend.create.assert_not_called()
+        backend.bridge.assert_not_called()
+        backend.release.assert_not_called()
+        worker.close()
+        worker.thread.join(1)
+        self.assertFalse(worker.thread.is_alive())
+
+    def test_real_worker_dispatch_refreshes_one_existing_vm_and_only_probes_ssh(self):
+        backend = mock.Mock(spec=dashboard.Backend)
+        config = dashboard.Config(session="selected", ephemeral=True)
+        status = ready_status(config)
+        status["model_prepare"] = {
+            "running": False,
+            "status": "succeeded",
+            "result": {"ok": True},
+        }
+        backend.bridge.side_effect = lambda _config, action, **_kwargs: (
+            status if action == "status" else {"ok": True, "status": "started"}
+        )
+        backend.ssh.return_value = {"running": True, "http_ready": True}
+        worker = dashboard.Worker(backend)
+        self.addCleanup(worker.close)
+        self.assertTrue(worker.submit("prepare_refresh", config))
+        for _ in range(15):
+            kind, value = worker.events.get(timeout=1)
+            if kind == "done":
+                self.assertEqual(value, "prepare_refresh")
+                break
+        else:
+            self.fail("Model refresh did not complete")
+        self.assertEqual(
+            [call.args[1] for call in backend.bridge.call_args_list],
+            ["status", "deploy", "prepare", "status", "status"],
+        )
+        self.assertTrue(
+            all(
+                call.args[0].session == "selected" and call.args[0].ephemeral is True
+                for call in backend.bridge.call_args_list
+            )
+        )
+        backend.ssh.assert_called_once_with(config, "status")
+        backend.create.assert_not_called()
+        backend.release.assert_not_called()
+        worker.close()
+        worker.thread.join(1)
+        self.assertFalse(worker.thread.is_alive())
 
 
 class StatusRetryTests(unittest.TestCase):
@@ -1160,7 +1492,8 @@ class ThemeTests(unittest.TestCase):
     def test_brand_colors_are_exact_rgb_scaled_for_curses(self):
         theme = self.initialized()
         self.assertEqual(
-            theme.BRAND, {"comfy": "#F2FF59", "title": "#E77012", "accent": "#F9AA00"}
+            {key: theme.BRAND[key] for key in ("comfy", "title", "accent")},
+            {"comfy": "#F2FF59", "title": "#E77012", "accent": "#F9AA00"},
         )
         self.assertEqual(
             dashboard.curses.init_color.call_args_list,
@@ -1168,6 +1501,8 @@ class ThemeTests(unittest.TestCase):
                 mock.call(229, 949, 1000, 349),
                 mock.call(208, 906, 439, 71),
                 mock.call(214, 976, 667, 0),
+                mock.call(75, 459, 749, 1000),
+                mock.call(153, 741, 875, 1000),
             ],
         )
         pairs = dashboard.curses.init_pair.call_args_list
@@ -1175,6 +1510,10 @@ class ThemeTests(unittest.TestCase):
         self.assertIn(mock.call(2, 214, -1), pairs)
         self.assertIn(mock.call(8, 229, -1), pairs)
         self.assertIn(mock.call(9, 255, -1), pairs)
+        self.assertIn(mock.call(10, 75, -1), pairs)
+        self.assertIn(mock.call(11, 153, -1), pairs)
+        self.assertTrue(theme.roles["info_heading"] & dashboard.curses.A_BOLD)
+        self.assertFalse(theme.roles["info"] & dashboard.curses.A_BOLD)
 
     def test_fixed_256_color_terminal_does_not_attempt_palette_mutation(self):
         self.initialized(change=False)
@@ -1187,6 +1526,8 @@ class ThemeTests(unittest.TestCase):
         dashboard.curses.init_pair.assert_any_call(1, dashboard.curses.COLOR_YELLOW, -1)
         dashboard.curses.init_pair.assert_any_call(3, dashboard.curses.COLOR_GREEN, -1)
         dashboard.curses.init_pair.assert_any_call(9, dashboard.curses.COLOR_WHITE, -1)
+        dashboard.curses.init_pair.assert_any_call(10, dashboard.curses.COLOR_CYAN, -1)
+        dashboard.curses.init_pair.assert_any_call(11, dashboard.curses.COLOR_CYAN, -1)
 
     def test_monochrome_preserves_text_roles_without_curses_color_calls(self):
         theme = self.initialized(color=False)

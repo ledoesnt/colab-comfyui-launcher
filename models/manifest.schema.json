@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pinned Hugging Face models for the ComfyUI launcher",
+  "description": "The base manifest needs at least one file. An additional manifest may have no files. Python validation also rejects destination collisions across manifests and parent/file conflicts.",
+  "type": "object",
+  "required": ["repo_id", "revision", "files"],
+  "properties": {
+    "name": {"type": "string"},
+    "repo_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "total_size_bytes": {"type": "integer", "minimum": 0},
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "size_bytes", "sha256"],
+        "properties": {
+          "path": {"$ref": "#/$defs/relativePath"},
+          "source_path": {"$ref": "#/$defs/relativePath"},
+          "size_bytes": {"type": "integer", "minimum": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "not": {
+          "anyOf": [
+            {"required": ["url"]},
+            {"required": ["repo_id"]},
+            {"required": ["revision"]}
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$",
+      "not": {"pattern": "\\.partial$"}
+    }
+  }
+}

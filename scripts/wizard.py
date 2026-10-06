@@ -28,8 +28,10 @@ from dashboard import (
     Worker,
     clip_cells,
     human_bytes,
+    pinned_model_summary,
     safe_error,
     services_ready,
+    validate_model_plan,
 )
 
 GPU_CHOICES = ("G4", "H100", "A100", "L4", "T4")
@@ -70,6 +72,10 @@ class Wizard:
         self.stage = "Choose how to start"
         self.notice = "Choose a new runtime, or inspect an existing one."
         self.error = ""
+        self.cleanup_warning = ""
+        self.required_model_categories: set[str] | None = None
+        self.model_paths_need_restart = False
+        self.model_registration_notice = ""
         self.updated = 0.0
         self.last_refresh = 0.0
         self.resume = False
@@ -78,6 +84,8 @@ class Wizard:
         self.input_field = ""
         self.input_return = "summary"
         self.last_operation = ""
+        self.operation_started = 0.0
+        self.observe_runtime = False
         self.quitting = False
         if self.demo:
             self.config.session = self.config.session or "offline-demo"
@@ -109,12 +117,17 @@ class Wizard:
         target = config if config is not None else self.config
         if self.worker.submit(action, target):
             self.last_operation = action
+            self.operation_started = time.monotonic()
             self.error = ""
             return True
         self.notice = "An operation is running; no additional operation was submitted."
         return False
 
     def _ready(self) -> bool:
+        if self.model_paths_need_restart:
+            return False
+        if self.worker.busy and self.last_operation == "prepare_refresh":
+            return False
         if not services_ready(self.config, self.status):
             return False
         if self.config.access == "local-only":
@@ -124,6 +137,32 @@ class Wizard:
                 and bool(self.ssh.get("url"))
             )
         return self.status.get("tunnel_alive") is True and bool(self.status.get("url"))
+
+    def _check_model_registration(self) -> None:
+        if self.required_model_categories is None:
+            return
+        registered = self.status.get("model_search_categories")
+        known = isinstance(registered, list) and all(
+            isinstance(category, str) for category in registered
+        )
+        missing = self.required_model_categories - set(registered) if known else set()
+        self.model_paths_need_restart = not known or bool(missing)
+        if not self.model_paths_need_restart:
+            self.model_registration_notice = ""
+        elif self.status.get("comfyui_alive") is not True:
+            self.model_registration_notice = "Model files are verified. Choose Continue missing startup steps to start ComfyUI with the registered model directories."
+        else:
+            reason = (
+                "Running ComfyUI model paths are unknown."
+                if not known
+                else "Running ComfyUI has no model paths for: "
+                + ", ".join(sorted(missing))
+                + "."
+            )
+            self.model_registration_notice = (
+                reason
+                + " Choose Stop services, then Continue missing startup steps. Refreshing the browser alone does not register directories."
+            )
 
     def _url(self) -> str | None:
         if not self._ready():
@@ -295,6 +334,11 @@ class Wizard:
             return [
                 Choice("inspect", "Inspect current runtime"),
                 Choice("mount", "Authorize / check Google Drive"),
+                Choice(
+                    "prepare_refresh",
+                    "Prepare / refresh models",
+                    "Apply this checkout's h3.json, extra.json and extra-*.json to the selected GPU runtime, prepare missing VM files, and keep existing ComfyUI / SSH services. Refresh the browser after success. An already running preparation is waited for without redeployment.",
+                ),
                 Choice("smoke", "Run a PNG smoke test"),
                 Choice("render", "Render the H3 API test"),
                 Choice("stop", "Stop services · retain VM"),
@@ -368,6 +412,13 @@ class Wizard:
         )
 
     def _begin(self) -> None:
+        if not self.config.cpu:
+            try:
+                validate_model_plan()
+            except DashboardError as exc:
+                self.error = safe_error(exc)
+                self.notice = "Fix the local model lists before starting or resuming this GPU runtime. No startup action was submitted."
+                return
         identity = Path(self.config.identity or DEFAULT_IDENTITY).expanduser()
         if (
             self.config.access == "local-only"
@@ -383,6 +434,7 @@ class Wizard:
         action = "wizard_resume" if self.resume else "wizard_create"
         if self._submit(action, candidate):
             self.config = candidate
+            self.observe_runtime = True
             self._page("pipeline")
             self.notice = "Startup runs in the background. Completed steps will be verified and skipped."
 
@@ -451,6 +503,8 @@ class Wizard:
         if self.resume and changed_ssh and self.ssh.get("running") is not False:
             self.error = "Stop and verify the existing SSH forward before changing its port or key."
             return
+        if candidate != self.config:
+            self.observe_runtime = False
         self.config = candidate
         self.error = ""
         self._page(self.input_return)
@@ -473,6 +527,12 @@ class Wizard:
                 self.config, session="", access="local-only", email=""
             )
             self.status, self.ssh, self.provider = {}, {}, {}
+            self.required_model_categories = None
+            self.model_paths_need_restart = False
+            self.model_registration_notice = ""
+            self.observe_runtime = False
+            self.stage = "Choose compute hardware"
+            self.notice = "Choose the compute hardware for the new runtime."
             self._page("hardware")
         elif key in ("existing", "refresh_list"):
             if self.demo:
@@ -491,15 +551,24 @@ class Wizard:
                 )
         elif self.page == "hardware":
             self.config.cpu = key == "cpu"
+            self.notice = (
+                "Choose where models and outputs are saved."
+                if self.config.cpu
+                else "Choose a GPU type for the new runtime."
+            )
             self._page(
                 "storage" if self.config.cpu else "gpu",
                 int(self.config.ephemeral) if self.config.cpu else 0,
             )
         elif self.page == "gpu":
             self.config.gpu = key
+            self.notice = "Choose where models and outputs are saved."
             self._page("storage", int(self.config.ephemeral))
         elif self.page == "storage":
+            if self.config.ephemeral != (key == "ephemeral"):
+                self.observe_runtime = False
             self.config.ephemeral = key == "ephemeral"
+            self.notice = "Review the selected settings before confirming startup."
             self._page("summary")
             self.notice = "Storage selected. Review the configuration, then continue the missing steps."
         elif self.page == "sessions" and key.startswith("session:"):
@@ -516,6 +585,7 @@ class Wizard:
             if self._submit("inspect", candidate):
                 self.config = candidate
                 self.resume = True
+                self.observe_runtime = False
                 self.status, self.ssh = {}, {}
                 self._page("inspect")
         elif key == "start":
@@ -561,6 +631,7 @@ class Wizard:
         elif key in (
             "inspect",
             "mount",
+            "prepare_refresh",
             "smoke",
             "render",
             "stop",
@@ -568,6 +639,13 @@ class Wizard:
             "ssh_stop",
             "wizard_resume",
         ):
+            if key == "prepare_refresh":
+                if self.config.cpu:
+                    self.notice = "Model preparation requires a GPU runtime; the CPU editor skips H3 models."
+                    return True
+                if not self.observe_runtime or not self.config.session:
+                    self.notice = "Inspect the selected runtime to restore its storage settings before refreshing models."
+                    return True
             if self._submit(key):
                 self._page("inspect" if key == "inspect" else "pipeline")
         elif key in ("back", "home"):
@@ -630,6 +708,10 @@ class Wizard:
                 return
             if kind == "status":
                 self.status, self.updated = value, time.monotonic()
+                self._check_model_registration()
+            elif kind == "model_registration":
+                self.required_model_categories = set(value)
+                self._check_model_registration()
             elif kind == "ssh":
                 self.ssh = value
             elif kind == "config":
@@ -637,9 +719,15 @@ class Wizard:
             elif kind == "session":
                 config, provider = value
                 self.config, self.provider = replace(config), provider
+                self.observe_runtime = True
             elif kind == "inspection":
+                if value["config"].session != self.config.session:
+                    self.required_model_categories = None
+                    self.model_paths_need_restart = False
+                    self.model_registration_notice = ""
                 self.config = replace(value["config"])
                 self.status, self.ssh = value.get("status", {}), value.get("ssh", {})
+                self._check_model_registration()
                 self.provider, self.resume = value.get("provider", {}), True
                 self.updated = time.monotonic()
                 self.error = ""
@@ -647,6 +735,7 @@ class Wizard:
                     value.get("known_config", value.get("configuration_known", False))
                     is True
                 )
+                self.observe_runtime = known_config
                 if known_config and value.get("ready") is True and self._ready():
                     self._page("ready")
                     self.notice = "Existing services and browser access were verified; no startup was repeated."
@@ -658,6 +747,18 @@ class Wizard:
                     self.notice = "Runtime selected; storage configuration is not yet known. Choose storage before continuing."
             elif kind == "sessions":
                 self.sessions = value
+                if self.config.session and not any(
+                    row["name"] == self.config.session for row in value
+                ):
+                    # This event is emitted only after a verified provider list.
+                    # Retain settings for inspection, but withdraw old VM proof.
+                    self.status, self.ssh, self.provider = {}, {}, {}
+                    self.updated = 0.0
+                    self.resume = False
+                    self.observe_runtime = False
+                    self.required_model_categories = None
+                    self.model_paths_need_restart = False
+                    self.model_registration_notice = ""
                 self._page("sessions")
                 self.notice = (
                     "Select a runtime to inspect it."
@@ -665,7 +766,8 @@ class Wizard:
                     else "No active named runtimes. Return and choose Create a new runtime."
                 )
             elif kind == "stage":
-                self.stage = str(value)
+                if value != "status":
+                    self.stage = str(value)
             elif kind == "notice":
                 self.notice = str(value)
             elif kind == "auth":
@@ -682,14 +784,26 @@ class Wizard:
                 self.error = safe_error(value)
                 self._page("failure")
             elif kind == "ssh_error":
+                # A failed probe cannot keep advertising its previous successful
+                # tunnel snapshot as current evidence of browser readiness.
+                self.ssh = {"error": safe_error(value)}
                 self.notice = "Local SSH status: " + safe_error(value)
             elif kind == "released":
                 released, warning = value
                 if released.session == self.config.session:
+                    self.cleanup_warning = (
+                        "Released " + released.session + ": " + safe_error(warning)
+                        if warning
+                        else ""
+                    )
                     self.config = replace(self.config, session="", create_key=False)
                     self.status, self.ssh, self.provider = {}, {}, {}
+                    self.required_model_categories = None
+                    self.model_paths_need_restart = False
+                    self.model_registration_notice = ""
                     self.auth.clear()
                     self.resume = False
+                    self.observe_runtime = False
                     self._page("home")
                     self.notice = "Selected VM released and verified." + (
                         " Cleanup warning: " + safe_error(warning) if warning else ""
@@ -700,6 +814,14 @@ class Wizard:
                     self.resume = True
                     self._page("summary")
                     self.notice = "The connection is no longer verified ready. Inspect before continuing missing steps."
+                elif (
+                    value == "status"
+                    and self.page == "summary"
+                    and self.observe_runtime
+                    and self._ready()
+                ):
+                    self._page("ready")
+                    self.notice = "ComfyUI and SSH were verified ready; no startup command was repeated."
                 if self.page == "pipeline" and value not in (
                     "status",
                     "sessions",
@@ -708,22 +830,54 @@ class Wizard:
                 ):
                     if self._ready():
                         self._page("ready")
-                        self.notice = "ComfyUI and its local connection are ready."
+                        if value != "prepare_refresh":
+                            self.notice = "ComfyUI and its local connection are ready."
                     else:
                         self.resume = True
                         self._page("summary")
-                        self.notice = "The operation completed; inspect or continue any remaining startup steps."
+                        if value != "prepare_refresh":
+                            self.notice = "The operation completed; inspect or continue any remaining startup steps."
 
     def _refresh(self) -> None:
         now = time.monotonic()
         if (
-            self.page == "ready"
+            (
+                self.page == "ready"
+                or self.page in ("summary", "advanced")
+                and self.observe_runtime
+                and bool(self.config.session)
+            )
             and not self.demo
             and not self.worker.busy
             and now - self.last_refresh >= REFRESH_SECONDS
             and self.worker.submit("status", self.config)
         ):
             self.last_refresh = now
+            self.last_operation = "status"
+            self.operation_started = now
+
+    def _busy_text(self) -> str:
+        action = (
+            getattr(self.worker, "active_action", None)
+            or getattr(self.worker, "pending_action", None)
+            or self.last_operation
+        )
+        label = {
+            "sessions": "Loading runtimes from Colab",
+            "inspect": "Inspecting selected runtime",
+            "status": "Refreshing ComfyUI + SSH status",
+            "ssh_start": "Connecting local SSH",
+            "ssh_stop": "Stopping local SSH forwarding",
+            "release": "Releasing selected VM",
+            "mount": "Checking Google Drive authorization",
+            "prepare_refresh": "Preparing updated model lists",
+            "render": "Submitting H3 render",
+            "smoke": "Running PNG smoke test",
+            "stop": "Stopping services; retaining VM",
+        }.get(action, self.stage)
+        elapsed = max(0, time.monotonic() - self.operation_started)
+        spinner = "|/-\\"[int(time.monotonic() * 5) % 4]
+        return f"{spinner} {label} · {elapsed:.0f}s elapsed"
 
     def _title(self) -> str:
         return {
@@ -751,18 +905,29 @@ class Wizard:
 
     def _complete_steps(self) -> set[str]:
         complete = set()
-        if self.config.session and (self.provider or self.status or self.resume):
+        runtime_known = bool(
+            self.config.session and (self.provider or self.status or self.resume)
+        )
+        if runtime_known:
             complete.update(("session", "hardware"))
             if self.page != "storage":
                 complete.add("storage")
         drive = self.status.get("drive") or {}
-        if (self.config.ephemeral and self.page != "storage") or (
+        if (runtime_known and self.config.ephemeral and self.page != "storage") or (
             drive.get("mounted") is True and drive.get("mydrive_ready") is True
         ):
             complete.add("mount")
         if (self.status.get("installation") or {}).get("status") == "ready":
             complete.add("installation")
-        if self.config.cpu or self.status.get("models_ready") is True:
+        if (
+            not self.config.cpu
+            and self.status.get("models_ready") is True
+            and not (self.worker.busy and self.last_operation == "prepare_refresh")
+            and not any(
+                (self.status.get(task) or {}).get("running") is True
+                for task in ("model_prepare", "model_download")
+            )
+        ):
             complete.add("models")
         if self._ready():
             complete.add("startup")
@@ -862,8 +1027,35 @@ class Wizard:
 
     def _details(self, width: int) -> list[tuple[str, str]]:
         rows: list[tuple[str, str]] = []
+        if self.worker.busy:
+            rows.extend(
+                (
+                    ("IN PROGRESS · " + self._busy_text(), "accent"),
+                    (
+                        "Waiting for the provider reply; this screen remains active. No duplicate action is submitted.",
+                        "muted",
+                    ),
+                    ("", "normal"),
+                )
+            )
         if self.error:
             rows.extend((("Attention", "bad"), (self.error, "normal"), ("", "normal")))
+        if self.cleanup_warning:
+            rows.extend(
+                (
+                    ("Previous cleanup warning", "warn"),
+                    (self.cleanup_warning, "normal"),
+                    ("", "normal"),
+                )
+            )
+        if self.model_registration_notice:
+            rows.extend(
+                (
+                    ("Model directory registration", "warn"),
+                    (self.model_registration_notice, "normal"),
+                    ("", "normal"),
+                )
+            )
         if self.page in (
             "summary",
             "settings",
@@ -899,12 +1091,7 @@ class Wizard:
                         "normal",
                     ),
                     (
-                        "Models: "
-                        + (
-                            "Skipped in CPU mode"
-                            if self.config.cpu
-                            else "4 pinned H3 files · approximately 40.07 GB"
-                        ),
+                        "Models: " + pinned_model_summary(self.config.cpu),
                         "normal",
                     ),
                     (
@@ -1059,8 +1246,8 @@ class Wizard:
             if selected.detail:
                 rows.extend(
                     (
-                        (selected.label, "accent"),
-                        (selected.detail, "normal"),
+                        ("ABOUT THIS CHOICE · " + selected.label, "info_heading"),
+                        (selected.detail, "info"),
                         ("", "normal"),
                     )
                 )
@@ -1121,6 +1308,8 @@ class Wizard:
             "title",
         )
         self._write(screen, 1, 1, self._title(), width - 2, "comfy")
+        if self.worker.busy:
+            self._write(screen, 2, 1, self._busy_text(), width - 2, "accent")
         if height < 24 or width < 50:
             self._write(
                 screen,
@@ -1157,16 +1346,27 @@ class Wizard:
             self._write(screen, 3, 1, "YOUR STARTUP STEPS", left - 2, "accent")
             complete, active = self._complete_steps(), self._active_step()
             for index, (key, title) in enumerate(STEPS if split else ()):
-                marker = "+" if key in complete else (">" if key == active else "o")
+                skipped = key == "models" and self.config.cpu
+                if skipped:
+                    title = "Models · skipped on CPU"
+                marker = (
+                    "-"
+                    if skipped
+                    else ("+" if key in complete else (">" if key == active else "o"))
+                )
                 self._write(
                     screen,
                     5 + index,
                     2,
                     marker + " " + title,
                     left - 3,
-                    "comfy"
-                    if key in complete
-                    else ("accent" if key == active else "muted"),
+                    "muted"
+                    if skipped
+                    else (
+                        "comfy"
+                        if key in complete
+                        else ("accent" if key == active else "muted")
+                    ),
                 )
             if not split:
                 self._write(
@@ -1258,13 +1458,11 @@ class Wizard:
             "muted",
         )
         if self.worker.busy:
-            spinner = "|/-\\"[int(time.monotonic() * 5) % 4]
             self._write(
                 screen,
                 height - 1,
                 1,
-                spinner
-                + " Working · future steps stop when you exit; running resources remain",
+                "Working · Exit stops future steps; running resources remain",
                 width - 2,
                 "accent",
             )

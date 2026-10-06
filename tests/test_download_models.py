@@ -118,6 +118,86 @@ class ModelDownloadTests(unittest.TestCase):
         self.assertEqual(result["verification"], "stream_sha256")
         self.assertTrue((self.root / downloader.RECEIPT_NAME).is_file())
 
+    def test_drive_writer_timestamp_transition_preserves_stream_sha(self):
+        self.root = self.drive / "MyDrive" / "owned-model-cache"
+        self.final = self.root / self.item["path"]
+        self.final.parent.mkdir(parents=True)
+        self.partial = self.final.with_name(self.final.name + ".partial")
+        self.response(DATA)
+        original = downloader.file_identity
+
+        def fuse_metadata(path):
+            value = original(path)
+            if path == self.partial and value is not None:
+                return dict(
+                    value,
+                    mtime_ns=value["mtime_ns"] + 1,
+                    ctime_ns=value["ctime_ns"] + 1,
+                )
+            return value
+
+        with (
+            mock.patch.object(downloader.os.path, "ismount", return_value=True),
+            mock.patch.object(downloader, "file_identity", side_effect=fuse_metadata),
+            mock.patch.object(
+                downloader,
+                "hash_file",
+                side_effect=AssertionError("No second Drive SHA read"),
+            ),
+        ):
+            self.assertEqual(self.download()["verification"], "stream_sha256")
+        self.assertEqual(self.final.read_bytes(), DATA)
+        receipts = downloader.Receipts(self.root, "Fixture-Org/Fixture-Model", "a" * 40)
+        self.assertTrue(receipts.matches(self.final, self.item))
+
+    def test_vm_writer_timestamp_change_still_prevents_publication(self):
+        self.response(DATA)
+        original = downloader.file_identity
+
+        def changed(path):
+            value = original(path)
+            if path == self.partial and value is not None:
+                return dict(value, ctime_ns=value["ctime_ns"] + 1)
+            return value
+
+        with (
+            mock.patch.object(downloader, "file_identity", side_effect=changed),
+            self.assertRaisesRegex(downloader.DownloadError, "Partial changed"),
+        ):
+            self.download()
+        self.assertFalse(self.final.exists())
+
+    def test_drive_writer_never_accepts_replaced_inode_device_or_size(self):
+        path = self.drive / "MyDrive" / "owned.partial"
+        path.write_bytes(DATA)
+        expected = downloader.file_identity(path)
+        for key in ("device", "inode", "size"):
+            with (
+                self.subTest(key=key),
+                mock.patch.object(downloader.os.path, "ismount", return_value=True),
+            ):
+                current = dict(
+                    expected,
+                    mtime_ns=expected["mtime_ns"] + 1,
+                    ctime_ns=expected["ctime_ns"] + 1,
+                )
+                current[key] += 1
+                with mock.patch.object(
+                    downloader, "file_identity", return_value=current
+                ):
+                    self.assertFalse(downloader.written_partial_matches(path, expected))
+
+    def test_unmounted_drive_does_not_relax_writer_timestamps(self):
+        path = self.drive / "MyDrive" / "owned.partial"
+        path.write_bytes(DATA)
+        expected = downloader.file_identity(path)
+        changed = dict(expected, ctime_ns=expected["ctime_ns"] + 1)
+        with (
+            mock.patch.object(downloader.os.path, "ismount", return_value=False),
+            mock.patch.object(downloader, "file_identity", return_value=changed),
+        ):
+            self.assertFalse(downloader.written_partial_matches(path, expected))
+
     def test_verified_receipt_skips_content_read_but_explicit_verify_re_reads(self):
         self.final.write_bytes(DATA)
         self.assertEqual(self.download()["verification"], "full_sha256")
@@ -330,6 +410,333 @@ class ModelDownloadTests(unittest.TestCase):
                 self.write_manifest(**fields)
                 with self.assertRaises(downloader.DownloadError):
                     downloader.load_manifest(self.manifest)
+
+    def extra_manifest(self, item=None, **changes):
+        path = self.content / "extra.json"
+        value = {
+            "repo_id": "Fixture-Org/Other-Model",
+            "revision": "b" * 40,
+            "files": [
+                item
+                or dict(
+                    self.item,
+                    path="loras/extra.safetensors",
+                    source_path="weights/extra.safetensors",
+                )
+            ],
+        }
+        value.update(changes)
+        path.write_text(json.dumps(value))
+        return path
+
+    def test_extra_manifest_downloads_correct_source_to_comfyui_destination(self):
+        self.args.extra_manifest = [self.extra_manifest()]
+        self.http.side_effect = lambda *_args, **_kwargs: Response(DATA)
+        result = downloader.run(self.args)
+        self.assertEqual(result["total_size_bytes"], 2 * len(DATA))
+        self.assertEqual(len(result["sources"]), 2)
+        self.assertEqual((self.root / "loras/extra.safetensors").read_bytes(), DATA)
+        self.assertEqual(
+            self.http.call_args.args[0].full_url,
+            "https://huggingface.co/Fixture-Org/Other-Model/resolve/"
+            + "b" * 40
+            + "/weights/extra.safetensors",
+        )
+        self.assertFalse((self.root / "weights").exists())
+        self.http.reset_mock(side_effect=True)
+        with mock.patch.object(
+            downloader, "hash_file", side_effect=AssertionError("Receipt reuse")
+        ):
+            again = downloader.run(self.args)
+        self.assertTrue(
+            all(
+                item["verification"] == "verified_receipt_metadata"
+                for item in again["files"]
+            )
+        )
+        self.http.assert_not_called()
+
+    def test_extra_sources_preserve_existing_base_receipts(self):
+        self.response(DATA)
+        self.download()
+        self.args.extra_manifest = [self.extra_manifest()]
+        self.http.side_effect = lambda *_args, **_kwargs: Response(DATA)
+        with mock.patch.object(
+            downloader, "hash_file", side_effect=AssertionError("No base reread")
+        ):
+            result = downloader.run(self.args)
+        self.assertEqual(
+            result["files"][0]["verification"], "verified_receipt_metadata"
+        )
+        self.assertEqual(result["files"][1]["verification"], "stream_sha256")
+        self.assertEqual(self.http.call_count, 2)
+        legacy = downloader.Receipts(self.root, "Fixture-Org/Fixture-Model", "a" * 40)
+        self.assertTrue(legacy.matches(self.final, self.item))
+
+    def test_auto_extra_manifest_only_applies_to_the_default_base(self):
+        extra = self.extra_manifest()
+        with (
+            mock.patch.object(downloader, "DEFAULT_MANIFEST", self.manifest),
+            mock.patch.object(downloader, "DEFAULT_EXTRA_MANIFEST", extra),
+        ):
+            self.assertEqual(len(downloader.load_manifests(self.manifest)["files"]), 2)
+            other = self.content / "other.json"
+            other.write_bytes(self.manifest.read_bytes())
+            self.assertEqual(len(downloader.load_manifests(other)["files"]), 1)
+            self.assertEqual(
+                len(downloader.load_manifests(self.manifest, [extra])["files"]),
+                2,
+            )
+            self.extra_manifest(files=[])
+            self.assertEqual(len(downloader.load_manifests(self.manifest)["files"]), 1)
+
+    def test_default_discovers_multiple_repositories_sorted_and_reuses_base_receipts(
+        self,
+    ):
+        self.response(DATA)
+        self.download()
+        extra = self.extra_manifest(files=[])
+        for filename, repo, revision, path in (
+            ("extra-z.json", "Fixture-Org/Z-Model", "c" * 40, "loras/z.safetensors"),
+            ("extra-a.json", "Fixture-Org/A-Model", "b" * 40, "vae/a.safetensors"),
+        ):
+            (self.content / filename).write_text(
+                json.dumps(
+                    {
+                        "repo_id": repo,
+                        "revision": revision,
+                        "files": [dict(self.item, path=path)],
+                    }
+                )
+            )
+        # Other JSON documents are not model manifests selected by the pattern.
+        (self.content / "manifest.schema.json").write_text("not a model manifest")
+        (self.content / "h3-i2v-metadata.json").write_text("not a model manifest")
+        (self.content / "selected-extra-manifests.json").write_text(
+            json.dumps({"version": 1, "files": ["extra-z.json", "extra-a.json"]})
+        )
+        self.http.reset_mock()
+        self.http.side_effect = lambda *_args, **_kwargs: Response(DATA)
+        with (
+            mock.patch.object(downloader, "DEFAULT_MANIFEST", self.manifest),
+            mock.patch.object(downloader, "DEFAULT_EXTRA_MANIFEST", extra),
+            mock.patch.object(
+                downloader, "hash_file", side_effect=AssertionError("No base reread")
+            ),
+        ):
+            result = downloader.run(self.args)
+            self.assertEqual(
+                [item["path"] for item in result["files"]],
+                [self.item["path"], "vae/a.safetensors", "loras/z.safetensors"],
+            )
+            self.assertEqual(
+                result["files"][0]["verification"], "verified_receipt_metadata"
+            )
+            self.assertEqual(self.http.call_count, 2)
+            self.assertEqual(
+                [source["repo_id"] for source in result["sources"]],
+                [
+                    "Fixture-Org/Fixture-Model",
+                    "Fixture-Org/A-Model",
+                    "Fixture-Org/Z-Model",
+                ],
+            )
+            self.assertEqual(
+                len(
+                    downloader.load_manifests(
+                        self.manifest, [self.content / "extra-a.json"]
+                    )["files"]
+                ),
+                3,
+            )
+            self.http.reset_mock()
+            again = downloader.run(self.args)
+            self.assertTrue(
+                all(
+                    item["verification"] == "verified_receipt_metadata"
+                    for item in again["files"]
+                )
+            )
+            self.http.assert_not_called()
+
+    def test_invalid_or_colliding_discovered_manifest_fails_before_network(self):
+        extra = self.extra_manifest(files=[])
+        additional = self.content / "extra-bad.json"
+        for value in (
+            "not valid JSON",
+            json.dumps(
+                {"repo_id": "Fixture-Org/Other", "revision": "main", "files": []}
+            ),
+            json.dumps(
+                {
+                    "repo_id": "Fixture-Org/Other",
+                    "revision": "b" * 40,
+                    "files": [self.item],
+                }
+            ),
+        ):
+            with self.subTest(value=value):
+                additional.write_text(value)
+                with (
+                    mock.patch.object(downloader, "DEFAULT_MANIFEST", self.manifest),
+                    mock.patch.object(downloader, "DEFAULT_EXTRA_MANIFEST", extra),
+                    self.assertRaises(downloader.DownloadError),
+                ):
+                    downloader.run(self.args)
+                self.assertFalse(self.final.exists())
+                self.assertFalse((self.root / downloader.RECEIPT_NAME).exists())
+        self.http.assert_not_called()
+
+    def test_deployment_registry_selects_exact_lists_ignoring_stale_bad_files(self):
+        self.response(DATA)
+        self.download()
+        common = self.extra_manifest(files=[])
+        selected = self.content / "extra-current.json"
+        selected.write_text(
+            json.dumps(
+                {
+                    "repo_id": "Fixture-Org/Current",
+                    "revision": "c" * 40,
+                    "files": [dict(self.item, path="loras/current.safetensors")],
+                }
+            )
+        )
+        common.write_text("unselected common manifest is invalid")
+        (self.content / "extra-stale.json").write_text(
+            "unselected stale manifest is invalid"
+        )
+        registry = self.content / "selected-extra-manifests.json"
+        registry.write_text(json.dumps({"version": 1, "files": [selected.name]}))
+        self.http.reset_mock()
+        self.http.side_effect = lambda *_args, **_kwargs: Response(DATA)
+        with (
+            mock.patch.object(downloader, "DEFAULT_MANIFEST", self.manifest),
+            mock.patch.object(downloader, "DEFAULT_EXTRA_MANIFEST", common),
+            mock.patch.object(
+                downloader, "hash_file", side_effect=AssertionError("No core reread")
+            ),
+        ):
+            result = downloader.run(self.args)
+            self.assertEqual(
+                [item["path"] for item in result["files"]],
+                [self.item["path"], "loras/current.safetensors"],
+            )
+            self.assertEqual(
+                result["files"][0]["verification"], "verified_receipt_metadata"
+            )
+            self.assertEqual(result["sources"][1]["repo_id"], "Fixture-Org/Current")
+            self.assertEqual(self.http.call_count, 1)
+            registry.write_text(json.dumps({"version": 1, "files": []}))
+            self.assertEqual(len(downloader.load_manifests(self.manifest)["files"]), 1)
+            self.assertEqual(
+                (self.root / "loras/current.safetensors").read_bytes(), DATA
+            )
+
+    def test_deployment_registry_schema_and_names_fail_before_network(self):
+        registry = self.content / "selected-extra-manifests.json"
+        for value in (
+            "invalid JSON",
+            json.dumps([]),
+            json.dumps({"version": True, "files": []}),
+            json.dumps({"version": 2, "files": []}),
+            json.dumps({"version": 1, "files": "extra.json"}),
+            json.dumps({"version": 1, "files": [None]}),
+            json.dumps({"version": 1, "files": [{}]}),
+            json.dumps({"version": 1, "files": ["extra.json", "extra.json"]}),
+            *(
+                json.dumps({"version": 1, "files": [name]})
+                for name in (
+                    "../extra-x.json",
+                    "/extra.json",
+                    "extrafoo.json",
+                    "manifest.schema.json",
+                    "h3-i2v.json",
+                    "extra-missing.json",
+                )
+            ),
+        ):
+            with self.subTest(value=value):
+                registry.write_text(value)
+                with (
+                    mock.patch.object(downloader, "DEFAULT_MANIFEST", self.manifest),
+                    self.assertRaises(downloader.DownloadError),
+                ):
+                    downloader.run(self.args)
+        self.http.assert_not_called()
+        self.assertFalse(self.final.exists())
+
+    def test_deployment_registry_rejects_selected_directories_and_symlinks(self):
+        registry = self.content / "selected-extra-manifests.json"
+        directory = self.content / "extra-directory.json"
+        directory.mkdir()
+        linked = self.content / "extra-link.json"
+        linked.symlink_to(self.manifest)
+        for selected in (directory, linked):
+            registry.write_text(json.dumps({"version": 1, "files": [selected.name]}))
+            with (
+                self.subTest(name=selected.name),
+                mock.patch.object(downloader, "DEFAULT_MANIFEST", self.manifest),
+                self.assertRaises(downloader.DownloadError),
+            ):
+                downloader.run(self.args)
+        registry.unlink()
+        registry.symlink_to(self.manifest)
+        with (
+            mock.patch.object(downloader, "DEFAULT_MANIFEST", self.manifest),
+            self.assertRaises(downloader.DownloadError),
+        ):
+            downloader.run(self.args)
+        self.http.assert_not_called()
+
+    def test_extra_manifest_collisions_fail_before_download(self):
+        for item in (
+            self.item,
+            dict(self.item, path="diffusion_models"),
+            dict(self.item, path=self.item["path"] + "/nested"),
+        ):
+            with self.subTest(path=item["path"]):
+                self.args.extra_manifest = [self.extra_manifest(item)]
+                with self.assertRaises(downloader.DownloadError):
+                    downloader.run(self.args)
+        self.http.assert_not_called()
+        self.assertFalse(self.final.exists())
+
+    def test_source_path_is_validated_and_direct_file_urls_are_rejected(self):
+        for fields in (
+            {"source_path": "../escape"},
+            {"source_path": "https://fixture.invalid/model"},
+            {"source_path": "weights/model?token=x"},
+            {"source_path": "weights//model"},
+            {"url": "https://fixture.invalid/model?secret=value"},
+            {"repo_id": "Other-Org/Other-Model"},
+            {"revision": "main"},
+        ):
+            with self.subTest(fields=fields):
+                self.write_manifest(files=[dict(self.item, **fields)])
+                with self.assertRaises(downloader.DownloadError) as raised:
+                    downloader.load_manifest(self.manifest)
+                self.assertNotIn("secret=value", str(raised.exception))
+
+    def test_repeatable_extra_manifest_cli_preserves_json_boundary(self):
+        extra = self.extra_manifest()
+        self.http.side_effect = lambda *_args, **_kwargs: Response(DATA)
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            code = downloader.main(
+                [
+                    "--manifest",
+                    str(self.manifest),
+                    "--extra-manifest",
+                    str(extra),
+                    "--extra-manifest",
+                    str(extra),
+                    "--models-root",
+                    str(self.root),
+                    "--ephemeral",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(json.loads(output.getvalue())["files"]), 2)
 
     def test_drive_mount_is_required_and_no_directory_created_on_failure(self):
         requested = self.drive / "MyDrive" / "launcher" / "models"

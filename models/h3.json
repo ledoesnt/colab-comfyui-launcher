@@ -1,15 +1,20 @@
 {
-  "name": "MiniMax H3 Base FL2VA for ComfyUI",
+  "name": "MiniMax H3 FL2VA and official I2V template for ComfyUI",
   "repo_id": "Comfy-Org/MiniMax-H3",
   "revision": "e5eb578a89295337b8ff433a035929ce0279e0b6",
   "format": "comfyui-safetensors",
-  "total_size_bytes": 40073842159,
+  "total_size_bytes": 42030547279,
   "metadata_source": "https://huggingface.co/api/models/Comfy-Org/MiniMax-H3?blobs=true",
-  "verified_metadata_date": "2026-10-04",
+  "verified_metadata_date": "2026-10-06",
   "license": {
     "name": "MiniMax H3 Community License Agreement",
     "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE",
-    "excluded_territories": ["European Union", "United Kingdom", "Republic of Korea", "United States of America"],
+    "excluded_territories": [
+      "European Union",
+      "United Kingdom",
+      "Republic of Korea",
+      "United States of America"
+    ],
     "notice": "Open weights under a custom territorial license; this manifest does not grant model rights. Check the original license before download or deployment."
   },
   "files": [
@@ -32,6 +37,17 @@
       "path": "vae/minimax_h3_audio_vae_fp32.safetensors",
       "size_bytes": 605254808,
       "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"
+    },
+    {
+      "path": "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+      "size_bytes": 1956193000,
+      "sha256": "2339acdf19bfe123f46b971ea35d367a84adb85de43627e1eceafa5a5b2b111e"
+    },
+    {
+      "path": "embeddings/minimaxh3_art_is_explosion.safetensors",
+      "size_bytes": 512120,
+      "sha256": "00e8679c77ce1fc3fd3accb67bc4db56d626b6b27609797504ab00e2b997145f",
+      "optional_for_template": true
     }
   ]
 }

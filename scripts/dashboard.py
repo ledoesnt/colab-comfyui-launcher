@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import curses
+import importlib.util
 import json
 import os
 import queue
@@ -24,6 +25,7 @@ import uuid
 import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -31,6 +33,20 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STORAGE = "/content/drive/MyDrive/colab-comfyui-launcher-test"
 DEFAULT_IDENTITY = Path.home() / ".ssh/colab_comfyui_launcher"
 REFRESH_SECONDS = 10.0
+MODEL_SEARCH_CATEGORIES = frozenset(
+    (
+        "diffusion_models",
+        "text_encoders",
+        "vae",
+        "checkpoints",
+        "loras",
+        "clip_vision",
+        "embeddings",
+        "controlnet",
+        "upscale_models",
+        "style_models",
+    )
+)
 NOT_DEPLOYED_NOTICE = "VM ready; launcher not deployed. Use d + Enter to deploy, or f + Enter for full startup."
 
 
@@ -445,6 +461,7 @@ class Worker:
                     "wizard_create",
                     "wizard_resume",
                     "mount",
+                    "prepare_refresh",
                 ) and action in ("stop", "release"):
                     # Cleanup uses the operation's original session/SSH settings.
                     if (
@@ -595,6 +612,8 @@ class Worker:
             raise DashboardError(
                 "Existing services use different storage/access settings. Stop them explicitly before reconfiguring."
             )
+        if not config.cpu:
+            validate_model_plan()
         self._mount_embedded(config)
         if status.get("deployed") is not True:
             self._check_cancelled()
@@ -662,6 +681,123 @@ class Worker:
                 )
             self.events.put(("ssh", ssh))
         self.events.put(("notice", "ComfyUI is ready."))
+
+    def _prepare_refresh(self, config: Config) -> None:
+        """Apply current pinned model lists without changing the VM or services."""
+        self.events.put(("stage", "checking current runtime before model refresh"))
+        status = self._status(config)
+        saved = status.get("configuration") or {}
+        if not (
+            isinstance(saved, dict)
+            and type(saved.get("cpu")) is bool
+            and type(saved.get("ephemeral")) is bool
+            and saved.get("access_mode") in ("local", "public", "email")
+            and (saved["ephemeral"] or isinstance(saved.get("storage_root"), str))
+        ):
+            raise DashboardError(
+                "Runtime storage configuration is unknown. Inspect this runtime before refreshing models."
+            )
+        if config.cpu or saved["cpu"]:
+            raise DashboardError(
+                "Model preparation requires a GPU runtime; the CPU editor skips H3 models."
+            )
+        if (
+            saved["ephemeral"] != config.ephemeral
+            or (not config.ephemeral and saved["storage_root"] != config.storage_root)
+            or saved["access_mode"]
+            != ("local" if config.access == "local-only" else config.access)
+        ):
+            raise DashboardError(
+                "Saved runtime settings differ from the selected settings. Inspect this runtime before refreshing models."
+            )
+        if not config.ephemeral and (
+            Path("/content/drive/MyDrive") not in Path(saved["storage_root"]).parents
+            or ".." in Path(saved["storage_root"]).parts
+        ):
+            raise DashboardError(
+                "Saved Drive directory is invalid. Inspect this runtime before refreshing models."
+            )
+        manifest = validate_model_plan()
+        required_categories = {
+            item["path"].split("/", 1)[0] for item in manifest["files"]
+        }
+        task = status.get("model_prepare") or {}
+        existing_task = task.get("running") is True
+        if existing_task:
+            self.events.put(("stage", "waiting for existing local model preparation"))
+        else:
+            if task.get("status") in ("unknown", "interrupted"):
+                raise DashboardError(
+                    "Model preparation state is uncertain; inspect this runtime before submitting another task."
+                )
+            if (status.get("model_download") or {}).get("running") is True:
+                raise DashboardError(
+                    "A model download is already running. Wait for it before refreshing models."
+                )
+            if (status.get("installation") or {}).get("status") != "ready":
+                raise DashboardError(
+                    "ComfyUI installation is not ready. Continue the startup steps before refreshing models."
+                )
+            drive = status.get("drive") or {}
+            if not config.ephemeral and not (
+                drive.get("mounted") is True and drive.get("mydrive_ready") is True
+            ):
+                raise DashboardError(
+                    "Google Drive is not ready. Use Authorize / check Google Drive before refreshing models."
+                )
+            self._check_cancelled()
+            self.events.put(("stage", "deploying updated model lists to this runtime"))
+            self.backend.bridge(config, "deploy")
+            self._check_cancelled()
+            self.events.put(("stage", "preparing added models on VM disk"))
+            self.backend.bridge(config, "prepare", download_missing=True)
+        self._wait(config, "model_prepare", 1860)
+        final_status = self._status(config)
+        if final_status.get("models_ready") is not True:
+            raise DashboardError(
+                "Local model readiness changed after preparation. Inspect the runtime before submitting a workflow."
+            )
+        if config.access == "local-only":
+            self._check_cancelled()
+            try:
+                self.events.put(("ssh", self.backend.ssh(config, "status")))
+            except DashboardError as exc:
+                self.events.put(("ssh_error", safe_error(exc)))
+        registered = final_status.get("model_search_categories")
+        known_paths = isinstance(registered, list) and all(
+            isinstance(category, str) for category in registered
+        )
+        missing = required_categories - set(registered) if known_paths else set()
+        registration_needed = final_status.get("comfyui_alive") is True and (
+            not known_paths or bool(missing)
+        )
+        self.events.put(("model_registration", sorted(required_categories)))
+        notice = (
+            "Existing preparation finished. Edited local lists were not redeployed; choose Prepare / refresh models again to apply them."
+            if existing_task
+            else "Model files prepared and verified; existing services were retained."
+        )
+        if registration_needed:
+            notice += (
+                " Running ComfyUI search paths are unknown."
+                if not known_paths
+                else " Running ComfyUI has no registered paths for: "
+                + ", ".join(sorted(missing))
+                + "."
+            )
+            notice += " Use Stop services, then Continue missing startup steps to register the model directories. Browser refresh alone is insufficient."
+        elif not existing_task:
+            notice += (
+                " Refresh ComfyUI to see new models."
+                if final_status.get("comfyui_alive") is True
+                else " ComfyUI is stopped; Continue missing startup steps to start it."
+            )
+        self.events.put(
+            (
+                "notice",
+                notice,
+            )
+        )
 
     def _check_cancelled(self) -> None:
         if self.cancelled.is_set():
@@ -775,6 +911,8 @@ class Worker:
                 self._check_cancelled()
 
     def _pipeline(self, config: Config) -> None:
+        if not config.cpu:
+            validate_model_plan()
         for action in ("deploy", "install"):
             self._check_cancelled()
             self.events.put(("stage", action))
@@ -832,6 +970,8 @@ class Worker:
                     self._check_cancelled()
                 if action in ("wizard_create", "wizard_resume"):
                     if action == "wizard_create":
+                        if not config.cpu:
+                            validate_model_plan()
                         self.events.put(("stage", "creating and verifying runtime"))
                         provider = self.backend.create(config)
                         self.events.put(("session", (config, provider)))
@@ -840,11 +980,15 @@ class Worker:
                     self.events.put(("inspection", self.backend.inspect(config)))
                 elif action == "mount":
                     self._mount_embedded(config)
+                elif action == "prepare_refresh":
+                    self._prepare_refresh(config)
                 elif action == "pipeline":
                     self._pipeline(config)
                 elif action == "sessions":
                     self.events.put(("sessions", self.backend.sessions()))
                 elif action == "new":
+                    if not config.cpu:
+                        validate_model_plan()
                     provider = self.backend.create(config)
                     self.events.put(("session", (config, provider)))
                     self._status(config)
@@ -860,6 +1004,9 @@ class Worker:
                     self._stop(config)
                 elif action.startswith("ssh_"):
                     self.events.put(("ssh", self.backend.ssh(config, action[4:])))
+                    # A live local tunnel must be reconciled with current remote
+                    # service state, rather than the UI's pre-start snapshot.
+                    self._status(config)
                 elif action == "status":
                     self._status(config)
                     try:
@@ -900,6 +1047,48 @@ def human_bytes(value: object) -> str:
             return f"{amount:.1f}{unit}"
         amount /= 1024
     return "?"
+
+
+@lru_cache(maxsize=1)
+def _model_manifest_module() -> Any:
+    specification = importlib.util.spec_from_file_location(
+        "launcher_dashboard_models", ROOT / "scripts/download_models.py"
+    )
+    if specification is None or specification.loader is None:
+        raise DashboardError("Cannot load the model manifest reader")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def validate_model_plan() -> dict[str, Any]:
+    try:
+        module = _model_manifest_module()
+        manifest = module.load_manifests(module.DEFAULT_MANIFEST)
+    except Exception as exc:
+        raise DashboardError("Invalid local model list: " + safe_error(exc)) from exc
+    required = {item["path"].split("/", 1)[0] for item in manifest["files"]}
+    unsupported = sorted(required - MODEL_SEARCH_CATEGORIES)
+    if unsupported:
+        raise DashboardError(
+            "Model categories are not registered by this launcher: "
+            + ", ".join(unsupported)
+            + ". Update the runtime directory mapping before preparing these files."
+        )
+    return manifest
+
+
+def pinned_model_summary(cpu: bool = False) -> str:
+    if cpu:
+        return "Skipped in CPU mode"
+    try:
+        manifest = validate_model_plan()
+    except DashboardError as exc:
+        return safe_error(exc)
+    return (
+        f"{len(manifest['files'])} pinned model files · approximately "
+        f"{manifest['total_size_bytes'] / 1_000_000_000:.2f} GB"
+    )
 
 
 def compact_name(path: object, limit: int = 28) -> str:
@@ -1086,6 +1275,8 @@ class Theme:
         "comfy": "#F2FF59",
         "title": "#E77012",
         "accent": "#F9AA00",
+        "info_heading": "#75BFFF",
+        "info": "#BDDFFF",
     }
 
     def __init__(self, color: bool = True):
@@ -1100,6 +1291,8 @@ class Theme:
             "normal": curses.A_NORMAL,
             "comfy": curses.A_BOLD,
             "input": curses.A_BOLD,
+            "info_heading": curses.A_BOLD,
+            "info": curses.A_NORMAL,
         }
         self.unicode = "utf" in (sys.stdout.encoding or "").lower()
 
@@ -1122,6 +1315,8 @@ class Theme:
                     (229, self.BRAND["comfy"]),
                     (208, self.BRAND["title"]),
                     (214, self.BRAND["accent"]),
+                    (75, self.BRAND["info_heading"]),
+                    (153, self.BRAND["info"]),
                 ):
                     rgb = tuple(
                         round(int(value[index : index + 2], 16) * 1000 / 255)
@@ -1141,11 +1336,13 @@ class Theme:
                 ("normal", 252 if extended else curses.COLOR_WHITE),
                 ("comfy", 229 if extended else curses.COLOR_YELLOW),
                 ("input", 255 if extended else curses.COLOR_WHITE),
+                ("info_heading", 75 if extended else curses.COLOR_CYAN),
+                ("info", 153 if extended else curses.COLOR_CYAN),
             ]
             for pair, (role, foreground) in enumerate(colors, 1):
                 curses.init_pair(pair, foreground, background)
                 self.roles[role] = curses.color_pair(pair) | (
-                    curses.A_BOLD if role != "muted" else curses.A_NORMAL
+                    curses.A_NORMAL if role in ("muted", "info") else curses.A_BOLD
                 )
         except curses.error:
             # Partial/basic terminal capabilities never prevent local control.
@@ -1697,7 +1894,11 @@ class Dashboard:
         )
         install_state = str(install.get("status", "unknown")).upper()
         mode = self.status.get("access_mode") or self.config.access
-        model_state = "READY" if self.status.get("models_ready") else "waiting"
+        model_state = (
+            "SKIPPED (CPU)"
+            if self.config.cpu
+            else ("READY" if self.status.get("models_ready") else "waiting")
+        )
         if rect.height <= 6:
             rows = [
                 (

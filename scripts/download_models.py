@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 CONTENT_ROOT = Path("/content")
 DRIVE_MOUNT = CONTENT_ROOT / "drive"
 DEFAULT_MANIFEST = Path(__file__).resolve().parents[1] / "models" / "h3.json"
+DEFAULT_EXTRA_MANIFEST = DEFAULT_MANIFEST.with_name("extra.json")
 CHUNK_BYTES = 4 * 1024 * 1024
 RECEIPT_NAME = ".verified-models.json"
 
@@ -66,7 +67,33 @@ def time_budget(seconds):
             signal.setitimer(signal.ITIMER_REAL, remaining, old_timer[1])
 
 
-def load_manifest(path):
+def validate_model_path(path, label="Model paths"):
+    if (
+        not isinstance(path, str)
+        or not path
+        or str(PurePosixPath(path)) != path
+        or not all(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", part)
+            for part in path.split("/")
+        )
+        or path.endswith(".partial")
+    ):
+        raise DownloadError(label + " must be safe relative filenames")
+
+
+def validate_path_collisions(files):
+    paths = set()
+    for item in files:
+        path = item["path"]
+        if path in paths:
+            raise DownloadError("Duplicate model destination path in manifests")
+        paths.add(path)
+    for path in paths:
+        if any(str(parent) in paths for parent in PurePosixPath(path).parents):
+            raise DownloadError("Model file paths conflict with a parent directory")
+
+
+def load_manifest(path, allow_empty=False):
     try:
         manifest = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -82,42 +109,113 @@ def load_manifest(path):
     if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise DownloadError("revision must be a pinned 40-character commit hash")
     files = manifest.get("files")
-    if not isinstance(files, list) or not files:
+    if not isinstance(files, list) or (not files and not allow_empty):
         raise DownloadError("Manifest must contain a nonempty files list")
-    paths = set()
     for item in files:
         if not isinstance(item, dict):
             raise DownloadError("Each model file must be an object")
-        path = item.get("path")
-        if (
-            not isinstance(path, str)
-            or not path
-            or str(PurePosixPath(path)) != path
-            or not all(
-                re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", part)
-                for part in path.split("/")
+        validate_model_path(item.get("path"))
+        if "source_path" in item:
+            validate_model_path(item["source_path"], "Model source paths")
+        if any(key in item for key in ("url", "repo_id", "revision")):
+            raise DownloadError(
+                "File sources use the pinned manifest repo_id/revision; use another manifest for another repository"
             )
-            or path.endswith(".partial")
-        ):
-            raise DownloadError("Model paths must be safe relative filenames")
-        if path in paths:
-            raise DownloadError("Duplicate model path in manifest")
-        paths.add(path)
         if type(item.get("size_bytes")) is not int or item["size_bytes"] <= 0:
             raise DownloadError("Model size_bytes must be a positive integer")
         if not isinstance(item.get("sha256"), str) or not re.fullmatch(
             r"[0-9a-f]{64}", item["sha256"]
         ):
             raise DownloadError("Model sha256 must be a lowercase SHA256 digest")
-    for path in paths:
-        if any(str(parent) in paths for parent in PurePosixPath(path).parents):
-            raise DownloadError("Model file paths conflict with a parent directory")
+    validate_path_collisions(files)
     total = sum(item["size_bytes"] for item in files)
     if "total_size_bytes" in manifest and (
         type(manifest["total_size_bytes"]) is not int
         or manifest["total_size_bytes"] != total
     ):
         raise DownloadError("Manifest total_size_bytes does not match its files")
+    return manifest
+
+
+def default_extra_manifests():
+    """Use the deployment's exact selection, or discover local checkout lists."""
+    directory = DEFAULT_MANIFEST.parent
+    registry = directory / "selected-extra-manifests.json"
+    if registry.exists() or registry.is_symlink():
+        if registry.is_symlink() or not registry.is_file():
+            raise DownloadError("Additional manifest registry must be a regular file")
+        if registry.stat().st_size > 1024 * 1024:
+            raise DownloadError("Additional manifest registry is unexpectedly large")
+        try:
+            with os.fdopen(
+                os.open(registry, os.O_RDONLY | os.O_NOFOLLOW), "r", encoding="utf-8"
+            ) as stream:
+                value = json.load(stream)
+        except (OSError, ValueError):
+            raise DownloadError(
+                "Cannot read a valid additional manifest registry"
+            ) from None
+        if not (
+            isinstance(value, dict)
+            and type(value.get("version")) is int
+            and value["version"] == 1
+            and isinstance(value.get("files"), list)
+        ):
+            raise DownloadError(
+                "Additional manifest registry needs version 1 and a files list"
+            )
+        names = value["files"]
+        if not all(
+            isinstance(name, str)
+            and re.fullmatch(r"extra(?:-[A-Za-z0-9._-]+)?\.json", name)
+            for name in names
+        ) or len(set(names)) != len(names):
+            raise DownloadError(
+                "Additional manifest registry has invalid or duplicate names"
+            )
+        paths = [directory / name for name in sorted(names)]
+        if any(path.is_symlink() or not path.is_file() for path in paths):
+            raise DownloadError(
+                "Selected additional manifests must be existing regular files, without symlinks"
+            )
+        return paths
+    paths = [DEFAULT_EXTRA_MANIFEST] if DEFAULT_EXTRA_MANIFEST.exists() else []
+    paths.extend(sorted(directory.glob("extra-*.json")))
+    return paths
+
+
+def load_manifests(path, extra_manifest_paths=()):
+    """Merge default extra JSON files and explicitly selected pinned sources."""
+    selected = [load_manifest(path)]
+    extra_paths = []
+    if Path(path).resolve() == DEFAULT_MANIFEST.resolve():
+        extra_paths.extend(default_extra_manifests())
+    extra_paths.extend(extra_manifest_paths)
+    visited = set()
+    for extra in extra_paths:
+        identity = Path(extra).resolve()
+        if identity in visited:
+            continue
+        visited.add(identity)
+        value = load_manifest(extra, allow_empty=True)
+        if value["files"]:
+            selected.append(value)
+    manifest = dict(selected[0])
+    manifest["files"] = [
+        dict(item, repo_id=value["repo_id"], revision=value["revision"])
+        for value in selected
+        for item in value["files"]
+    ]
+    validate_path_collisions(manifest["files"])
+    manifest["total_size_bytes"] = sum(item["size_bytes"] for item in manifest["files"])
+    manifest["sources"] = [
+        {
+            "repo_id": value["repo_id"],
+            "revision": value["revision"],
+            "file_count": len(value["files"]),
+        }
+        for value in selected
+    ]
     return manifest
 
 
@@ -208,6 +306,25 @@ def stat_identity(info):
         "device": info.st_dev,
         "inode": info.st_ino,
     }
+
+
+def written_partial_matches(path, expected):
+    """Drive FUSE finalizes writable timestamps on close; ownership stays fixed.
+
+    This is only for an owned download write, never a read/hash/receipt skip.
+    Ordinary VM files retain strict timestamp checks. Stream SHA and size are
+    separately checked before publishing, and receipts use post-close metadata.
+    """
+    current = file_identity(path)
+    if current == expected:
+        return True
+    if (
+        current is not None
+        and path.is_relative_to(DRIVE_MOUNT)
+        and os.path.ismount(DRIVE_MOUNT)
+    ):
+        return all(current[key] == expected[key] for key in ("size", "device", "inode"))
+    return False
 
 
 def atomic_json(path, value, root, durable=True):
@@ -374,12 +491,14 @@ class Receipts:
 
     def key(self, item):
         identity = [
-            self.repo,
-            self.revision,
+            item.get("repo_id", self.repo),
+            item.get("revision", self.revision),
             item["path"],
             item["size_bytes"],
             item["sha256"],
         ]
+        if item.get("source_path", item["path"]) != item["path"]:
+            identity.append(item["source_path"])
         return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
 
     def matches(self, path, item):
@@ -529,7 +648,10 @@ def download_file(
     result_status = "resumed" if offset else "downloaded"
     digest = None
     if offset < item["size_bytes"]:
-        url = f"https://huggingface.co/{repo}/resolve/{revision}/{item['path']}"
+        source_path = item.get("source_path", item["path"])
+        source_repo = item.get("repo_id", repo)
+        source_revision = item.get("revision", revision)
+        url = f"https://huggingface.co/{source_repo}/resolve/{source_revision}/{source_path}"
         headers = {
             "Accept-Encoding": "identity",
             "User-Agent": "colab-comfyui-launcher/1",
@@ -621,7 +743,9 @@ def download_file(
                 stream.flush()
                 os.fsync(stream.fileno())
                 written_identity = stat_identity(os.fstat(stream.fileno()))
-            if written_identity != file_identity(partial):
+                if not written_partial_matches(partial, written_identity):
+                    raise DownloadError("Partial changed during download")
+            if not written_partial_matches(partial, written_identity):
                 raise DownloadError("Partial changed during download")
             if received != body_size or offset + received != item["size_bytes"]:
                 raise DownloadError(
@@ -665,7 +789,7 @@ def download_file(
 
 def run(args):
     with time_budget(args.max_seconds) as deadline:
-        manifest = load_manifest(args.manifest)
+        manifest = load_manifests(args.manifest, getattr(args, "extra_manifest", ()))
         root = models_root(args.models_root, args.ephemeral)
         progress = Progress(
             getattr(args, "progress_file", None), "download", manifest["files"]
@@ -694,6 +818,7 @@ def run(args):
             "ok": True,
             "repo_id": manifest["repo_id"],
             "revision": manifest["revision"],
+            "sources": manifest["sources"],
             "models_root": str(root),
             "ephemeral": args.ephemeral,
             "files": results,
@@ -709,6 +834,13 @@ class JsonArgumentParser(argparse.ArgumentParser):
 def main(argv=None):
     parser = JsonArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--extra-manifest",
+        type=Path,
+        action="append",
+        default=[],
+        help="Append a pinned model manifest; repeat for additional repositories",
+    )
     parser.add_argument(
         "--models-root",
         type=Path,
