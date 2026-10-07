@@ -8,13 +8,13 @@ python3 scripts/dashboard.py
 
 默认通过 `local-only` 服务与 SSH 转发，在本机 `http://127.0.0.1:8188` 访问。也可以显式选择 `--public` Cloudflare 临时公开网址，或 `--allowed-email` 邮箱登录；不会自动公开服务。SSH 模式需要专用密钥，创建密钥必须由你明确选择。
 
-这是独立的基础设施工具，不依赖 `video-render-lab` 的 Render API。2026-10-07 新增屏内模型勾选与添加、Colab 登录前置检查、默认两路文件下载和小窗口进度布局；本轮验证实际本机终端操作、公开模型元数据保存以及本机 HTTP 并发传输，没有重新分配 GPU 或操作已有用户实例。详见 [最新测试范围](docs/test-report.md)。
+这是独立的基础设施工具，不依赖 `video-render-lab` 的 Render API。2026-10-07 新增屏内模型勾选与添加、Colab 登录前置检查、默认两路文件下载和小窗口进度布局；2026-10-08 统一登录入口、Back 导航和两种布局的步骤状态，移除重复信息块。这两轮验证范围是本机终端、公开模型元数据和本机 HTTP 传输，没有重新分配 GPU 或操作已有用户实例。详见 [最新测试范围](docs/test-report.md)。
 
 2026-10-06 在真实 G4 上完成官方 Popular H3 I2V 浏览器基础 / 8 步 Turbo 两次生成、音视频校验、六模型准备、同 VM 模型维护及工作流服务重启恢复。六文件约 42.03 GB 全量直接下载并校验用时 405.142 秒；同四文件 Drive 首次复制 792.101 秒、直接下载 387.167 秒。两路并发样本比串行缩短约四分之一，Drive 暖缓存样本则更快；这些固定顺序实测不能作为新 VM 的速度保证。最后一次重启后的 API 回归在 120 秒上限内未完成，记录为超时；该历史轮次 G4 和 SSH 已释放。详见 [历史实测记录](docs/test-report.md)。
 
 2026-10-05 的历史向导验证覆盖新建 CPU、两台 G4 的 Drive / 临时存储分支、四模型逐文件进度、SSH、退出保留与接回；两分支完成原 T2V API 音视频生成。临时下载为 305.849 秒，Drive 复制为 726.705 秒，来自不同 VM。另一次历史同机先复制再本地 SHA 共 439.911 秒，其中本地 SHA 26.875 秒；随后同步复制校验为 367.357 秒，受顺序和暖缓存影响。逐步操作截图和 Markdown 保存在 Git 外。
 
-本轮 IAB 在 SSH 本地网址完成 Popular I2V 的实际上传、Run、视频预览与保存。受控 Chrome 标签仍报 `ERR_BLOCKED_BY_CLIENT`，其拦截来源未确定；本轮没有修改扩展或安全设置。此前 Cloudflare 邮箱登录未通过。仅已实际执行的模板计入验收。详见 [实测记录](docs/test-report.md) 与 [H3 调查](docs/colab-h3-research.md)。
+此前 IAB 在 SSH 本地网址完成 Popular I2V 的实际上传、Run、视频预览与保存。受控 Chrome 标签仍报 `ERR_BLOCKED_BY_CLIENT`，其拦截来源未确定；测试没有修改扩展或安全设置。此前 Cloudflare 邮箱登录未通过。仅已实际执行的模板计入验收。详见 [实测记录](docs/test-report.md) 与 [H3 调查](docs/colab-h3-research.md)。
 
 ## 准备
 
@@ -33,26 +33,26 @@ colab --auth=oauth2 sessions
 
 ## 终端界面
 
-默认是逐步启动向导，采用 ComfyUI `#F2FF59`、Colab `#E77012` / `#F9AA00` 配色。**上下选择，Enter 确认**；移动选中项不会执行操作。Esc 返回或取消输入；PgUp / PgDn 翻看右侧详情。输入字段为空时显示默认值，开始输入后提示消失，普通输入使用高对比文字。
+默认是逐步启动向导，采用 ComfyUI `#F2FF59`、Colab `#E77012` / `#F9AA00` 配色。**上下选择，Enter 确认**；移动选中项不会执行操作。可回退页面统一选择 **Back**，Esc 也可返回或取消输入；PgUp / PgDn 翻看详情。输入字段为空时显示默认值，开始输入后提示消失，普通输入使用高对比文字。
 
-窗口不足 110 列或 32 行时采用紧凑布局：步骤放在一行，当前阶段和六个模型进度直接显示在首屏；50×24 起可用。足够大的窗口保留双栏。GPU 的 `project-tested H3 profile` / `H3 profile untested` 表示项目记录的测试覆盖，不会因为一次启动成功自动改变。
+窗口不足 110 列或 32 行时采用紧凑布局：**STARTUP FLOW** 下用箭头连接步骤，步骤与操作区之间留出空行，优先展示当前阶段和逐模型进度；50×24 起可用，完整详情仍可翻页。足够大的窗口保留双栏。两种布局共用步骤状态：`+` 表示已验证，使用黄绿色；`>` 表示当前步骤，使用橙色；`-` 表示跳过，使用灰色。登录状态、操作说明、提示与模型来源各显示一次。GPU 的 `project-tested H3 profile` / `H3 profile untested` 表示项目记录的测试覆盖，不会因为一次启动成功自动改变。
 
 首次使用：
 
-启动先显示 **Colab login** 状态并执行只读检查。未登录时选 **Authorize / check Colab login**，在屏内完成提供方授权；登录确认后才进入实例流程。网络失败显示未核实，不当作退出登录。首页也能直接打开 **Manage models**，不需要先分配 VM。
+启动先显示 Colab 登录状态并执行只读检查；首页只保留一个 **Colab login** 入口。进入后，已验证登录的账号显示 **Recheck login** 和 **Back**；未验证时显示 **Check login status**、**Sign in** 和 **Back**。Check / Recheck 只查询会话，不启动授权或创建实例；Sign in 先检查已有登录，仅在需要时引导提供方浏览器授权。登录确认后才进入实例流程。网络失败显示未核实，不当作退出登录。首页也能直接打开 **Manage models**，不需要先分配 VM。
 
 1. 选择 **Create a new runtime**，选择 GPU 或 CPU；GPU 再选择型号。G4 是本项目已测型号，其余型号的 H3 兼容性未验证。
 2. 选择 **Google Drive** 或 **VM disk**。前者长期缓存模型和保存输出；后者跳过挂载，直接下载到 VM，释放后不保留模型与输出。
 3. 检查配置摘要，再确认创建。首次缺少专用 SSH key 时，明确选择创建或填写已有 key 路径；不会覆盖已有 key。
-4. 若官方 CLI 登录或 Drive 挂载要求授权，右侧显示本轮链接和操作提示，选择 **Open authorization in browser**。按提供方要求完成后，选择 **I have authorized · continue**；若官方 CLI 要求 code，在屏内遮罩输入。子终端保持在后台，不切走 TUI；实际挂载和 MyDrive 检查通过才继续。
+4. 若官方 CLI 登录或 Drive 挂载要求授权，右侧显示本轮链接和操作提示，选择 **Open authorization in browser**。按提供方要求完成后，选择 **I have authorized · continue**；若官方 CLI 要求 code，在屏内遮罩输入。官方交互运行在真正拥有控制终端的子 PTY，不切走 TUI；实际挂载和 MyDrive 检查通过才继续。授权链接和 code 只在本轮显示，不保存授权画面或原始交互日志。
 5. 自动部署、安装、准备 GPU 模型并启动 ComfyUI。右侧显示每个文件的下载、复制或校验进度；CPU 跳过 H3。下载和复制同步计算 SHA256，已有同 VM 验证记录复用会明确标注没有新计算 SHA。
 6. 自动建立 SSH 转发并验证本机 HTTP；出现 **ComfyUI is ready** 后选择 **Open ComfyUI in browser**。
 
-**View existing runtimes** 会先核对真实状态、恢复已有配置，再显示概览或继续缺少的步骤。不会因为 CLI 超时自动重复新建。配置未知时重新选择存储；已有运行服务的存储和访问模式不能直接覆盖。更改已运行 SSH 的端口或 key 前，先到 Advanced actions 停止旧转发。
+**View existing runtimes** 会先核对真实状态、恢复已有配置，再显示概览或继续缺少的步骤。查询期间显示不可执行的 **Loading...** 和可用的 **Back**；Back 返回，保留已有实例与任务。不会因为 CLI 超时自动重复新建。配置未知时重新选择存储；已有运行服务的存储和访问模式不能直接覆盖。更改已运行 SSH 的端口或 key 前，先到 Advanced actions 停止旧转发。
 
 同一实例的唯一有效 owned SSH 转发会恢复实际端口和 key 路径，再检查本机 HTTP；不会静默回到 8188。多个转发或旧版本缺少配置的活跃记录需明确处理：用已知端口停止旧转发，再继续向导。只读状态查询遇到连接关闭或本机命令超时最多尝试三次；创建、安装、准备等写操作不因此重复提交。
 
-Ready 页面可以打开浏览器、**Exit and keep resources**、**End this VM** 或查看其他实例。Exit 保留 VM、已运行服务、转发和远端任务；End this VM 有独立确认，默认选中 Cancel，且只清理选中的实例。启动期间请求释放会取消后续协调并串行清理原实例。挂载、启动失败或状态未知时停在错误页，先 Inspect 再处理，不自动重试未知结果。
+Ready 页面可以打开浏览器、**Exit and keep resources**、**End this VM** 或查看其他实例。Exit 保留 VM、已运行服务、转发和远端任务；End this VM 有独立确认，默认选中 **Cancel and keep it running**，且只清理选中的实例。启动期间请求释放会取消后续协调并串行清理原实例。挂载、启动失败或状态未知时停在错误页，先 Inspect 再处理，不自动重试未知结果。
 
 离线预览不创建 Colab、不访问凭据、不打开浏览器：
 
@@ -74,7 +74,7 @@ Demo 是只读 fixture，可预览导航、输入与进度，不作为云端成�
 | --- | --- |
 | Inspect current runtime | 查询真实状态，恢复已保存的配置与本机 SSH 转发信息。 |
 | Authorize / check Google Drive | 检查 Drive；需要时在屏内引导授权，已挂载则跳过。VM disk 模式直接跳过，不切换存储模式。 |
-| Manage models · add / select files | 添加公共 Hugging Face 模型文件、查看完整清单并按 Enter 切换 `[✓]` / `[×]`；选择自动保存，供下次准备使用。 |
+| Manage models | 添加公共 Hugging Face 模型文件、查看完整清单并按 Enter 切换 `[✓]` / `[×]`；选择自动保存，供下次准备使用。 |
 | Prepare / refresh models | 把本机最新模型清单部署到当前 GPU 实例，准备并验证新增模型，保留服务与 SSH；已有任务先等待，不重复提交。 |
 | Run a PNG smoke test | 运行无模型的 64×64 PNG 工作流，检查执行、输出获取与存储一致性；CPU 也可使用。 |
 | Render the H3 API test | 执行项目固定的 H3 视频测试并校验媒体和存储输出；需要 GPU、已准备的模型和运行中的 ComfyUI。 |
@@ -83,7 +83,7 @@ Demo 是只读 fixture，可预览导航、输入与进度，不作为云端成�
 | Stop local SSH forwarding | 只停止当前配置的本机 owned SSH 转发，保留远端服务与 VM。 |
 | Continue missing startup steps | 检查已有状态，跳过已就绪步骤、等待已有任务，并完成缺少的启动步骤；状态不明时停下。 |
 
-**Return to runtime overview** 返回概览。**End this VM** 在概览页单独操作并再次确认；停止服务或转发不等于释放 VM。
+**Back** 返回概览。**End this VM** 在概览页单独操作并再次确认；停止服务或转发不等于释放 VM。
 
 完整导航和两条存储分支见 [启动流程图](docs/startup-wizard.md)。
 

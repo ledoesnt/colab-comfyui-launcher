@@ -155,7 +155,8 @@ class WizardTests(unittest.TestCase):
         self.choose("gpu")
         self.assertEqual(self.ui.page, "gpu")
         self.assertEqual(
-            [choice.key for choice in self.ui._choices()], list(wizard.GPU_CHOICES)
+            [choice.key for choice in self.ui._choices()],
+            list(wizard.GPU_CHOICES) + ["back"],
         )
         self.assertIn("tested", self.ui._choices()[0].label)
         self.assertIn("H3 profile untested", self.ui._choices()[1].label)

@@ -37,6 +37,7 @@ UNKNOWN = {"state": "unavailable", "message": "Fixture network unavailable."}
 FAKE_CLI = r"""
 import os
 import sys
+import time
 from pathlib import Path
 
 root = Path(sys.argv[1])
@@ -44,6 +45,9 @@ assert sys.argv[2:] == ["--auth=oauth2", "sessions"], "Only read-only sessions i
 with (root / "commands").open("a") as stream:
     stream.write("sessions tty=" + str(sys.stdin.isatty()) + "\n")
 mode = (root / "mode").read_text()
+if mode == "delayed_verified":
+    (root / "entered").touch()
+    time.sleep(0.5)
 if mode == "network":
     print("ConnectionError: fixture network unavailable", file=sys.stderr)
     raise SystemExit(2)
@@ -314,6 +318,48 @@ class AccountPTYTests(unittest.TestCase):
         self.assertEqual(self.backend.terminals, [])
         self.assertTrue(any(kind == "error" for kind, _ in self.seen))
 
+    def test_real_worker_delayed_cli_recheck_back_cannot_leave_checking_when_idle(self):
+        (self.directory / "verified").touch()
+        ui = wizard.Wizard(dashboard.Config(), self.backend, self.worker)
+
+        def pump_until(predicate, timeout=4):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                ui._events()
+                if predicate():
+                    return
+                time.sleep(0.005)
+            self.fail("Real local Worker/CLI did not reach the expected UI state")
+
+        pump_until(
+            lambda: not self.worker.busy and ui.account.get("state") == "authenticated"
+        )
+        ui.config = replace(self.config)
+        ui.status = {"http_ready": True}
+        ui.ssh = {"running": True}
+        (self.directory / "mode").write_text("delayed_verified")
+        ui._activate(wizard.Choice("account", "Colab login"))
+        ui._activate(wizard.Choice("account_check", "Recheck login"))
+        pump_until(lambda: (self.directory / "entered").exists())
+        self.assertTrue(self.worker.busy)
+        self.assertEqual(ui.account["state"], "checking")
+        ui._key("\n")  # Waiting pages default to the enabled Back choice.
+        self.assertEqual(ui.page, "home")
+        self.assertEqual(ui.account["state"], "unknown")
+        self.assertIn("cancelled", ui.account["message"])
+        pump_until(lambda: not self.worker.busy)
+        ui._events()  # Drain actual late cancellation/done events, no fake done.
+        self.assertNotEqual(ui.account["state"], "checking")
+        self.assertEqual(ui.page, "home")
+        self.assertEqual(ui.config.session, "retain-fixture-runtime")
+        self.assertEqual(ui.status, {"http_ready": True})
+        self.assertEqual(ui.ssh, {"running": True})
+        self.assertEqual(self.backend.terminals, [])
+        self.assertEqual(
+            (self.directory / "commands").read_text(),
+            "sessions tty=False\nsessions tty=False\n",
+        )
+
 
 class LocalWorker:
     def __init__(self):
@@ -423,7 +469,7 @@ class AccountNavigationTests(unittest.TestCase):
         self.ui.ssh = {"running": True}
         self.ui._page("ready")
         self.choose("account_login")
-        self.choose("account_back")
+        self.choose("back")
         self.assertTrue(self.worker.cancelled)
         self.worker.events.put(
             ("auth", {"url": "https://fixture.invalid/late", "waiting": True})

@@ -55,6 +55,7 @@ class Choice:
     key: str
     label: str
     detail: str = ""
+    enabled: bool = True
 
 
 class Wizard:
@@ -91,15 +92,24 @@ class Wizard:
         self.account_intent: str | None = None
         self.account_return_page = "home"
         self.account_dismissed = False
+        self.listing_return_page = "home"
+        self.sessions_return_page = "home"
+        self.listing_dismissed = False
+        self.inspect_return_page = "home"
+        self.inspect_dismissed = False
+        self.inspect_previous: dict[str, Any] | None = None
+        self.advanced_return_page = "summary"
         self.input_value = ""
         self.input_field = ""
         self.input_return = "summary"
+        self.input_back_page = "summary"
         self.last_operation = ""
         self.operation_started = 0.0
         self.observe_runtime = False
         self.quitting = False
         self.model_entries: list[dict[str, Any]] = []
         self.models_return = "home"
+        self.model_adding_dismissed = False
         if self.demo:
             self.config.session = self.config.session or "offline-demo"
             self.status = backend.bridge(self.config, "status")
@@ -115,13 +125,21 @@ class Wizard:
             self.resume = True
             self._require_account("inspect")
         elif hasattr(backend, "account_status"):
-            self.account["state"] = "checking"
+            self._account_checking()
             self._submit("account_status")
 
     def _page(self, page: str, selected: int = 0) -> None:
         self.page, self.selected = page, selected
         self.detail_offset = 0
         self.input_value = ""
+        choices = self._choices()
+        if choices:
+            self.selected = min(self.selected, len(choices) - 1)
+            if not choices[self.selected].enabled:
+                self.selected = next(
+                    (index for index, choice in enumerate(choices) if choice.enabled),
+                    self.selected,
+                )
 
     def _submit(self, action: str, config: Config | None = None) -> bool:
         if self.demo:
@@ -151,13 +169,23 @@ class Wizard:
             return False
         self.account_intent = intent
         self.account_dismissed = False
-        self.account_return_page = self.page
+        if self.page != "account":
+            self.account_return_page = self.page
         self._page("account")
         self.notice = "Verify Colab login before choosing a runtime. No runtime is created by login."
         if not self.worker.busy and self.account.get("state") != "not_authenticated":
-            self.account["state"] = "checking"
-            self._submit("account_status")
+            self._account_checking()
+            if self._submit("account_status"):
+                self._page("account")
         return False
+
+    def _account_checking(self, signing_in: bool = False) -> None:
+        self.account = {
+            "state": "checking",
+            "message": "Checking Colab login before sign-in. Browser authorization will be requested only if needed."
+            if signing_in
+            else "Checking Colab login with a read-only session request. No runtime is created.",
+        }
 
     def _finish_account(self) -> None:
         if self.account_dismissed:
@@ -171,13 +199,55 @@ class Wizard:
             self._page("summary")
             self.notice = "Colab login verified. Review and confirm startup; no runtime was created by authorization."
         elif intent == "inspect":
-            if self._submit("inspect"):
-                self._page("inspect")
+            self._start_inspection(return_page=self.account_return_page)
         elif intent == "existing":
-            if self._submit("sessions"):
-                self._page("listing")
+            self._start_listing(return_page=self.account_return_page)
         elif intent == "new":
             self._activate(Choice("new", "Create a new runtime"))
+
+    def _start_listing(self, return_page: str | None = None) -> bool:
+        origin = return_page or self.page
+        if not self._submit("sessions"):
+            return False
+        self.listing_return_page = origin
+        if origin != "sessions":
+            self.sessions_return_page = origin
+        self.listing_dismissed = False
+        self._page("listing")
+        self.notice = "Listing runtimes. The previously selected runtime stays running."
+        return True
+
+    def _start_inspection(
+        self, candidate: Config | None = None, return_page: str | None = None
+    ) -> bool:
+        origin = return_page or self.page
+        if not self._submit("inspect", candidate):
+            return False
+        self.inspect_return_page = origin
+        self.inspect_dismissed = False
+        self.inspect_previous = {
+            field: getattr(self, field)
+            for field in (
+                "config",
+                "status",
+                "ssh",
+                "provider",
+                "resume",
+                "observe_runtime",
+                "updated",
+                "required_model_categories",
+                "model_paths_need_restart",
+                "model_registration_notice",
+            )
+        }
+        self.inspect_previous["config"] = replace(self.config)
+        if candidate is not None:
+            self.config = candidate
+            self.resume = True
+            self.observe_runtime = False
+            self.status, self.ssh = {}, {}
+        self._page("inspect")
+        return True
 
     def _ready(self) -> bool:
         if self.model_paths_need_restart:
@@ -245,7 +315,7 @@ class Wizard:
                 ),
                 Choice(
                     "models",
-                    "Manage models · auto-download list",
+                    "Manage models",
                     "Add model files and save which models are automatically prepared. No runtime is required.",
                 ),
                 Choice(
@@ -254,14 +324,9 @@ class Wizard:
                     "Exiting this UI does not stop any runtime.",
                 ),
                 Choice(
-                    "account_check",
-                    "Check Colab login",
-                    "Read-only verification; no runtime is created.",
-                ),
-                Choice(
-                    "account_login",
-                    "Authorize / check Colab login",
-                    "Use the provider's interactive login only if it is required.",
+                    "account",
+                    "Colab login",
+                    "View login status, check the connection or sign in. No runtime is created.",
                 ),
             ]
         if self.page == "account":
@@ -278,23 +343,61 @@ class Wizard:
                     )
                 )
             if not self.worker.busy:
-                choices.extend(
-                    (
-                        Choice("account_check", "Check Colab login"),
-                        Choice("account_login", "Authorize / check Colab login"),
+                choices.append(
+                    Choice(
+                        "account_check",
+                        "Recheck login"
+                        if self.account.get("state") == "authenticated"
+                        else "Check login status",
+                        "Read-only session request. Does not start interactive authorization or create a runtime.",
                     )
                 )
-            choices.extend(
-                (
+                if self.account.get("state") != "authenticated":
+                    choices.append(
+                        Choice(
+                            "account_login",
+                            "Sign in",
+                            "Use the provider's browser authorization and masked code input if login is required. Existing login is retained.",
+                        )
+                    )
+            elif not self.auth.get("waiting"):
+                choices.append(
                     Choice(
-                        "account_back",
-                        "Cancel login / return",
-                        "Retain existing VM, services and SSH; discard this navigation request.",
-                    ),
-                    Choice("quit", "Exit and keep resources"),
+                        "loading",
+                        "Loading...",
+                        "Waiting for Colab login verification. Back retains all runtime resources.",
+                        enabled=False,
+                    )
+                )
+            choices.append(
+                Choice(
+                    "back",
+                    "Back",
+                    "Return to the previous page. Cancel this login request while retaining existing VM, services and SSH.",
                 )
             )
             return choices
+        if self.page in ("listing", "inspect", "model_adding"):
+            descriptions = {
+                "listing": "Waiting for the provider's runtime list.",
+                "inspect": "Inspecting the selected runtime without starting or stopping it.",
+                "model_adding": "Reading public model metadata and saving the confirmed download choice. No weights or runtime are requested.",
+            }
+            return [
+                Choice(
+                    "loading",
+                    "Loading...",
+                    descriptions[self.page],
+                    enabled=False,
+                ),
+                Choice(
+                    "back",
+                    "Back",
+                    "Return to models. The confirmed metadata save continues in the background."
+                    if self.page == "model_adding"
+                    else "Return while the read-only request finishes.",
+                ),
+            ]
         if self.page == "hardware":
             return [
                 Choice(
@@ -307,6 +410,7 @@ class Wizard:
                     "CPU · test the web editor",
                     "Skip H3 weights; install ComfyUI and test PNG output.",
                 ),
+                Choice("back", "Back"),
             ]
         if self.page == "gpu":
             return [
@@ -321,7 +425,7 @@ class Wizard:
                     "Project test coverage is a fixed label, not this runtime's status. Starting a GPU does not prove H3 rendering compatibility. Allocation depends on your account.",
                 )
                 for gpu in GPU_CHOICES
-            ]
+            ] + [Choice("back", "Back")]
         if self.page == "storage":
             return [
                 Choice(
@@ -334,6 +438,7 @@ class Wizard:
                     "VM disk · temporary",
                     "Skip Drive. Download directly to VM disk. Models and outputs disappear when the VM is released.",
                 ),
+                Choice("back", "Back"),
             ]
         if self.page == "summary":
             choices = [
@@ -349,7 +454,7 @@ class Wizard:
                 ),
                 Choice(
                     "models",
-                    "Manage models · auto-download list",
+                    "Manage models",
                     "Choose which pinned files are automatically prepared, or add a public model file. Choices are saved for later runtimes.",
                 ),
             ]
@@ -381,7 +486,7 @@ class Wizard:
             ]
             if not self.config.ephemeral:
                 choices.append(Choice("storage_root", "Dedicated Drive directory"))
-            choices.append(Choice("back", "Return to configuration summary"))
+            choices.append(Choice("back", "Back"))
             return choices
         if self.page == "key_confirm":
             return [
@@ -391,7 +496,7 @@ class Wizard:
                     "Create this key on SSH startup only if absent. Existing keys are never overwritten.",
                 ),
                 Choice("choose_key", "Choose an existing key path"),
-                Choice("back", "Back to summary"),
+                Choice("back", "Back"),
             ]
         if self.page == "sessions":
             choices = [
@@ -405,7 +510,7 @@ class Wizard:
             choices.extend(
                 [
                     Choice("refresh_list", "Refresh runtime list"),
-                    Choice("back", "Back to start"),
+                    Choice("back", "Back"),
                 ]
             )
             return choices
@@ -452,7 +557,7 @@ class Wizard:
                 Choice("mount", "Authorize / check Google Drive"),
                 Choice(
                     "models",
-                    "Manage models · add / select files",
+                    "Manage models",
                     "Saved checkbox choices control later preparation. Editing the list does not download immediately.",
                 ),
                 Choice(
@@ -466,7 +571,7 @@ class Wizard:
                 Choice("ssh_start", "Start local SSH forwarding"),
                 Choice("ssh_stop", "Stop local SSH forwarding"),
                 Choice("wizard_resume", "Continue missing startup steps"),
-                Choice("back", "Return to runtime overview"),
+                Choice("back", "Back"),
             ]
         if self.page == "models":
             choices = [
@@ -493,7 +598,7 @@ class Wizard:
             choices.append(
                 Choice(
                     "back",
-                    "Return · choices are saved",
+                    "Back",
                     "Unchecking a model keeps any existing weight file. Disabled required models can leave a workflow with Missing Models.",
                 )
             )
@@ -508,7 +613,7 @@ class Wizard:
                     "ComfyUI model directory category. The file keeps its original name.",
                 )
                 for category in sorted(MODEL_SEARCH_CATEGORIES)
-            ] + [Choice("back", "Cancel adding model")]
+            ] + [Choice("back", "Back")]
         if self.page == "model_add_confirm":
             return [
                 Choice(
@@ -516,7 +621,7 @@ class Wizard:
                     "Confirm · save model to download list",
                     "Read public metadata only, pin the source and save the new model with auto-download enabled. No GPU is allocated.",
                 ),
-                Choice("back", "Cancel adding model"),
+                Choice("back", "Back"),
             ]
         if self.page == "failure":
             choices = []
@@ -557,7 +662,7 @@ class Wizard:
                     )
                 )
             if self.demo:
-                choices.append(Choice("home", "Preview startup choices"))
+                choices.append(Choice("home", "Back"))
             choices.append(
                 Choice(
                     "quit",
@@ -568,7 +673,14 @@ class Wizard:
             if self.config.session and not self.demo:
                 choices.append(Choice("release", "End the selected VM"))
             return choices
-        return [Choice("quit", "Exit and keep resources")]
+        return [
+            Choice(
+                "loading", "Loading...", "Waiting for the current page.", enabled=False
+            ),
+            Choice(
+                "back", "Back", "Return to the start page without changing resources."
+            ),
+        ]
 
     def _new_name(self) -> str:
         hardware = (
@@ -623,6 +735,7 @@ class Wizard:
 
     def _input(self, field: str, return_page: str) -> None:
         self.input_field, self.input_return = field, return_page
+        self.input_back_page = self.page
         self._page("input")
 
     def _confirm_input(self) -> None:
@@ -705,7 +818,12 @@ class Wizard:
         self._page(self.input_return)
 
     def _activate(self, choice: Choice) -> bool:
+        if not choice.enabled:
+            return True
         key = choice.key
+        if key in ("back", "home", "account_back"):
+            self._back()
+            return True
         if key == "quit":
             self.quitting = True
             self.auth.clear()
@@ -733,6 +851,9 @@ class Wizard:
             self._page("hardware")
         elif key in ("existing", "refresh_list"):
             if self.demo:
+                if self.page != "sessions":
+                    self.sessions_return_page = self.page
+                self.listing_dismissed = False
                 self.sessions = [
                     {
                         "name": "offline-demo",
@@ -743,11 +864,8 @@ class Wizard:
                 self._page("sessions")
             elif not self._require_account("existing"):
                 return True
-            elif self._submit("sessions"):
-                self._page("listing")
-                self.notice = (
-                    "Listing runtimes. The previously selected runtime stays running."
-                )
+            else:
+                self._start_listing()
         elif self.page == "hardware":
             self.config.cpu = key == "cpu"
             self.notice = (
@@ -781,12 +899,7 @@ class Wizard:
             )
             if row["hardware"] in GPU_CHOICES:
                 candidate.gpu = row["hardware"]
-            if self._submit("inspect", candidate):
-                self.config = candidate
-                self.resume = True
-                self.observe_runtime = False
-                self.status, self.ssh = {}, {}
-                self._page("inspect")
+            self._start_inspection(candidate)
         elif key == "start":
             self._begin()
         elif key == "settings":
@@ -817,6 +930,13 @@ class Wizard:
                 "auth_code",
                 "account" if self.last_operation == "account_login" else "pipeline",
             )
+        elif key == "account":
+            if self.page != "account":
+                self.account_return_page = self.page
+                self.account_intent = None
+            self.account_dismissed = False
+            self._page("account")
+            self.notice = str(self.account.get("message", "Colab login is unverified."))
         elif key in ("account_check", "account_login"):
             if not self.worker.busy:
                 if self.page != "account":
@@ -825,20 +945,8 @@ class Wizard:
                     "account_status" if key == "account_check" else "account_login"
                 ):
                     self.account_dismissed = False
-                    self.account["state"] = "checking"
+                    self._account_checking(signing_in=key == "account_login")
                     self._page("account")
-        elif key == "account_back":
-            cancel = getattr(self.worker, "cancel_account", None)
-            if callable(cancel):
-                cancel()
-            self.account_intent = None
-            self.account_dismissed = True
-            self.auth.clear()
-            self._page(
-                self.account_return_page
-                if self.account_return_page != "input"
-                else "home"
-            )
         elif key == "release":
             self.input_return = self.page
             self._page("release_confirm", 1)
@@ -891,12 +999,16 @@ class Wizard:
             self._page("model_add_confirm")
         elif key == "model_add_save":
             if self._submit("model_add"):
+                self.model_adding_dismissed = False
                 self._page("model_adding")
                 self.notice = "Reading file metadata and saving the list; no weights are downloaded yet."
         elif key == "advanced":
+            self.advanced_return_page = self.page
             self._page("advanced")
+        elif key == "inspect":
+            if self._require_account("inspect"):
+                self._start_inspection()
         elif key in (
-            "inspect",
             "mount",
             "prepare_refresh",
             "smoke",
@@ -914,28 +1026,81 @@ class Wizard:
                     self.notice = "Inspect the selected runtime to restore its storage settings before refreshing models."
                     return True
             if self._submit(key):
-                self._page("inspect" if key == "inspect" else "pipeline")
-        elif key in ("back", "home"):
-            self._back()
+                self._page("pipeline")
         return True
 
-    def _load_models(self) -> None:
+    def _load_models(self, *, navigate: bool = True) -> None:
         try:
             self.model_entries = model_catalog_entries()
-            self.error = ""
-            self._page("models")
-            self.notice = "[✓] = automatically prepare · [×] = skip. Enter saves a toggle; existing weights are kept."
+            if navigate:
+                self.error = ""
+                self._page("models")
+                self.notice = "[✓] = automatically prepare · [×] = skip. Enter saves a toggle; existing weights are kept."
         except DashboardError as exc:
-            self.error = safe_error(exc)
+            if navigate:
+                self.error = safe_error(exc)
 
     def _back(self) -> None:
+        self.notice = ""
         if self.page == "account":
-            self._activate(Choice("account_back", "Cancel login / return"))
+            cancel = getattr(self.worker, "cancel_account", None)
+            if callable(cancel):
+                cancel()
+            if self.account.get("state") == "checking" or (
+                self.worker.busy and self.last_operation == "account_login"
+            ):
+                self.account = {
+                    "state": "unknown",
+                    "message": "Colab login request cancelled. Login is unverified; check login status before choosing a runtime. Existing resources are retained.",
+                }
+            self.account_intent = None
+            self.account_dismissed = True
+            self.auth.clear()
+            self._page(
+                self.account_return_page
+                if self.account_return_page not in ("input", "account")
+                else "home"
+            )
             return
-        if self.page in ("models", "model_category", "model_add_confirm"):
-            self._page(self.models_return if self.page == "models" else "models")
+        if self.page == "listing":
+            self.listing_dismissed = True
+            self._page(self.listing_return_page)
+            return
+        if self.page == "inspect":
+            self.inspect_dismissed = True
+            if self.inspect_previous is not None:
+                for field, value in self.inspect_previous.items():
+                    setattr(self, field, value)
+                self.inspect_previous = None
+            self._page(self.inspect_return_page)
+            return
+        if self.page == "sessions":
+            self.listing_dismissed = True
+            self._page(self.sessions_return_page)
+            return
+        if self.page == "models":
+            self._page(self.models_return)
             self.config.model_url = ""
             self.config.model_path = ""
+            return
+        if self.page == "model_adding":
+            self.model_adding_dismissed = True
+            self.config.model_url = ""
+            self.config.model_path = ""
+            self._page("models")
+            return
+        if self.page == "model_category":
+            self._input("model_url", "models")
+            self.input_back_page = "models"
+            self.input_value = self.config.model_url
+            return
+        if self.page == "model_add_confirm":
+            category = self.config.model_path.split("/", 1)[0]
+            categories = sorted(MODEL_SEARCH_CATEGORIES)
+            self._page(
+                "model_category",
+                categories.index(category) if category in categories else 0,
+            )
             return
         parents = {
             "hardware": "home",
@@ -946,16 +1111,21 @@ class Wizard:
             "summary": "storage",
             "settings": "summary",
             "key_confirm": "summary",
-            "sessions": "home",
-            "advanced": "ready" if self._ready() else "summary",
+            "advanced": self.advanced_return_page,
         }
         if self.page in ("input", "release_confirm"):
-            self._page(self.input_return)
+            target = self.input_back_page if self.page == "input" else self.input_return
+            if self.page == "input" and self.input_field == "model_url":
+                self.config.model_url = ""
+                self.config.model_path = ""
+            self._page(target)
         elif self.demo and self.page in ("pipeline", "ready", "failure"):
             self._page("home")
         elif self.page in parents:
             target = parents[self.page]
             self._page(target, int(self.config.ephemeral) if target == "storage" else 0)
+        elif self.page not in ("home", "ready", "pipeline", "failure"):
+            self._page("home")
 
     def _key(self, key: str) -> bool:
         if key in ("KEY_NPAGE", "KEY_PPAGE"):
@@ -976,10 +1146,18 @@ class Wizard:
                 self.input_value += key
             return True
         choices = self._choices()
+        if not choices:
+            return True
         if key == "KEY_UP":
-            self.selected = (self.selected - 1) % len(choices)
+            for _ in choices:
+                self.selected = (self.selected - 1) % len(choices)
+                if choices[self.selected].enabled:
+                    break
         elif key == "KEY_DOWN":
-            self.selected = (self.selected + 1) % len(choices)
+            for _ in choices:
+                self.selected = (self.selected + 1) % len(choices)
+                if choices[self.selected].enabled:
+                    break
         elif key in ("\r", "\n", "KEY_ENTER"):
             return self._activate(choices[min(self.selected, len(choices) - 1)])
         return True
@@ -998,10 +1176,15 @@ class Wizard:
                 self._check_model_registration()
             elif kind == "model_added":
                 path, manifest = value
-                self.config.model_url = ""
-                self.config.model_path = ""
-                self._load_models()
-                self.notice = f"Saved {path} in models/{manifest}. Automatically prepared on the next startup or Prepare / refresh models."
+                navigate = (
+                    not self.model_adding_dismissed and self.page == "model_adding"
+                )
+                if navigate:
+                    self.config.model_url = ""
+                    self.config.model_path = ""
+                self._load_models(navigate=navigate)
+                if navigate or self.page == "models":
+                    self.notice = f"Saved {path} in models/{manifest}. Automatically prepared on the next startup or Prepare / refresh models."
             elif kind == "ssh":
                 self.ssh = value
             elif kind == "config":
@@ -1011,6 +1194,9 @@ class Wizard:
                 self.config, self.provider = replace(config), provider
                 self.observe_runtime = True
             elif kind == "inspection":
+                if self.inspect_dismissed:
+                    continue
+                self.inspect_previous = None
                 if value["config"].session != self.config.session:
                     self.required_model_categories = None
                     self.model_paths_need_restart = False
@@ -1049,18 +1235,19 @@ class Wizard:
                     self.required_model_categories = None
                     self.model_paths_need_restart = False
                     self.model_registration_notice = ""
-                self._page("sessions")
-                self.notice = (
-                    "Select a runtime to inspect it."
-                    if value
-                    else "No active named runtimes. Return and choose Create a new runtime."
-                )
+                if not self.listing_dismissed:
+                    self._page("sessions")
+                    self.notice = (
+                        "Select a runtime to inspect it."
+                        if value
+                        else "No active named runtimes. Return and choose Create a new runtime."
+                    )
             elif kind == "stage":
                 if value != "status":
                     self.stage = str(value)
             elif kind == "account":
                 self.account = dict(value)
-                if self.page in ("home", "account"):
+                if not self.account_dismissed and self.page in ("home", "account"):
                     self.notice = str(
                         value.get("message", "Colab login is unverified.")
                     )
@@ -1085,12 +1272,32 @@ class Wizard:
                         else "pipeline"
                     )
             elif kind == "error":
+                if self.last_operation == "model_add" and self.model_adding_dismissed:
+                    if self.page == "models":
+                        self.error = safe_error(value)
+                    continue
+                if (
+                    self.last_operation == "sessions"
+                    and self.listing_dismissed
+                    or self.last_operation == "inspect"
+                    and self.inspect_dismissed
+                ):
+                    continue
+                if (
+                    self.last_operation in ("account_status", "account_login")
+                    and self.account_dismissed
+                ):
+                    self.account = {
+                        "state": "unavailable",
+                        "message": safe_error(value),
+                    }
+                    continue
                 self.auth.clear()
                 self.input_value = ""
                 self.error = safe_error(value)
                 if self.last_operation in ("account_status", "account_login"):
                     self.account = {"state": "unavailable", "message": self.error}
-                    if not self.account_dismissed:
+                    if not self.account_dismissed and self.page == "account":
                         self._page("account")
                 else:
                     self._page("models" if self.page == "model_adding" else "failure")
@@ -1254,6 +1461,8 @@ class Wizard:
         return complete
 
     def _active_step(self) -> str:
+        if self.page in ("home", "account", "sessions", "listing", "inspect"):
+            return "session"
         if self.page == "account" or (
             self.auth and self.last_operation == "account_login"
         ):
@@ -1267,6 +1476,8 @@ class Wizard:
             return "models"
         if self.page in ("hardware", "gpu"):
             return "hardware"
+        if self.page == "ready":
+            return "startup"
         if (
             self.page in ("storage", "summary", "settings", "key_confirm", "input")
             and not self.auth
@@ -1356,9 +1567,25 @@ class Wizard:
             rows.append(("", "normal"))
         return rows
 
-    def _details(self, width: int) -> list[tuple[str, str]]:
+    def _step_style(self, key: str) -> tuple[str, str]:
+        """Use identical verified/current/skipped states in both layouts."""
+        if (key == "models" and self.config.cpu) or (
+            key == "mount" and self.config.ephemeral
+        ):
+            return "-", "muted"
+        if self.page == "ready" and key in self._complete_steps():
+            return "+", "comfy"
+        if key == self._active_step():
+            return ">", "accent"
+        if key in self._complete_steps():
+            return "+", "comfy"
+        return "o", "muted"
+
+    def _details(
+        self, width: int, *, omit: frozenset[str] = frozenset()
+    ) -> list[tuple[str, str]]:
         rows: list[tuple[str, str]] = []
-        if self.page == "model_add_confirm":
+        if self.page == "model_add_confirm" and "model_add" not in omit:
             rows.extend(
                 (
                     ("MODEL ADDITION · review before Enter", "accent"),
@@ -1371,10 +1598,13 @@ class Wizard:
                     ("", "normal"),
                 )
             )
-        if self.page in ("home", "account") or (
-            self.page == "input"
-            and self.input_field == "auth_code"
-            and self.last_operation == "account_login"
+        if "account" not in omit and (
+            self.page in ("home", "account")
+            or (
+                self.page == "input"
+                and self.input_field == "auth_code"
+                and self.last_operation == "account_login"
+            )
         ):
             state = str(self.account.get("state", "unknown"))
             rows.extend(
@@ -1394,12 +1624,16 @@ class Wizard:
                     ("", "normal"),
                 )
             )
-        if self.page in (
-            "models",
-            "model_category",
-            "model_add_confirm",
-            "model_adding",
-        ) or (self.page == "input" and self.input_field == "model_url"):
+        if "catalog" not in omit and (
+            self.page
+            in (
+                "models",
+                "model_category",
+                "model_add_confirm",
+                "model_adding",
+            )
+            or (self.page == "input" and self.input_field == "model_url")
+        ):
             selected = sum(row.get("auto_download", True) for row in self.model_entries)
             rows.extend(
                 (
@@ -1419,7 +1653,7 @@ class Wizard:
                     ("", "normal"),
                 )
             )
-            if self.config.model_url:
+            if self.config.model_url and self.page != "model_add_confirm":
                 rows.extend(
                     (
                         ("Source file", "accent"),
@@ -1443,7 +1677,7 @@ class Wizard:
                     ("", "normal"),
                 )
             )
-        if self.error:
+        if self.error and "attention" not in omit:
             rows.extend((("Attention", "bad"), (self.error, "normal"), ("", "normal")))
         if self.cleanup_warning:
             rows.extend(
@@ -1571,7 +1805,7 @@ class Wizard:
                         "warn" if age > 2 * REFRESH_SECONDS else "muted",
                     )
                 )
-            if self._url():
+            if self._url() and "url" not in omit:
                 rows.extend(
                     (
                         ("Open in your local browser", "comfy"),
@@ -1579,7 +1813,7 @@ class Wizard:
                     )
                 )
             rows.append(("", "normal"))
-        if self.auth:
+        if self.auth and "auth" not in omit:
             rows.extend(
                 (
                     ("Provider authorization · transient", "accent"),
@@ -1645,12 +1879,16 @@ class Wizard:
         # Authorization controls remain above them when user input is required.
         if self.page == "pipeline":
             rows.extend(self._model_rows(width))
-        if self.notice:
+        if (
+            self.notice
+            and "notice" not in omit
+            and self.notice != self.account.get("message")
+        ):
             rows.extend(
                 (("Next / status", "accent"), (self.notice, "normal"), ("", "normal"))
             )
         choices = self._choices()
-        if self.page != "input" and choices:
+        if self.page != "input" and choices and "choice" not in omit:
             selected = choices[min(self.selected, len(choices) - 1)]
             if selected.detail:
                 rows.extend(
@@ -1771,7 +2009,9 @@ class Wizard:
     def _compact_details(self, width: int) -> list[tuple[str, str]]:
         """Prioritize actionable errors, authorization and model progress."""
         rows: list[tuple[str, str]] = []
+        omitted = {"account", "attention", "auth", "url"}
         if self.page == "model_add_confirm":
+            omitted.update(("model_add", "catalog"))
             rows.extend(
                 (
                     ("MODEL ADDITION · review before Enter", "accent"),
@@ -1820,6 +2060,7 @@ class Wizard:
             "input",
         ):
             selected = choices[min(self.selected, len(choices) - 1)]
+            omitted.add("choice")
             if self.page == "models" and selected.key.startswith("model:"):
                 path = selected.key.removeprefix("model:")
                 item = next(
@@ -1846,6 +2087,7 @@ class Wizard:
                     )
                 )
             elif selected.detail:
+                omitted.add("choice")
                 rows.extend(
                     (
                         ("ABOUT THIS CHOICE · " + selected.label, "info_heading"),
@@ -1854,23 +2096,13 @@ class Wizard:
                 )
         if self.page in ("pipeline", "ready", "failure", "advanced", "inspect"):
             rows.extend(self._compact_model_rows(width))
-        if rows:
-            rows.append(("FULL DETAILS · PgUp/PgDn", "info_heading"))
         wrapped = []
         for value, role in rows:
             wrapped.extend(
                 (line, role) for line in textwrap.wrap(value, max(8, width)) or [""]
             )
         details = []
-        login_block = False
-        for value, role in self._details(width):
-            if self.page in ("home", "account") and value.startswith("COLAB LOGIN ·"):
-                login_block = True
-                continue
-            if login_block:
-                if not value:
-                    login_block = False
-                continue
+        for value, role in self._details(width, omit=frozenset(omitted)):
             if not (
                 role == "comfy"
                 and value.startswith("[")
@@ -1878,7 +2110,13 @@ class Wizard:
                 and set(value.partition("]")[0][1:]) <= {"#", "-"}
             ):
                 details.append((value, role))
-        return wrapped + details
+        if not any(value for value, _ in details):
+            return wrapped
+        return (
+            wrapped
+            + [("", "normal"), ("DETAILS · PgUp/PgDn", "info_heading")]
+            + details
+        )
 
     def _draw_compact(self, screen: Any) -> None:
         """Keep navigation and six model meters visible on ordinary terminals."""
@@ -1889,46 +2127,36 @@ class Wizard:
             if self.page in ("pipeline", "inspect", "listing", "model_adding")
             else self._title()
         )
-        self._write(
-            screen,
-            2,
-            1,
-            self._busy_text() if self.worker.busy else "Now: " + stage,
-            width - 2,
-            "accent",
-        )
-        complete, active = self._complete_steps(), self._active_step()
-        column = 1
+        if self.worker.busy:
+            self._write(screen, 2, 1, self._busy_text(), width - 2, "accent")
+        elif self.page in ("pipeline", "inspect", "listing", "model_adding"):
+            self._write(screen, 2, 1, "Now: " + stage, width - 2, "accent")
+        self._write(screen, 3, 1, "STARTUP FLOW", content_width, "accent")
+        row, column = 4, 2
         labels = ("VM", "Compute", "Disk", "Drive", "Env", "Models", "SSH")
-        for (key, _), label in zip(STEPS, labels):
-            skipped = (key == "models" and self.config.cpu) or (
-                key == "mount" and self.config.ephemeral
-            )
-            marker = (
-                "-"
-                if skipped
-                else ("+" if key in complete else (">" if key == active else "o"))
-            )
-            role = (
-                "muted"
-                if skipped
-                else (
-                    "comfy"
-                    if key in complete
-                    else ("accent" if key == active else "muted")
-                )
-            )
-            value = marker + label + "  "
-            self._write(screen, 3, column, value, width - column - 1, role)
+        for index, ((key, _), label) in enumerate(zip(STEPS, labels)):
+            marker, role = self._step_style(key)
+            value = marker + " " + label
+            separator = " → " if index else ""
+            if column + len(separator) + len(value) > width - 2:
+                row, column = row + 1, 2
+                separator = "→ "
+            if separator:
+                self._write(screen, row, column, separator, len(separator), "muted")
+                column += len(separator)
+            self._write(screen, row, column, value, len(value), role)
             column += len(value)
+        choice_top = row + 2
         if self.page == "input":
             label = (
                 "Provider code"
                 if self.input_field == "auth_code"
                 else self.input_field.replace("_", " ").title()
             )
-            self._write(screen, 4, 1, "EDIT / ENTER TO SUBMIT", content_width, "accent")
-            self._write(screen, 5, 2, label, content_width, "normal")
+            self._write(
+                screen, choice_top, 1, "EDIT / ENTER TO SUBMIT", content_width, "accent"
+            )
+            self._write(screen, choice_top + 1, 2, label, content_width, "normal")
             value = (
                 "*" * len(self.input_value)
                 if self.input_field == "auth_code"
@@ -1936,16 +2164,16 @@ class Wizard:
             )
             self._write(
                 screen,
-                6,
+                choice_top + 2,
                 2,
                 "> " + (value if value else self._input_default()),
                 content_width,
                 "input" if value else "muted",
             )
-            detail_top = 8
+            detail_top = choice_top + 4
         else:
             choices = self._choices()
-            reserved = 14 if self.page == "models" else 12
+            reserved = (14 if self.page == "models" else 11) + (choice_top - 4)
             available = min(len(choices), max(1, height - reserved))
             offset = max(
                 0, min(self.selected - available + 1, max(0, len(choices) - available))
@@ -1953,19 +2181,23 @@ class Wizard:
             heading = "CHOOSE / CONFIRM"
             if len(choices) > available:
                 heading += f" · {offset + 1}-{offset + available}/{len(choices)}"
-            self._write(screen, 4, 1, heading, content_width, "accent")
+            self._write(screen, choice_top, 1, heading, content_width, "accent")
             for index, choice in enumerate(
                 choices[offset : offset + available], offset
             ):
+                enabled = getattr(choice, "enabled", True)
                 self._write(
                     screen,
-                    5 + index - offset,
+                    choice_top + 1 + index - offset,
                     2,
-                    ("> " if self.selected == index else "  ") + choice.label,
+                    ("> " if self.selected == index and enabled else "  ")
+                    + choice.label,
                     content_width,
-                    "accent" if self.selected == index else "normal",
+                    "muted"
+                    if not enabled
+                    else ("accent" if self.selected == index else "normal"),
                 )
-            detail_top = 6 + available
+            detail_top = choice_top + 2 + available
         rows = self._compact_details(content_width)
         count = max(1, height - 3 - detail_top)
         offset = min(self.detail_offset, max(0, len(rows) - count))
@@ -2032,29 +2264,19 @@ class Wizard:
             left = max(30, min(46, int(width * 0.37))) if split else width - 2
             body_bottom = height - 3
             self._write(screen, 3, 1, "YOUR STARTUP STEPS", left - 2, "accent")
-            complete, active = self._complete_steps(), self._active_step()
             for index, (key, title) in enumerate(STEPS if split else ()):
-                skipped = key == "models" and self.config.cpu
-                if skipped:
+                marker, role = self._step_style(key)
+                if key == "models" and self.config.cpu:
                     title = "Models · skipped on CPU"
-                marker = (
-                    "-"
-                    if skipped
-                    else ("+" if key in complete else (">" if key == active else "o"))
-                )
+                elif key == "mount" and self.config.ephemeral:
+                    title = "Drive · skipped on VM disk"
                 self._write(
                     screen,
                     5 + index,
                     2,
                     marker + " " + title,
                     left - 3,
-                    "muted"
-                    if skipped
-                    else (
-                        "comfy"
-                        if key in complete
-                        else ("accent" if key == active else "muted")
-                    ),
+                    role,
                 )
             if not split:
                 self._write(
@@ -2104,13 +2326,17 @@ class Wizard:
                 for index, choice in enumerate(
                     choices[offset : offset + available], offset
                 ):
+                    enabled = getattr(choice, "enabled", True)
                     self._write(
                         screen,
                         choice_top + index - offset,
                         2,
-                        ("> " if self.selected == index else "  ") + choice.label,
+                        ("> " if self.selected == index and enabled else "  ")
+                        + choice.label,
                         left - 3,
-                        "accent" if self.selected == index else "normal",
+                        "muted"
+                        if not enabled
+                        else ("accent" if self.selected == index else "normal"),
                     )
             if split:
                 for row in range(3, body_bottom):
@@ -2186,6 +2412,10 @@ class Wizard:
                 try:
                     key = screen.getkey()
                 except curses.error:
+                    continue
+                if key == "KEY_RESIZE":
+                    # Repaint retained cells and attributes after switching layouts.
+                    screen.clearok(True)
                     continue
                 try:
                     if not self._key(key):

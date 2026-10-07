@@ -161,13 +161,16 @@ class CompactWizardTests(unittest.TestCase):
                 self.ui.input_value = ""
                 before = self.draw(size)
                 self.assertIn("> 8188", before.text)
-                self.assertEqual(before.attributes[6][2], 456)
+                row = next(
+                    i for i, line in enumerate(before.rows) if "> 8188" in "".join(line)
+                )
+                self.assertEqual(before.attributes[row][2], 456)
                 self.ui.input_value = "9001"
                 after = self.draw(size)
-                field = "".join(after.rows[6])
+                field = "".join(after.rows[row])
                 self.assertIn("> 9001", field)
                 self.assertNotIn("8188", field)
-                self.assertEqual(after.attributes[6][2], 123)
+                self.assertEqual(after.attributes[row][2], 123)
         self.ui.input_field = "auth_code"
         self.ui.input_value = "private-provider-example"
         screen = self.draw((24, 80))
@@ -215,7 +218,8 @@ class CompactWizardTests(unittest.TestCase):
         self.ui.stage = "Checking Colab login"
         self.ui.page = "gpu"
         screen = self.draw((24, 80))
-        self.assertIn("Now: Choose GPU model", screen.text)
+        self.assertEqual(screen.text.count("Choose GPU model"), 1)
+        self.assertNotIn("Now: Choose GPU model", screen.text)
         self.assertNotIn("Now: Checking Colab login", screen.text)
         self.assertEqual(self.worker.submitted, [])
 
@@ -250,9 +254,115 @@ class CompactWizardTests(unittest.TestCase):
         self.assertIn("Path: " + files[1]["path"], screen.text)
         self.assertIn("Auto-download: disabled · 100.0B · h3.json", screen.text)
         self.assertIn("Enter toggles and saves", screen.text)
-        self.assertIn("Add model · Hugging Face file URL", screen.text)
-        self.assertIn("Return · choices are saved", screen.text)
+        self.ui.selected = len(self.ui.model_entries) + 1
+        menu_bottom = self.draw((24, 80)).text
+        self.assertIn("Add model · Hugging Face file URL", menu_bottom)
+        self.assertIn("Back", menu_bottom)
         self.assertEqual(self.worker.submitted, [])
+
+    def test_summary_blocks_appear_once_across_all_detail_pages(self):
+        self.ui.status = {}
+        self.ui.account = {
+            "state": "authenticated",
+            "message": "Login proof confirmed.",
+        }
+        self.ui.notice = self.ui.account["message"]
+        for page in ("home", "account", "hardware", "gpu"):
+            with self.subTest(page=page):
+                self.ui.page = page
+                lines = self.ui._compact_details(76)
+                text = "\n".join(value for value, _ in lines)
+                self.assertLessEqual(text.count("ABOUT THIS CHOICE"), 1)
+                self.assertLessEqual(text.count(self.ui.notice), 1)
+        self.ui.page = "model_add_confirm"
+        self.ui.config.model_url = (
+            "https://huggingface.co/a/b/blob/main/style.safetensors"
+        )
+        self.ui.config.model_path = "embeddings/style.safetensors"
+        text = "\n".join(value for value, _ in self.ui._compact_details(100))
+        self.assertEqual(text.count(self.ui.config.model_url), 1)
+        self.assertEqual(text.count("Destination: " + self.ui.config.model_path), 1)
+
+    def test_compact_flow_has_connectors_and_blank_rows_before_menu(self):
+        self.ui.page = "home"
+        self.ui.stage = "Preparing local models"
+        screen = self.draw((24, 80))
+        self.assertFalse("".join(screen.rows[2]).strip())
+        self.assertIn("STARTUP FLOW", "".join(screen.rows[3]))
+        flow = "".join(screen.rows[4])
+        self.assertEqual(flow.count("→"), 6)
+        self.assertIn("> VM", flow)
+        self.assertNotIn("> Models", flow)
+        self.assertFalse("".join(screen.rows[5]).strip())
+        self.assertIn("CHOOSE / CONFIRM", "".join(screen.rows[6]))
+
+    def test_verified_and_current_steps_have_same_roles_in_both_layouts(self):
+        self.ui.page = "models"
+        self.ui.status["models_ready"] = True
+        self.ui.status["model_prepare"]["running"] = False
+        self.ui.theme.roles.update(comfy=123, accent=456)
+        for size in ((24, 80), (36, 120)):
+            with self.subTest(size=size):
+                frame = self.draw(size)
+                label = "> Models" if size[1] == 80 else "> Local models"
+                row = next(
+                    i for i, line in enumerate(frame.rows) if label in "".join(line)
+                )
+                column = "".join(frame.rows[row]).index(label)
+                self.assertEqual(frame.attributes[row][column], 456)
+                verified = "+ Env" if size[1] == 80 else "+ ComfyUI environment"
+                row = next(
+                    i for i, line in enumerate(frame.rows) if verified in "".join(line)
+                )
+                column = "".join(frame.rows[row]).index(verified)
+                self.assertEqual(frame.attributes[row][column], 123)
+
+    def test_minimum_window_wraps_flow_without_clipping_last_step(self):
+        self.ui.page = "home"
+        screen = self.draw((24, 50))
+        self.assertIn("SSH", "\n".join("".join(row) for row in screen.rows[4:6]))
+        self.assertIn("→", screen.text)
+        self.assertIn("Enter confirm", screen.text)
+
+    def test_pending_choices_show_disabled_loading_and_back_in_both_layouts(self):
+        self.ui._page("listing")
+        self.ui.theme.roles.update(muted=123, accent=456)
+        for size in ((24, 80), (36, 120)):
+            with self.subTest(size=size):
+                screen = self.draw(size)
+                self.assertIn("Loading...", screen.text)
+                self.assertNotIn("Exit and keep resources", screen.text)
+                self.assertIn("> Back", screen.text)
+                self.assertNotIn("> Loading...", screen.text)
+                row = next(
+                    i
+                    for i, line in enumerate(screen.rows)
+                    if "Loading..." in "".join(line)
+                )
+                column = "".join(screen.rows[row]).index("Loading...")
+                self.assertEqual(screen.attributes[row][column], 123)
+        self.assertEqual(self.worker.submitted, [])
+
+    def test_resize_repaints_without_submitting_or_changing_selection(self):
+        self.ui.page = "home"
+        quit_index = next(
+            i for i, choice in enumerate(self.ui._choices()) if choice.key == "quit"
+        )
+        self.ui.selected = quit_index
+        screen = Frame(24, 80)
+        screen.timeout = mock.Mock()
+        screen.clearok = mock.Mock()
+        screen.getkey = mock.Mock(side_effect=["KEY_RESIZE", "\n"])
+        with (
+            mock.patch.object(self.ui.theme, "initialize"),
+            mock.patch.object(wizard.curses, "set_escdelay"),
+            mock.patch.object(wizard.curses, "curs_set"),
+            mock.patch.object(wizard.curses, "doupdate"),
+        ):
+            self.ui.run(screen)
+        screen.clearok.assert_called_once_with(True)
+        self.assertEqual(self.worker.submitted, [])
+        self.assertTrue(self.ui.quitting)
 
     def test_large_catalog_preserves_selected_metadata_and_scrollable_navigation(self):
         self.ui.page = "models"
