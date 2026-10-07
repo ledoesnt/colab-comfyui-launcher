@@ -7,6 +7,8 @@ import fcntl
 import hashlib
 import json
 import math
+import multiprocessing
+import multiprocessing.connection
 import os
 import re
 import signal
@@ -25,10 +27,19 @@ DEFAULT_MANIFEST = Path(__file__).resolve().parents[1] / "models" / "h3.json"
 DEFAULT_EXTRA_MANIFEST = DEFAULT_MANIFEST.with_name("extra.json")
 CHUNK_BYTES = 4 * 1024 * 1024
 RECEIPT_NAME = ".verified-models.json"
+DEFAULT_WORKERS = 2
 
 
 class DownloadError(Exception):
     """An error whose message contains no credentials or redirected URLs."""
+
+
+def worker_count(value):
+    if isinstance(value, str) and value.isdecimal():
+        value = int(value)
+    if type(value) is not int or not 1 <= value <= 4:
+        raise DownloadError("workers must be an integer between 1 and 4")
+    return value
 
 
 class Deadline:
@@ -117,6 +128,8 @@ def load_manifest(path, allow_empty=False):
         validate_model_path(item.get("path"))
         if "source_path" in item:
             validate_model_path(item["source_path"], "Model source paths")
+        if "auto_download" in item and type(item["auto_download"]) is not bool:
+            raise DownloadError("Model auto_download must be a boolean")
         if any(key in item for key in ("url", "repo_id", "revision")):
             raise DownloadError(
                 "File sources use the pinned manifest repo_id/revision; use another manifest for another repository"
@@ -184,7 +197,7 @@ def default_extra_manifests():
     return paths
 
 
-def load_manifests(path, extra_manifest_paths=()):
+def load_manifests(path, extra_manifest_paths=(), *, include_disabled=False):
     """Merge default extra JSON files and explicitly selected pinned sources."""
     selected = [load_manifest(path)]
     extra_paths = []
@@ -207,6 +220,10 @@ def load_manifests(path, extra_manifest_paths=()):
         for item in value["files"]
     ]
     validate_path_collisions(manifest["files"])
+    if not include_disabled:
+        manifest["files"] = [
+            item for item in manifest["files"] if item.get("auto_download", True)
+        ]
     manifest["total_size_bytes"] = sum(item["size_bytes"] for item in manifest["files"])
     manifest["sources"] = [
         {
@@ -377,9 +394,7 @@ class Progress:
         self.updated = -math.inf
         self.current_started = self.started
         self.current_path = None
-        self.current_phase = None
-        self.phase_started = self.started
-        self.phase_base = 0
+        self.tracking = {}
         self.value = {
             "version": 1,
             "operation": operation,
@@ -403,25 +418,28 @@ class Progress:
         self, item, phase, done, status="running", force=False, verification=None
     ):
         now = time.monotonic()
-        if self.current_path != item["path"]:
-            self.current_started = now
-            self.current_path = item["path"]
-            self.current_phase = None
+        self.current_path = item["path"]
+        if item["path"] not in self.tracking:
+            self.tracking[item["path"]] = {
+                "started": now,
+                "phase": None,
+                "phase_started": now,
+                "phase_base": 0,
+            }
             force = True
-        elapsed = now - self.current_started
+        timing = self.tracking[item["path"]]
+        elapsed = now - timing["started"]
         entry = next(
             value for value in self.value["files"] if value["path"] == item["path"]
         )
-        if phase != self.current_phase:
-            self.current_phase = phase
-            self.phase_started = now
-            self.phase_base = done
-        phase_elapsed = now - self.phase_started
+        if phase != timing["phase"]:
+            timing.update(phase=phase, phase_started=now, phase_base=done)
+        phase_elapsed = now - timing["phase_started"]
         rate = (
             entry["rate_bytes_per_second"]
             if phase == "complete"
             else (
-                round((done - self.phase_base) / phase_elapsed, 3)
+                round((done - timing["phase_base"]) / phase_elapsed, 3)
                 if phase_elapsed > 0
                 else 0
             )
@@ -454,7 +472,7 @@ class Progress:
         self.value["status"] = "succeeded" if ok else "failed"
         if not ok:
             for entry in self.value["files"]:
-                if entry["path"] == self.current_path and entry["status"] == "running":
+                if entry["status"] == "running":
                     entry["status"] = "failed"
         self.value["elapsed_seconds"] = round(time.monotonic() - self.started, 3)
         atomic_json(self.path, self.value, self.root, durable=False)
@@ -787,7 +805,207 @@ def download_file(
     }
 
 
+class WorkerProgress:
+    """Small per-file events; the parent alone writes the shared progress file."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.updated = -math.inf
+        self.phase = None
+
+    def update(
+        self, item, phase, done, status="running", force=False, verification=None
+    ):
+        now = time.monotonic()
+        if force or phase != self.phase or now - self.updated >= 1:
+            self.connection.send(("progress", phase, done, status, verification))
+            self.updated, self.phase = now, phase
+
+
+class WorkerReceipts:
+    """Reuse a snapshot; durable receipt updates are serialized in the parent."""
+
+    def __init__(self, receipts, connection):
+        self.receipts, self.connection = receipts, connection
+
+    def matches(self, path, item):
+        return self.receipts.matches(path, item)
+
+    def record(self, path, item, expected=None, source=None):
+        current = file_identity(path)
+        if not current or current["size"] != item["size_bytes"]:
+            raise DownloadError("Verified model changed before receipt publication")
+        if expected is not None and current != expected:
+            raise DownloadError(
+                "Verified model metadata changed before receipt publication"
+            )
+        self.connection.send(("receipt", current, source))
+
+
+def download_worker(connection, root, manifest, item, deadline, receipts, verify_cache):
+    try:
+        result = download_file(
+            root,
+            manifest["repo_id"],
+            manifest["revision"],
+            item,
+            deadline,
+            WorkerReceipts(receipts, connection),
+            verify_cache,
+            WorkerProgress(connection),
+        )
+        connection.send(("result", result))
+    except BaseException as error:  # noqa: BLE001
+        # This child-process boundary sanitizes unexpected errors as well as
+        # cancellation; never let redirected URLs escape through a traceback.
+        connection.send(
+            (
+                "error",
+                str(error)
+                if isinstance(error, DownloadError)
+                else "Model download failed (" + type(error).__name__ + ")",
+            )
+        )
+    finally:
+        connection.close()
+
+
+def finish_worker(process):
+    """Only signal unreaped children from this batch; never an arbitrary PID."""
+    if process.pid is None:
+        return
+    process.join(0.1)
+    if process.is_alive():
+        process.terminate()
+        process.join(0.2)
+    if process.is_alive():
+        process.kill()
+        process.join(0.5)
+    if process.is_alive():
+        raise DownloadError("Owned model worker could not be stopped")
+
+
+def download_files(
+    root, manifest, items, deadline, receipts, verify_cache, progress, workers
+):
+    """Bounded file concurrency, with shared metadata owned by the coordinator.
+
+    Colab is Linux. Separate fork workers keep a blocked HTTPS read killable at
+    the overall deadline; a Python thread pool cannot provide that guarantee.
+    Workers inherit the root lock and the task process group, so bridge cleanup
+    also reaches them. Completed verified files remain reusable after failure.
+    """
+    workers = worker_count(workers)
+    if workers == 1 or len(items) <= 1:
+        return [
+            download_file(
+                root,
+                manifest["repo_id"],
+                manifest["revision"],
+                item,
+                deadline,
+                receipts,
+                verify_cache,
+                progress,
+            )
+            for item in items
+        ]
+    context = multiprocessing.get_context("fork")
+    pending = iter(enumerate(items))
+    results = [None] * len(items)
+    active = {}
+
+    def launch():
+        while len(active) < workers:
+            try:
+                index, item = next(pending)
+            except StopIteration:
+                return
+            deadline.remaining()
+            incoming, outgoing = context.Pipe(duplex=False)
+            process = context.Process(
+                target=download_worker,
+                args=(outgoing, root, manifest, item, deadline, receipts, verify_cache),
+                daemon=True,
+            )
+            previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, {signal.SIGALRM, signal.SIGINT}
+            )
+            try:
+                # Register before unblocking alarm/interrupt delivery, so every
+                # started child is reachable by this batch's cancellation.
+                active[incoming] = (process, index, item)
+                process.start()
+            except BaseException:
+                outgoing.close()
+                raise
+            finally:
+                outgoing.close()
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    try:
+        launch()
+        while active:
+            connections = multiprocessing.connection.wait(
+                list(active), timeout=min(0.25, deadline.remaining())
+            )
+            for connection in connections:
+                process, index, item = active[connection]
+                try:
+                    event = connection.recv()
+                except EOFError:
+                    raise DownloadError(
+                        "Model worker exited without a verified result"
+                    ) from None
+                if event[0] == "progress":
+                    if progress:
+                        progress.update(
+                            item,
+                            event[1],
+                            event[2],
+                            event[3],
+                            force=True,
+                            verification=event[4],
+                        )
+                elif event[0] == "receipt":
+                    receipts.record(
+                        root / item["path"], item, expected=event[1], source=event[2]
+                    )
+                elif event[0] == "result":
+                    results[index] = event[1]
+                    finish_worker(process)
+                    connection.close()
+                    del active[connection]
+                    process.close()
+                elif event[0] == "error":
+                    if progress:
+                        entry = next(
+                            value
+                            for value in progress.value["files"]
+                            if value["path"] == item["path"]
+                        )
+                        progress.update(
+                            item, "failed", entry["done_bytes"], "failed", force=True
+                        )
+                    raise DownloadError(event[1])
+                else:
+                    raise DownloadError("Model worker returned an invalid event")
+            launch()
+        return results
+    finally:
+        # Cancel every active child before waiting, bounding cleanup independently
+        # of an HTTP server that stalls indefinitely or keeps trickling bytes.
+        for process, _index, _item in active.values():
+            if process.is_alive():
+                process.terminate()
+        for connection, (process, _index, _item) in active.items():
+            connection.close()
+            finish_worker(process)
+            process.close()
+
+
 def run(args):
+    workers = worker_count(getattr(args, "workers", DEFAULT_WORKERS))
     with time_budget(args.max_seconds) as deadline:
         manifest = load_manifests(args.manifest, getattr(args, "extra_manifest", ()))
         root = models_root(args.models_root, args.ephemeral)
@@ -797,19 +1015,16 @@ def run(args):
         try:
             with root_lock(root):
                 receipts = Receipts(root, manifest["repo_id"], manifest["revision"])
-                results = [
-                    download_file(
-                        root,
-                        manifest["repo_id"],
-                        manifest["revision"],
-                        item,
-                        deadline,
-                        receipts,
-                        getattr(args, "verify_cache", False),
-                        progress,
-                    )
-                    for item in manifest["files"]
-                ]
+                results = download_files(
+                    root,
+                    manifest,
+                    manifest["files"],
+                    deadline,
+                    receipts,
+                    getattr(args, "verify_cache", False),
+                    progress,
+                    workers,
+                )
             progress.finish(True)
         except BaseException:
             progress.finish(False)
@@ -821,6 +1036,7 @@ def run(args):
             "sources": manifest["sources"],
             "models_root": str(root),
             "ephemeral": args.ephemeral,
+            "workers": workers,
             "files": results,
             "total_size_bytes": sum(item["size_bytes"] for item in manifest["files"]),
         }
@@ -856,6 +1072,12 @@ def main(argv=None):
         type=float,
         default=1800,
         help="Overall deadline including hash checks (default: 1800)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=worker_count,
+        default=DEFAULT_WORKERS,
+        help="Concurrent HTTPS files (1–4, default: 2); 1 keeps serial downloads",
     )
     parser.add_argument(
         "--verify-cache",

@@ -646,6 +646,7 @@ class BackgroundArgumentsTests(unittest.TestCase):
             {
                 "action": "download",
                 "max_seconds": 120.0,
+                "workers": 2,
                 "models_root": "/content/dedicated/models",
                 "ephemeral": True,
                 "verify_cache": False,

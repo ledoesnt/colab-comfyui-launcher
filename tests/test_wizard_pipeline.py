@@ -889,6 +889,10 @@ class PipelineTests(unittest.TestCase):
 class ModelRefreshWorkerTests(unittest.TestCase):
     def test_gpu_create_preflight_rejects_before_any_vm_allocation(self):
         backend = mock.Mock(spec=dashboard.Backend)
+        backend.account_status.return_value = {
+            "state": "authenticated",
+            "message": "Fixture login verified.",
+        }
         config = dashboard.Config(session="not-allocated", ephemeral=True)
         worker = dashboard.Worker(backend)
         worker.account_checked = True
@@ -962,6 +966,10 @@ class ModelRefreshWorkerTests(unittest.TestCase):
 class StatusRetryTests(unittest.TestCase):
     def setUp(self):
         self.backend = mock.Mock(spec=dashboard.Backend)
+        self.backend.account_status.return_value = {
+            "state": "authenticated",
+            "message": "Fixture login verified.",
+        }
         self.worker = dashboard.Worker(self.backend)
         self.config = dashboard.Config(session="selected", ephemeral=True)
         retry_patch = mock.patch.object(
@@ -1094,7 +1102,8 @@ class StatusRetryTests(unittest.TestCase):
         self.backend.ssh.return_value = {"running": True, "http_ready": True}
         self.assertTrue(self.worker.submit("wizard_create", self.config))
         completed = False
-        for _ in range(12):
+        # Login verification emits its own stage/result before startup.
+        for _ in range(20):
             kind, value = self.worker.events.get(timeout=1)
             if kind == "done" and value == "wizard_create":
                 completed = True
@@ -1372,30 +1381,30 @@ class EmbeddedMountTests(unittest.TestCase):
         self.backend.provider_terminal.assert_not_called()
 
     def test_account_is_checked_once_without_mounting_or_mutating_a_vm(self):
-        terminals = []
-
-        def factory(_config, on_event):
-            terminal = ControlledTerminal(on_event)
-            terminals.append(terminal)
-            return terminal
-
-        self.backend.account_terminal.side_effect = factory
+        self.backend.account_status.return_value = {
+            "state": "authenticated",
+            "message": "Fixture login verified.",
+        }
         self.worker._ensure_account(self.config)
         self.worker._ensure_account(self.config)
-        self.backend.account_terminal.assert_called_once()
+        self.backend.account_status.assert_called_once_with()
+        self.backend.account_terminal.assert_not_called()
         self.assertTrue(self.worker.account_checked)
-        self.assertTrue(terminals[0].closed)
         self.backend.provider_terminal.assert_not_called()
         self.backend.bridge.assert_not_called()
         self.backend.create.assert_not_called()
         self.backend.release.assert_not_called()
 
     def test_failed_account_authorization_is_not_cached_as_logged_in(self):
+        self.backend.account_status.return_value = {
+            "state": "not_authenticated",
+            "message": "Fixture login required.",
+        }
         self.backend.account_terminal.side_effect = lambda _config, on_event: (
             ControlledTerminal(on_event, returncode=1)
         )
         with self.assertRaisesRegex(dashboard.DashboardError, "did not complete"):
-            self.worker._ensure_account(self.config)
+            self.worker._authorize_account(self.config)
         self.assertFalse(self.worker.account_checked)
         self.backend.create.assert_not_called()
         self.backend.release.assert_not_called()

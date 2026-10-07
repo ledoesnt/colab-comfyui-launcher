@@ -257,8 +257,13 @@ class WorkerTests(unittest.TestCase):
         self.backend.bridge.return_value = {"ok": True}
         self.backend.ssh.return_value = {"ok": True, "running": False}
         self.worker = dashboard.Worker(self.backend)
-        self.addCleanup(self.worker.close)
+        self.addCleanup(self.close_worker)
         self.config = dashboard.Config(session="only-selected-session")
+
+    def close_worker(self):
+        self.worker.close()
+        self.worker.thread.join(timeout=1)
+        self.assertFalse(self.worker.thread.is_alive(), "Fixture worker did not close")
 
     def finish(self):
         deadline = time.monotonic() + 2
@@ -683,6 +688,10 @@ class WorkerTests(unittest.TestCase):
 
     def test_new_cpu_background_event_then_not_deployed_status_never_installs(self):
         self.config.cpu = True
+        self.backend.account_status.return_value = {
+            "state": "authenticated",
+            "message": "Fixture login verified.",
+        }
         self.backend.create.return_value = {
             "name": self.config.session,
             "hardware": "CPU",
@@ -698,8 +707,11 @@ class WorkerTests(unittest.TestCase):
         self.finish()
         events = self.events()
         self.assertEqual(
-            [kind for kind, _ in events], ["stage", "session", "status", "done"]
+            [kind for kind, _ in events],
+            ["stage", "stage", "account", "session", "status", "done"],
         )
+        self.backend.account_status.assert_called_once_with()
+        self.assertEqual(events[2][1]["state"], "authenticated")
         self.assertEqual(
             [call.args[1] for call in self.backend.bridge.call_args_list], ["status"]
         )

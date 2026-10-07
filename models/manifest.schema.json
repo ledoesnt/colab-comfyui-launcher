@@ -20,6 +20,7 @@
         "properties": {
           "path": {"$ref": "#/$defs/relativePath"},
           "source_path": {"$ref": "#/$defs/relativePath"},
+          "auto_download": {"type": "boolean", "default": true},
           "size_bytes": {"type": "integer", "minimum": 1},
           "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
         },

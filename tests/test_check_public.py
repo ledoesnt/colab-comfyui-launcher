@@ -100,8 +100,10 @@ class CheckPublicTests(unittest.TestCase):
                 self.assertNotIn("secret", json.dumps(result))
 
     def test_http_or_redirect_failure_never_submits_and_hides_url(self):
+        http_failure = urllib.error.HTTPError(URL, 401, "private URL", {}, None)
+        self.addCleanup(http_failure.close)
         failures = [
-            urllib.error.HTTPError(URL, 401, "private URL", {}, None),
+            http_failure,
             checker.CheckError("Unexpected HTTP redirect"),
         ]
         for failure in failures:

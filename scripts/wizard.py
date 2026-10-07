@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 from dashboard import (
     DEFAULT_IDENTITY,
+    MODEL_SEARCH_CATEGORIES,
     REFRESH_SECONDS,
     Config,
     DashboardError,
@@ -28,9 +29,12 @@ from dashboard import (
     Worker,
     clip_cells,
     human_bytes,
+    model_catalog_entries,
+    parse_model_url,
     pinned_model_summary,
     safe_error,
     services_ready,
+    toggle_model_choice,
     validate_model_plan,
 )
 
@@ -80,6 +84,13 @@ class Wizard:
         self.last_refresh = 0.0
         self.resume = False
         self.auth: dict[str, Any] = {}
+        self.account: dict[str, Any] = {
+            "state": "unknown",
+            "message": "Colab login has not been checked.",
+        }
+        self.account_intent: str | None = None
+        self.account_return_page = "home"
+        self.account_dismissed = False
         self.input_value = ""
         self.input_field = ""
         self.input_return = "summary"
@@ -87,6 +98,8 @@ class Wizard:
         self.operation_started = 0.0
         self.observe_runtime = False
         self.quitting = False
+        self.model_entries: list[dict[str, Any]] = []
+        self.models_return = "home"
         if self.demo:
             self.config.session = self.config.session or "offline-demo"
             self.status = backend.bridge(self.config, "status")
@@ -100,8 +113,10 @@ class Wizard:
             self.stage = "Offline demonstration; no provider commands"
         elif self.config.session:
             self.resume = True
-            self.page = "inspect"
-            self._submit("inspect")
+            self._require_account("inspect")
+        elif hasattr(backend, "account_status"):
+            self.account["state"] = "checking"
+            self._submit("account_status")
 
     def _page(self, page: str, selected: int = 0) -> None:
         self.page, self.selected = page, selected
@@ -122,6 +137,47 @@ class Wizard:
             return True
         self.notice = "An operation is running; no additional operation was submitted."
         return False
+
+    def _require_account(self, intent: str) -> bool:
+        if self.demo or self.account.get("state") == "authenticated":
+            return True
+        if self.worker.busy and self.last_operation not in (
+            "account_status",
+            "account_login",
+        ):
+            self.notice = (
+                "Wait for the current operation; runtime resources are retained."
+            )
+            return False
+        self.account_intent = intent
+        self.account_dismissed = False
+        self.account_return_page = self.page
+        self._page("account")
+        self.notice = "Verify Colab login before choosing a runtime. No runtime is created by login."
+        if not self.worker.busy and self.account.get("state") != "not_authenticated":
+            self.account["state"] = "checking"
+            self._submit("account_status")
+        return False
+
+    def _finish_account(self) -> None:
+        if self.account_dismissed:
+            return
+        if self.page in ("home", "account") or self.account_intent:
+            self.notice = str(self.account.get("message", "Colab login is unverified."))
+        if self.account.get("state") != "authenticated" or not self.account_intent:
+            return
+        intent, self.account_intent = self.account_intent, None
+        if intent == "begin":
+            self._page("summary")
+            self.notice = "Colab login verified. Review and confirm startup; no runtime was created by authorization."
+        elif intent == "inspect":
+            if self._submit("inspect"):
+                self._page("inspect")
+        elif intent == "existing":
+            if self._submit("sessions"):
+                self._page("listing")
+        elif intent == "new":
+            self._activate(Choice("new", "Create a new runtime"))
 
     def _ready(self) -> bool:
         if self.model_paths_need_restart:
@@ -188,11 +244,57 @@ class Wizard:
                     "Inspect an existing runtime before continuing.",
                 ),
                 Choice(
+                    "models",
+                    "Manage models · auto-download list",
+                    "Add model files and save which models are automatically prepared. No runtime is required.",
+                ),
+                Choice(
                     "quit",
                     "Exit and keep resources",
                     "Exiting this UI does not stop any runtime.",
                 ),
+                Choice(
+                    "account_check",
+                    "Check Colab login",
+                    "Read-only verification; no runtime is created.",
+                ),
+                Choice(
+                    "account_login",
+                    "Authorize / check Colab login",
+                    "Use the provider's interactive login only if it is required.",
+                ),
             ]
+        if self.page == "account":
+            choices = []
+            if self.auth.get("url"):
+                choices.append(Choice("auth_open", "Open authorization in browser"))
+            if self.auth.get("waiting"):
+                choices.append(
+                    Choice(
+                        "auth_code" if self.auth.get("needs_code") else "auth_continue",
+                        "Enter provider authorization code"
+                        if self.auth.get("needs_code")
+                        else "I have authorized · continue",
+                    )
+                )
+            if not self.worker.busy:
+                choices.extend(
+                    (
+                        Choice("account_check", "Check Colab login"),
+                        Choice("account_login", "Authorize / check Colab login"),
+                    )
+                )
+            choices.extend(
+                (
+                    Choice(
+                        "account_back",
+                        "Cancel login / return",
+                        "Retain existing VM, services and SSH; discard this navigation request.",
+                    ),
+                    Choice("quit", "Exit and keep resources"),
+                )
+            )
+            return choices
         if self.page == "hardware":
             return [
                 Choice(
@@ -211,8 +313,12 @@ class Wizard:
                 Choice(
                     gpu,
                     gpu
-                    + (" · tested configuration" if gpu == "G4" else " · not verified"),
-                    "The CLI accepts this model; allocation depends on your account. Only G4 has been tested with this H3 profile.",
+                    + (
+                        " · project-tested H3 profile"
+                        if gpu == "G4"
+                        else " · H3 profile untested"
+                    ),
+                    "Project test coverage is a fixed label, not this runtime's status. Starting a GPU does not prove H3 rendering compatibility. Allocation depends on your account.",
                 )
                 for gpu in GPU_CHOICES
             ]
@@ -241,6 +347,11 @@ class Wizard:
                     "SSH and storage settings",
                     "Reuse the dedicated key and local port unless they need changing.",
                 ),
+                Choice(
+                    "models",
+                    "Manage models · auto-download list",
+                    "Choose which pinned files are automatically prepared, or add a public model file. Choices are saved for later runtimes.",
+                ),
             ]
             if self.config.session:
                 choices.append(
@@ -262,6 +373,11 @@ class Wizard:
             choices = [
                 Choice("port", "Local SSH port"),
                 Choice("identity", "Dedicated SSH key path"),
+                Choice(
+                    "download_workers",
+                    "Parallel downloads · " + str(self.config.download_workers),
+                    "Choose 1–4 file downloads; default 2. Drive-to-VM copying stays sequential.",
+                ),
             ]
             if not self.config.ephemeral:
                 choices.append(Choice("storage_root", "Dedicated Drive directory"))
@@ -335,6 +451,11 @@ class Wizard:
                 Choice("inspect", "Inspect current runtime"),
                 Choice("mount", "Authorize / check Google Drive"),
                 Choice(
+                    "models",
+                    "Manage models · add / select files",
+                    "Saved checkbox choices control later preparation. Editing the list does not download immediately.",
+                ),
+                Choice(
                     "prepare_refresh",
                     "Prepare / refresh models",
                     "Apply this checkout's h3.json, extra.json and extra-*.json to the selected GPU runtime, prepare missing VM files, and keep existing ComfyUI / SSH services. Refresh the browser after success. An already running preparation is waited for without redeployment.",
@@ -346,6 +467,56 @@ class Wizard:
                 Choice("ssh_stop", "Stop local SSH forwarding"),
                 Choice("wizard_resume", "Continue missing startup steps"),
                 Choice("back", "Return to runtime overview"),
+            ]
+        if self.page == "models":
+            choices = [
+                Choice(
+                    "model:" + row["path"],
+                    ("[✓] " if row.get("auto_download", True) else "[×] ")
+                    + Path(row["path"]).name,
+                    "Enter toggles automatic preparation and saves it immediately. "
+                    + row["path"]
+                    + " · "
+                    + human_bytes(row["size_bytes"])
+                    + " · "
+                    + Path(row["manifest"]).name,
+                )
+                for row in self.model_entries
+            ]
+            choices.append(
+                Choice(
+                    "model_add_url",
+                    "Add model · Hugging Face file URL",
+                    "Choose a public file URL and its ComfyUI category. Resolve the commit, file size and SHA256; save a pinned extra manifest. Download happens during preparation.",
+                )
+            )
+            choices.append(
+                Choice(
+                    "back",
+                    "Return · choices are saved",
+                    "Unchecking a model keeps any existing weight file. Disabled required models can leave a workflow with Missing Models.",
+                )
+            )
+            return choices
+        if self.page == "model_category":
+            from dashboard import MODEL_SEARCH_CATEGORIES
+
+            return [
+                Choice(
+                    "category:" + category,
+                    category,
+                    "ComfyUI model directory category. The file keeps its original name.",
+                )
+                for category in sorted(MODEL_SEARCH_CATEGORIES)
+            ] + [Choice("back", "Cancel adding model")]
+        if self.page == "model_add_confirm":
+            return [
+                Choice(
+                    "model_add_save",
+                    "Confirm · save model to download list",
+                    "Read public metadata only, pin the source and save the new model with auto-download enabled. No GPU is allocated.",
+                ),
+                Choice("back", "Cancel adding model"),
             ]
         if self.page == "failure":
             choices = []
@@ -412,6 +583,8 @@ class Wizard:
         )
 
     def _begin(self) -> None:
+        if not self._require_account("begin"):
+            return
         if not self.config.cpu:
             try:
                 validate_model_plan()
@@ -455,6 +628,21 @@ class Wizard:
     def _confirm_input(self) -> None:
         value = self.input_value.strip()
         field = self.input_field
+        if field == "model_url":
+            try:
+                _, _, source = parse_model_url(value)
+            except DashboardError as exc:
+                self.error = str(exc)
+                return
+            self.config.model_url = value
+            categories = sorted(MODEL_SEARCH_CATEGORIES)
+            prefix = source.split("/", 1)[0]
+            category = prefix if prefix in categories else categories[0]
+            self.config.model_path = category + "/" + Path(source).name
+            self.error = ""
+            self._page("model_category", categories.index(category))
+            self.notice = "Choose the directory required by this model's loader node."
+            return
         if field == "auth_code":
             if not value:
                 self.error = "Enter the provider code, or Esc to cancel."
@@ -463,7 +651,9 @@ class Wizard:
             if accepted:
                 self.auth.update(waiting=False, needs_code=False)
             self.input_value = ""
-            self._page("pipeline")
+            self._page(
+                "account" if self.last_operation == "account_login" else "pipeline"
+            )
             self.notice = (
                 "Provider input submitted; waiting for verification."
                 if accepted
@@ -471,6 +661,11 @@ class Wizard:
             )
             return
         candidate = replace(self.config)
+        if field == "download_workers":
+            if not value.isdecimal() or not 1 <= int(value) <= 4:
+                self.error = "Choose 1 to 4 parallel model downloads."
+                return
+            candidate.download_workers = int(value)
         if field == "port" and value:
             if not value.isdecimal() or not 1024 <= int(value) <= 65535:
                 self.error = "Use a port between 1024 and 65535."
@@ -517,6 +712,8 @@ class Wizard:
             self.input_value = ""
             return False
         if key == "new":
+            if not self._require_account("new"):
+                return True
             if self.worker.busy:
                 self.notice = (
                     "Wait for the current operation before choosing another runtime."
@@ -544,6 +741,8 @@ class Wizard:
                     }
                 ]
                 self._page("sessions")
+            elif not self._require_account("existing"):
+                return True
             elif self._submit("sessions"):
                 self._page("listing")
                 self.notice = (
@@ -614,7 +813,32 @@ class Wizard:
                 else "The provider is no longer waiting for input."
             )
         elif key == "auth_code":
-            self._input("auth_code", "pipeline")
+            self._input(
+                "auth_code",
+                "account" if self.last_operation == "account_login" else "pipeline",
+            )
+        elif key in ("account_check", "account_login"):
+            if not self.worker.busy:
+                if self.page != "account":
+                    self.account_return_page = self.page
+                if self._submit(
+                    "account_status" if key == "account_check" else "account_login"
+                ):
+                    self.account_dismissed = False
+                    self.account["state"] = "checking"
+                    self._page("account")
+        elif key == "account_back":
+            cancel = getattr(self.worker, "cancel_account", None)
+            if callable(cancel):
+                cancel()
+            self.account_intent = None
+            self.account_dismissed = True
+            self.auth.clear()
+            self._page(
+                self.account_return_page
+                if self.account_return_page != "input"
+                else "home"
+            )
         elif key == "release":
             self.input_return = self.page
             self._page("release_confirm", 1)
@@ -626,6 +850,49 @@ class Wizard:
                 self.notice = (
                     "Releasing only the selected runtime and its owned resources."
                 )
+        elif key == "models":
+            if self.worker.busy:
+                self.notice = (
+                    "Wait for the current preparation before editing its model list."
+                )
+                return True
+            self.models_return = self.page
+            self._load_models()
+        elif self.page == "models" and key.startswith("model:"):
+            if self.demo:
+                self.notice = "Offline demo: model choices are read-only."
+                return True
+            if self.worker.busy:
+                self.notice = "Wait for the current operation before changing saved model choices."
+                return True
+            try:
+                enabled = toggle_model_choice(key.removeprefix("model:"))
+                self.model_entries = model_catalog_entries()
+                self.notice = "Saved: " + (
+                    "automatic preparation enabled."
+                    if enabled
+                    else "automatic preparation disabled; existing weights are retained."
+                )
+                self.error = ""
+            except DashboardError as exc:
+                self.error = safe_error(exc)
+        elif key == "model_add_url":
+            if self.demo:
+                self.notice = "Offline demo: adding models is disabled."
+            else:
+                self._input("model_url", "models")
+                self.notice = (
+                    "Paste a public Hugging Face blob/resolve file URL, then Enter."
+                )
+        elif self.page == "model_category" and key.startswith("category:"):
+            self.config.model_path = (
+                key.removeprefix("category:") + "/" + Path(self.config.model_path).name
+            )
+            self._page("model_add_confirm")
+        elif key == "model_add_save":
+            if self._submit("model_add"):
+                self._page("model_adding")
+                self.notice = "Reading file metadata and saving the list; no weights are downloaded yet."
         elif key == "advanced":
             self._page("advanced")
         elif key in (
@@ -652,7 +919,24 @@ class Wizard:
             self._back()
         return True
 
+    def _load_models(self) -> None:
+        try:
+            self.model_entries = model_catalog_entries()
+            self.error = ""
+            self._page("models")
+            self.notice = "[✓] = automatically prepare · [×] = skip. Enter saves a toggle; existing weights are kept."
+        except DashboardError as exc:
+            self.error = safe_error(exc)
+
     def _back(self) -> None:
+        if self.page == "account":
+            self._activate(Choice("account_back", "Cancel login / return"))
+            return
+        if self.page in ("models", "model_category", "model_add_confirm"):
+            self._page(self.models_return if self.page == "models" else "models")
+            self.config.model_url = ""
+            self.config.model_path = ""
+            return
         parents = {
             "hardware": "home",
             "gpu": "hardware",
@@ -712,6 +996,12 @@ class Wizard:
             elif kind == "model_registration":
                 self.required_model_categories = set(value)
                 self._check_model_registration()
+            elif kind == "model_added":
+                path, manifest = value
+                self.config.model_url = ""
+                self.config.model_path = ""
+                self._load_models()
+                self.notice = f"Saved {path} in models/{manifest}. Automatically prepared on the next startup or Prepare / refresh models."
             elif kind == "ssh":
                 self.ssh = value
             elif kind == "config":
@@ -768,21 +1058,42 @@ class Wizard:
             elif kind == "stage":
                 if value != "status":
                     self.stage = str(value)
+            elif kind == "account":
+                self.account = dict(value)
+                if self.page in ("home", "account"):
+                    self.notice = str(
+                        value.get("message", "Colab login is unverified.")
+                    )
             elif kind == "notice":
                 self.notice = str(value)
             elif kind == "auth":
+                if self.last_operation == "account_login" and self.account_dismissed:
+                    continue
                 self.auth.update(value)
                 if self.page != "input":
-                    self._page("pipeline")
+                    self._page(
+                        "account"
+                        if self.last_operation == "account_login"
+                        else "pipeline"
+                    )
             elif kind == "auth_clear":
                 self.auth.clear()
                 if self.page == "input" and self.input_field == "auth_code":
-                    self._page("pipeline")
+                    self._page(
+                        "account"
+                        if self.last_operation == "account_login"
+                        else "pipeline"
+                    )
             elif kind == "error":
                 self.auth.clear()
                 self.input_value = ""
                 self.error = safe_error(value)
-                self._page("failure")
+                if self.last_operation in ("account_status", "account_login"):
+                    self.account = {"state": "unavailable", "message": self.error}
+                    if not self.account_dismissed:
+                        self._page("account")
+                else:
+                    self._page("models" if self.page == "model_adding" else "failure")
             elif kind == "ssh_error":
                 # A failed probe cannot keep advertising its previous successful
                 # tunnel snapshot as current evidence of browser readiness.
@@ -810,6 +1121,9 @@ class Wizard:
                     )
             elif kind == "done":
                 self.auth.clear()
+                if value in ("account_status", "account_login"):
+                    self._finish_account()
+                    continue
                 if value == "status" and self.page == "ready" and not self._ready():
                     self.resume = True
                     self._page("summary")
@@ -871,6 +1185,7 @@ class Wizard:
             "release": "Releasing selected VM",
             "mount": "Checking Google Drive authorization",
             "prepare_refresh": "Preparing updated model lists",
+            "model_add": "Reading and pinning model metadata",
             "render": "Submitting H3 render",
             "smoke": "Running PNG smoke test",
             "stop": "Stopping services; retaining VM",
@@ -882,6 +1197,7 @@ class Wizard:
     def _title(self) -> str:
         return {
             "home": "Start a ComfyUI session",
+            "account": "Colab account login · no runtime allocation",
             "hardware": "Choose compute",
             "gpu": "Choose GPU model",
             "storage": "Choose model and output storage",
@@ -898,6 +1214,10 @@ class Wizard:
             "failure": "An operation needs attention",
             "release_confirm": "Confirm VM release",
             "advanced": "Advanced runtime actions",
+            "models": "Saved model download list",
+            "model_category": "Choose the model directory category",
+            "model_add_confirm": "Review model addition",
+            "model_adding": "Adding a pinned model to your list",
             "input": "Enter provider code"
             if self.input_field == "auth_code"
             else "Edit " + self.input_field.replace("_", " "),
@@ -934,6 +1254,17 @@ class Wizard:
         return complete
 
     def _active_step(self) -> str:
+        if self.page == "account" or (
+            self.auth and self.last_operation == "account_login"
+        ):
+            return "session"
+        if self.page in (
+            "models",
+            "model_category",
+            "model_add_confirm",
+            "model_adding",
+        ) or (self.page == "input" and self.input_field == "model_url"):
+            return "models"
         if self.page in ("hardware", "gpu"):
             return "hardware"
         if (
@@ -1027,6 +1358,80 @@ class Wizard:
 
     def _details(self, width: int) -> list[tuple[str, str]]:
         rows: list[tuple[str, str]] = []
+        if self.page == "model_add_confirm":
+            rows.extend(
+                (
+                    ("MODEL ADDITION · review before Enter", "accent"),
+                    ("Source: " + self.config.model_url, "normal"),
+                    ("Destination: " + self.config.model_path, "comfy"),
+                    (
+                        "Auto-download: enabled after saving. Read public metadata and save the pinned list; prepare weights separately.",
+                        "normal",
+                    ),
+                    ("", "normal"),
+                )
+            )
+        if self.page in ("home", "account") or (
+            self.page == "input"
+            and self.input_field == "auth_code"
+            and self.last_operation == "account_login"
+        ):
+            state = str(self.account.get("state", "unknown"))
+            rows.extend(
+                (
+                    (
+                        "COLAB LOGIN · " + state.replace("_", " ").upper(),
+                        "good" if state == "authenticated" else "warn",
+                    ),
+                    (
+                        str(self.account.get("message", "Login is unverified.")),
+                        "normal",
+                    ),
+                    (
+                        "Login checks and authorization never allocate or release a runtime.",
+                        "muted",
+                    ),
+                    ("", "normal"),
+                )
+            )
+        if self.page in (
+            "models",
+            "model_category",
+            "model_add_confirm",
+            "model_adding",
+        ) or (self.page == "input" and self.input_field == "model_url"):
+            selected = sum(row.get("auto_download", True) for row in self.model_entries)
+            rows.extend(
+                (
+                    ("MODEL AUTO-DOWNLOAD · saved locally", "accent"),
+                    (
+                        f"{selected} selected / {len(self.model_entries)} models",
+                        "normal",
+                    ),
+                    (
+                        "Saved inside models/h3.json and extra-*.json. The list is reused by later runtimes and deployments.",
+                        "normal",
+                    ),
+                    (
+                        "Editing choices never deletes existing weights or changes a running preparation. Disabling required weights can leave workflows with Missing Models.",
+                        "warn",
+                    ),
+                    ("", "normal"),
+                )
+            )
+            if self.config.model_url:
+                rows.extend(
+                    (
+                        ("Source file", "accent"),
+                        (self.config.model_url, "normal"),
+                        ("Destination: " + self.config.model_path, "normal"),
+                        (
+                            "Only public metadata is read when you confirm. No model weights or GPU are requested here.",
+                            "muted",
+                        ),
+                        ("", "normal"),
+                    )
+                )
         if self.worker.busy:
             rows.extend(
                 (
@@ -1092,6 +1497,10 @@ class Wizard:
                     ),
                     (
                         "Models: " + pinned_model_summary(self.config.cpu),
+                        "normal",
+                    ),
+                    (
+                        f"Parallel downloads: {self.config.download_workers} · Drive copy: 1",
                         "normal",
                     ),
                     (
@@ -1262,6 +1671,10 @@ class Wizard:
         return wrapped
 
     def _input_default(self) -> str:
+        if self.input_field == "model_url":
+            return "https://huggingface.co/OWNER/REPO/blob/main/model.safetensors"
+        if self.input_field == "download_workers":
+            return str(self.config.download_workers) + " (1-4; default 2)"
         if self.input_field == "port":
             return str(self.config.local_port)
         if self.input_field == "identity":
@@ -1294,6 +1707,279 @@ class Wizard:
             role, self.theme.roles["good"] if role == "comfy" else curses.A_NORMAL
         )
         screen.addnstr(row, column, text, len(text), attribute)
+
+    def _compact_model_rows(self, width: int) -> list[tuple[str, str]]:
+        """One row per model; full paths and verification remain in details."""
+        rows: list[tuple[str, str]] = []
+        displayed: set[str] = set()
+        for key, label in (
+            ("model_prepare", "Prepare"),
+            ("model_download", "Download"),
+        ):
+            task = self.status.get(key) or {}
+            progress = task.get("progress") or {}
+            files = progress.get("files", []) if isinstance(progress, dict) else []
+            items = [
+                item
+                for item in files
+                if isinstance(item, dict)
+                and str(item.get("path", "model")) not in displayed
+            ]
+            if not items:
+                continue
+            rows.append(
+                (
+                    f"LOCAL MODELS · {label.lower()} {task.get('status', 'unknown')}",
+                    "accent",
+                )
+            )
+            for item in items:
+                path = str(item.get("path", "model"))
+                displayed.add(path)
+                try:
+                    total = float(item.get("total_bytes"))
+                    fraction = (
+                        min(1.0, max(0.0, float(item.get("done_bytes")) / total))
+                        if total > 0
+                        else None
+                    )
+                except (TypeError, ValueError, ZeroDivisionError):
+                    fraction = None
+                bar_width = 8 if width < 85 else 12
+                filled = int(bar_width * fraction) if fraction is not None else 0
+                bar = "[" + "#" * filled + "-" * (bar_width - filled) + "]"
+                percent = f"{fraction * 100:3.0f}%" if fraction is not None else "  ?%"
+                verification = item.get("verification")
+                phase = str(item.get("phase", item.get("status", "queued")))
+                if verification == "verified_receipt_metadata":
+                    phase, role = "receipt reuse", "good"
+                elif verification in ("stream_sha256", "full_sha256"):
+                    phase, role = "SHA verified", "good"
+                elif phase in ("failed", "error"):
+                    role = "bad"
+                elif fraction == 1:
+                    phase, role = "validation pending", "warn"
+                else:
+                    role = "comfy" if fraction else "muted"
+                amount = f"{human_bytes(item.get('done_bytes'))}/{human_bytes(item.get('total_bytes'))}"
+                metrics = f"{bar} {percent} {amount} {phase}"
+                name_width = max(10, width - len(metrics) - 2)
+                name = clip_cells(path.rsplit("/", 1)[-1], name_width)
+                rows.append((name.ljust(name_width) + "  " + metrics, role))
+        return rows
+
+    def _compact_details(self, width: int) -> list[tuple[str, str]]:
+        """Prioritize actionable errors, authorization and model progress."""
+        rows: list[tuple[str, str]] = []
+        if self.page == "model_add_confirm":
+            rows.extend(
+                (
+                    ("MODEL ADDITION · review before Enter", "accent"),
+                    ("Source: " + self.config.model_url, "normal"),
+                    ("Destination: " + self.config.model_path, "comfy"),
+                    (
+                        "Auto-download: enabled · metadata only; prepare weights separately.",
+                        "normal",
+                    ),
+                )
+            )
+        if self.error:
+            rows.extend((("Attention", "bad"), (self.error, "bad")))
+        if self.auth:
+            rows.append(("Provider authorization · transient", "accent"))
+            rows.append(
+                (
+                    str(
+                        self.auth.get("text")
+                        or "Complete provider authorization in your browser."
+                    ),
+                    "normal",
+                )
+            )
+            if self.auth.get("url"):
+                rows.append((str(self.auth["url"]), "normal"))
+        if self._url():
+            rows.append(("Open ComfyUI: " + (self._url() or ""), "comfy"))
+        if self.page in ("home", "account"):
+            account = getattr(self, "account", {})
+            state = str(account.get("state", "unknown"))
+            rows.append(
+                (
+                    "COLAB LOGIN · " + state.replace("_", " ").upper(),
+                    "good" if state == "authenticated" else "warn",
+                )
+            )
+            rows.append((str(account.get("message", "Login is unverified.")), "normal"))
+        choices = self._choices()
+        if choices and self.page not in (
+            "pipeline",
+            "ready",
+            "failure",
+            "advanced",
+            "inspect",
+            "input",
+        ):
+            selected = choices[min(self.selected, len(choices) - 1)]
+            if self.page == "models" and selected.key.startswith("model:"):
+                path = selected.key.removeprefix("model:")
+                item = next(
+                    (item for item in self.model_entries if item["path"] == path), {}
+                )
+                enabled = item.get("auto_download", True)
+                rows.extend(
+                    (
+                        ("ABOUT THIS MODEL", "info_heading"),
+                        ("Path: " + path, "normal"),
+                        (
+                            "Auto-download: "
+                            + ("enabled" if enabled else "disabled")
+                            + " · "
+                            + human_bytes(item.get("size_bytes"))
+                            + " · "
+                            + Path(item.get("manifest", "manifest")).name,
+                            "good" if enabled else "warn",
+                        ),
+                        (
+                            "Enter toggles and saves. Existing files are retained.",
+                            "info",
+                        ),
+                    )
+                )
+            elif selected.detail:
+                rows.extend(
+                    (
+                        ("ABOUT THIS CHOICE · " + selected.label, "info_heading"),
+                        (selected.detail, "info"),
+                    )
+                )
+        if self.page in ("pipeline", "ready", "failure", "advanced", "inspect"):
+            rows.extend(self._compact_model_rows(width))
+        if rows:
+            rows.append(("FULL DETAILS · PgUp/PgDn", "info_heading"))
+        wrapped = []
+        for value, role in rows:
+            wrapped.extend(
+                (line, role) for line in textwrap.wrap(value, max(8, width)) or [""]
+            )
+        details = []
+        login_block = False
+        for value, role in self._details(width):
+            if self.page in ("home", "account") and value.startswith("COLAB LOGIN ·"):
+                login_block = True
+                continue
+            if login_block:
+                if not value:
+                    login_block = False
+                continue
+            if not (
+                role == "comfy"
+                and value.startswith("[")
+                and "]" in value
+                and set(value.partition("]")[0][1:]) <= {"#", "-"}
+            ):
+                details.append((value, role))
+        return wrapped + details
+
+    def _draw_compact(self, screen: Any) -> None:
+        """Keep navigation and six model meters visible on ordinary terminals."""
+        height, width = screen.getmaxyx()
+        content_width = width - 4
+        stage = (
+            self.stage
+            if self.page in ("pipeline", "inspect", "listing", "model_adding")
+            else self._title()
+        )
+        self._write(
+            screen,
+            2,
+            1,
+            self._busy_text() if self.worker.busy else "Now: " + stage,
+            width - 2,
+            "accent",
+        )
+        complete, active = self._complete_steps(), self._active_step()
+        column = 1
+        labels = ("VM", "Compute", "Disk", "Drive", "Env", "Models", "SSH")
+        for (key, _), label in zip(STEPS, labels):
+            skipped = (key == "models" and self.config.cpu) or (
+                key == "mount" and self.config.ephemeral
+            )
+            marker = (
+                "-"
+                if skipped
+                else ("+" if key in complete else (">" if key == active else "o"))
+            )
+            role = (
+                "muted"
+                if skipped
+                else (
+                    "comfy"
+                    if key in complete
+                    else ("accent" if key == active else "muted")
+                )
+            )
+            value = marker + label + "  "
+            self._write(screen, 3, column, value, width - column - 1, role)
+            column += len(value)
+        if self.page == "input":
+            label = (
+                "Provider code"
+                if self.input_field == "auth_code"
+                else self.input_field.replace("_", " ").title()
+            )
+            self._write(screen, 4, 1, "EDIT / ENTER TO SUBMIT", content_width, "accent")
+            self._write(screen, 5, 2, label, content_width, "normal")
+            value = (
+                "*" * len(self.input_value)
+                if self.input_field == "auth_code"
+                else self.input_value
+            )
+            self._write(
+                screen,
+                6,
+                2,
+                "> " + (value if value else self._input_default()),
+                content_width,
+                "input" if value else "muted",
+            )
+            detail_top = 8
+        else:
+            choices = self._choices()
+            reserved = 14 if self.page == "models" else 12
+            available = min(len(choices), max(1, height - reserved))
+            offset = max(
+                0, min(self.selected - available + 1, max(0, len(choices) - available))
+            )
+            heading = "CHOOSE / CONFIRM"
+            if len(choices) > available:
+                heading += f" · {offset + 1}-{offset + available}/{len(choices)}"
+            self._write(screen, 4, 1, heading, content_width, "accent")
+            for index, choice in enumerate(
+                choices[offset : offset + available], offset
+            ):
+                self._write(
+                    screen,
+                    5 + index - offset,
+                    2,
+                    ("> " if self.selected == index else "  ") + choice.label,
+                    content_width,
+                    "accent" if self.selected == index else "normal",
+                )
+            detail_top = 6 + available
+        rows = self._compact_details(content_width)
+        count = max(1, height - 3 - detail_top)
+        offset = min(self.detail_offset, max(0, len(rows) - count))
+        self.detail_offset = offset
+        for row, (value, role) in enumerate(rows[offset : offset + count], detail_top):
+            self._write(screen, row, 2, value, content_width, role)
+        self._write(
+            screen,
+            height - 3,
+            1,
+            f"Details {offset + 1}-{min(offset + count, len(rows))}/{len(rows)} · PgUp/PgDn · + ready > current - skipped",
+            width - 2,
+            "muted",
+        )
 
     def _draw(self, screen: Any) -> None:
         """Compose a whole frame before a single terminal update."""
@@ -1339,6 +2025,8 @@ class Wizard:
                 self._write(
                     screen, height - 4, 1, "> " + choice.label, width - 2, "accent"
                 )
+        elif width < 110 or height < 32:
+            self._draw_compact(screen)
         else:
             split = width >= 86
             left = max(30, min(46, int(width * 0.37))) if split else width - 2

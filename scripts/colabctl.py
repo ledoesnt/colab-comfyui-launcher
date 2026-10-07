@@ -333,6 +333,11 @@ def background_arguments(payload):
     if not script.is_file() or not Path(executable).is_file():
         raise RuntimeError('Deploy and install required scripts before starting this task.')
     arguments = [str(executable), str(script), '--max-seconds', str(payload['max_seconds'])]
+    if action in ('download', 'prepare'):
+        workers = payload.get('workers', 2)
+        if type(workers) is not int or not 1 <= workers <= 4:
+            raise RuntimeError('Download workers must be an integer from 1 to 4.')
+        arguments.extend(['--workers', str(workers)])
     if action == 'download':
         if payload.get('models_root'):
             arguments.extend(['--models-root', payload['models_root']])
@@ -717,6 +722,13 @@ def parser() -> argparse.ArgumentParser:
         "download", help="Start bounded background downloads of pinned H3 models"
     )
     download.add_argument("--max-seconds", type=positive_seconds, default=1800.0)
+    download.add_argument(
+        "--workers",
+        type=int,
+        choices=range(1, 5),
+        default=2,
+        help="Parallel HTTPS model downloads (default: 2)",
+    )
     download.add_argument("--models-root", help="Absolute models directory on runtime")
     download.add_argument("--ephemeral", action="store_true")
     download.add_argument(
@@ -729,6 +741,13 @@ def parser() -> argparse.ArgumentParser:
         help="Prepare verified models on VM disk from Drive or direct download",
     )
     prepare.add_argument("--max-seconds", type=positive_seconds, default=1800.0)
+    prepare.add_argument(
+        "--workers",
+        type=int,
+        choices=range(1, 5),
+        default=2,
+        help="Parallel HTTPS model downloads; Drive copying stays sequential",
+    )
     prepare.add_argument("--cache-root", help="Absolute Drive models cache directory")
     prepare.add_argument(
         "--ephemeral",
@@ -774,6 +793,8 @@ def main(argv: list[str] | None = None) -> int:
         payload["install_timeout"] = arguments.install_timeout
     elif arguments.action in ("download", "prepare", "render"):
         payload["max_seconds"] = arguments.max_seconds
+        if arguments.action in ("download", "prepare"):
+            payload["workers"] = arguments.workers
         if arguments.action == "render":
             payload["workflow"] = arguments.workflow
         if arguments.action == "download":

@@ -1,4 +1,4 @@
-"""Deterministic cache preparation tests: no network, Drive, Colab, or weights."""
+"""Deterministic preparation tests: no external network, Drive, Colab, or weights."""
 
 import argparse
 import hashlib
@@ -12,6 +12,8 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from test_download_models import LoopbackDownloads
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_SPEC = importlib.util.spec_from_file_location(
@@ -77,6 +79,7 @@ class PrepareModelsTests(unittest.TestCase):
             cache_root=self.source_root,
             local_models_root=self.local_root,
             max_seconds=10,
+            workers=1,
             verify_cache=False,
             progress_file=None,
         )
@@ -805,6 +808,134 @@ class EphemeralModelsTests(unittest.TestCase):
         self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
         self.assertEqual(self.progress()["status"], "failed")
         self.assertIsNone(self.progress()["files"][0]["verification"])
+
+
+class ConcurrentPrepareTests(unittest.TestCase):
+    def setUp(self):
+        PrepareModelsTests.setUp(self)
+        self.args.workers = 2
+        self.args.download_missing = True
+        self.files = {
+            f"diffusion_models/concurrent-{index}.bin": bytes([65 + index])
+            * (32 * 1024)
+            for index in range(3)
+        }
+        self.items = [
+            {
+                "path": path,
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+            for path, data in self.files.items()
+        ]
+        self.manifest.write_text(
+            json.dumps(
+                {
+                    "repo_id": "Fixture-Org/Fixture-Model",
+                    "revision": "a" * 40,
+                    "files": self.items,
+                    "total_size_bytes": sum(len(data) for data in self.files.values()),
+                }
+            )
+        )
+        self.children_before = {
+            child.pid for child in cache.multiprocessing.active_children()
+        }
+
+    def test_ephemeral_preparation_overlaps_http_and_retains_one_verified_copy(self):
+        self.args.ephemeral = True
+        self.args.cache_root = None
+        with (
+            mock.patch.object(
+                cache.os.path, "ismount", side_effect=AssertionError("No Drive")
+            ),
+            LoopbackDownloads(cache, self.files) as server,
+        ):
+            result = preparer.run(self.args)
+            self.assertEqual(server.peak, 2)
+        self.assertEqual(result["workers"], 2)
+        self.assertTrue(result["models_ready"])
+        self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+        self.assertFalse((self.local_root.parent / "ephemeral-assets").exists())
+        for item in self.items:
+            self.assertEqual(
+                (self.local_root / item["path"]).read_bytes(), self.files[item["path"]]
+            )
+            self.assertFalse((self.source_root / item["path"]).exists())
+        self.assertEqual(
+            {child.pid for child in cache.multiprocessing.active_children()},
+            self.children_before,
+        )
+
+    def test_missing_drive_downloads_overlap_but_copy_starts_afterwards_sequentially(
+        self,
+    ):
+        copies = []
+        copy_file = preparer.copy_file
+        active = peak = 0
+        with LoopbackDownloads(cache, self.files) as server:
+
+            def copy(*args, **kwargs):
+                nonlocal active, peak
+                with server.lock:
+                    self.assertEqual(server.active, 0)
+                active += 1
+                peak = max(peak, active)
+                copies.append(args[2]["path"])
+                try:
+                    return copy_file(*args, **kwargs)
+                finally:
+                    active -= 1
+
+            with mock.patch.object(preparer, "copy_file", side_effect=copy):
+                result = preparer.run(self.args)
+            self.assertEqual(server.peak, 2)
+        self.assertEqual(peak, 1)
+        self.assertEqual(copies, list(self.files))
+        self.assertEqual(result["copy_workers"], 1)
+        self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+        self.assertTrue(
+            all(item["cache_status"] == "downloaded" for item in result["files"])
+        )
+        for item in self.items:
+            self.assertEqual(
+                (self.source_root / item["path"]).read_bytes(), self.files[item["path"]]
+            )
+            self.assertEqual(
+                (self.local_root / item["path"]).read_bytes(), self.files[item["path"]]
+            )
+
+    def test_existing_drive_models_are_not_prehashed_or_downloaded_during_concurrency(
+        self,
+    ):
+        for item in self.items:
+            path = self.source_root / item["path"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(self.files[item["path"]])
+        with mock.patch.object(
+            cache, "hash_file", side_effect=AssertionError("No Drive prehash")
+        ):
+            result = preparer.run(self.args)
+        self.http.assert_not_called()
+        self.assertTrue(
+            all(item["cache_status"] == "existing" for item in result["files"])
+        )
+        self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+
+    def test_all_models_disabled_succeeds_without_a_download_or_false_hash_claim(self):
+        value = json.loads(self.manifest.read_text())
+        for item in value["files"]:
+            item["auto_download"] = False
+        self.manifest.write_text(json.dumps(value))
+        self.args.ephemeral = True
+        self.args.cache_root = None
+        result = preparer.run(self.args)
+        self.assertTrue(result["models_ready"])
+        self.assertEqual(result["files"], [])
+        self.assertEqual(result["total_size_bytes"], 0)
+        self.assertFalse((self.local_root / cache.RECEIPT_NAME).exists())
+        self.assertTrue(preparer.local_cache_ready(self.local_root, self.manifest))
+        self.http.assert_not_called()
 
 
 if __name__ == "__main__":

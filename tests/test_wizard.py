@@ -94,6 +94,12 @@ class WizardTests(unittest.TestCase):
     def setUp(self):
         self.worker = LocalWorker()
         self.ui = wizard.Wizard(dashboard.Config(), object(), self.worker)
+        # Navigation fixtures start with a separately verified account; real
+        # login preflight/PTY behavior is covered by test_colab_auth_preflight.
+        self.ui.account = {
+            "state": "authenticated",
+            "message": "Fixture login verified.",
+        }
 
     def choose(self, key):
         keys = [choice.key for choice in self.ui._choices()]
@@ -152,7 +158,7 @@ class WizardTests(unittest.TestCase):
             [choice.key for choice in self.ui._choices()], list(wizard.GPU_CHOICES)
         )
         self.assertIn("tested", self.ui._choices()[0].label)
-        self.assertIn("not verified", self.ui._choices()[1].label)
+        self.assertIn("H3 profile untested", self.ui._choices()[1].label)
         self.choose("L4")
         self.choose("ephemeral")
         with mock.patch.object(Path, "is_file", return_value=True):
@@ -863,7 +869,8 @@ finally:
     def test_run_shortens_escape_delay_and_preserves_arrow_navigation(self):
         screen = Frame()
         screen.timeout = mock.Mock()
-        screen.getkey = mock.Mock(side_effect=["KEY_DOWN", "KEY_DOWN", "\n"])
+        quit_index = [choice.key for choice in self.ui._choices()].index("quit")
+        screen.getkey = mock.Mock(side_effect=["KEY_DOWN"] * quit_index + ["\n"])
         with (
             mock.patch.object(self.ui.theme, "initialize"),
             mock.patch.object(wizard.curses, "set_escdelay") as delay,

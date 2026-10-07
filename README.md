@@ -8,7 +8,9 @@ python3 scripts/dashboard.py
 
 默认通过 `local-only` 服务与 SSH 转发，在本机 `http://127.0.0.1:8188` 访问。也可以显式选择 `--public` Cloudflare 临时公开网址，或 `--allowed-email` 邮箱登录；不会自动公开服务。SSH 模式需要专用密钥，创建密钥必须由你明确选择。
 
-这是独立的基础设施工具，不依赖 `video-render-lab` 的 Render API。2026-10-06 在真实 G4 上完成官方 Popular H3 I2V 浏览器基础 / 8 步 Turbo 两次生成、音视频校验、六模型准备、同 VM 模型维护及工作流服务重启恢复。六文件约 42.03 GB 全量直接下载并校验用时 405.142 秒；同四文件 Drive 首次复制 792.101 秒、直接下载 387.167 秒。两路并发样本比串行缩短约四分之一，Drive 暖缓存样本则更快；这些固定顺序实测不能作为新 VM 的速度保证。最后一次重启后的 API 回归在 120 秒上限内未完成，记录为超时；本轮 G4 和 SSH 已释放。详见 [本轮记录](docs/test-report.md)。
+这是独立的基础设施工具，不依赖 `video-render-lab` 的 Render API。2026-10-07 新增屏内模型勾选与添加、Colab 登录前置检查、默认两路文件下载和小窗口进度布局；本轮验证实际本机终端操作、公开模型元数据保存以及本机 HTTP 并发传输，没有重新分配 GPU 或操作已有用户实例。详见 [最新测试范围](docs/test-report.md)。
+
+2026-10-06 在真实 G4 上完成官方 Popular H3 I2V 浏览器基础 / 8 步 Turbo 两次生成、音视频校验、六模型准备、同 VM 模型维护及工作流服务重启恢复。六文件约 42.03 GB 全量直接下载并校验用时 405.142 秒；同四文件 Drive 首次复制 792.101 秒、直接下载 387.167 秒。两路并发样本比串行缩短约四分之一，Drive 暖缓存样本则更快；这些固定顺序实测不能作为新 VM 的速度保证。最后一次重启后的 API 回归在 120 秒上限内未完成，记录为超时；该历史轮次 G4 和 SSH 已释放。详见 [历史实测记录](docs/test-report.md)。
 
 2026-10-05 的历史向导验证覆盖新建 CPU、两台 G4 的 Drive / 临时存储分支、四模型逐文件进度、SSH、退出保留与接回；两分支完成原 T2V API 音视频生成。临时下载为 305.849 秒，Drive 复制为 726.705 秒，来自不同 VM。另一次历史同机先复制再本地 SHA 共 439.911 秒，其中本地 SHA 26.875 秒；随后同步复制校验为 367.357 秒，受顺序和暖缓存影响。逐步操作截图和 Markdown 保存在 Git 外。
 
@@ -33,7 +35,11 @@ colab --auth=oauth2 sessions
 
 默认是逐步启动向导，采用 ComfyUI `#F2FF59`、Colab `#E77012` / `#F9AA00` 配色。**上下选择，Enter 确认**；移动选中项不会执行操作。Esc 返回或取消输入；PgUp / PgDn 翻看右侧详情。输入字段为空时显示默认值，开始输入后提示消失，普通输入使用高对比文字。
 
+窗口不足 110 列或 32 行时采用紧凑布局：步骤放在一行，当前阶段和六个模型进度直接显示在首屏；50×24 起可用。足够大的窗口保留双栏。GPU 的 `project-tested H3 profile` / `H3 profile untested` 表示项目记录的测试覆盖，不会因为一次启动成功自动改变。
+
 首次使用：
+
+启动先显示 **Colab login** 状态并执行只读检查。未登录时选 **Authorize / check Colab login**，在屏内完成提供方授权；登录确认后才进入实例流程。网络失败显示未核实，不当作退出登录。首页也能直接打开 **Manage models**，不需要先分配 VM。
 
 1. 选择 **Create a new runtime**，选择 GPU 或 CPU；GPU 再选择型号。G4 是本项目已测型号，其余型号的 H3 兼容性未验证。
 2. 选择 **Google Drive** 或 **VM disk**。前者长期缓存模型和保存输出；后者跳过挂载，直接下载到 VM，释放后不保留模型与输出。
@@ -68,6 +74,7 @@ Demo 是只读 fixture，可预览导航、输入与进度，不作为云端成�
 | --- | --- |
 | Inspect current runtime | 查询真实状态，恢复已保存的配置与本机 SSH 转发信息。 |
 | Authorize / check Google Drive | 检查 Drive；需要时在屏内引导授权，已挂载则跳过。VM disk 模式直接跳过，不切换存储模式。 |
+| Manage models · add / select files | 添加公共 Hugging Face 模型文件、查看完整清单并按 Enter 切换 `[✓]` / `[×]`；选择自动保存，供下次准备使用。 |
 | Prepare / refresh models | 把本机最新模型清单部署到当前 GPU 实例，准备并验证新增模型，保留服务与 SSH；已有任务先等待，不重复提交。 |
 | Run a PNG smoke test | 运行无模型的 64×64 PNG 工作流，检查执行、输出获取与存储一致性；CPU 也可使用。 |
 | Render the H3 API test | 执行项目固定的 H3 视频测试并校验媒体和存储输出；需要 GPU、已准备的模型和运行中的 ComfyUI。 |
@@ -88,7 +95,11 @@ Demo 是只读 fixture，可预览导航、输入与进度，不作为云端成�
 
 浏览器测试使用 **Templates → Popular → MiniMax H3: Image to Video**；仓库保存了完全一致的 [UI 模板](workflows/h3-i2v-ui.json)。模板来源、输入图片、参数和测试方式见 [I2V 说明](docs/h3-i2v.md)。原 T2V API 工作流仍保留为 `workflows/h3-api.json`。
 
-后续模型追加到 [models/extra.json](models/extra.json)，不同 Hugging Face 仓库各建一个 `models/extra-名称.json`。清单固定仓库 revision、文件路径、大小与 SHA256；在已启动的 TUI 中选择 **Advanced actions → Prepare / refresh models** 即可应用到同一 VM，再刷新 ComfyUI 模型列表。已验证的原模型会复用同 VM receipt。详见 [追加模型说明](docs/models.md)。下载权重不会自动安装它所需的自定义节点。
+首页、启动摘要或 **Advanced actions → Manage models** 都可查看和编辑清单。六个内置模型默认为 `[✓]`；选中模型按 Enter 切换 `[✓]` 自动准备 / `[×]` 跳过，并立即保存到清单的 `auto_download` 字段。添加模型时粘贴公共 Hugging Face 文件网址，选择目录类别，再 Enter 确认；启动器读取公开元数据，固定 commit、文件大小与 SHA256，保存到 `models/extra-added-*.json`，此时不下载权重。下次启动或 **Prepare / refresh models** 自动使用保存的选择。取消勾选保留已下载文件，停用必需模型可能使工作流提示 Missing Models。
+
+仍可手工编辑 [models/extra.json](models/extra.json)，不同仓库各用 `models/extra-名称.json`。缺少公开 SHA256 或需要认证的文件，使用独立核实的固定清单；TUI 不收集 Hugging Face token。详见 [追加模型说明](docs/models.md)。下载权重不会自动安装它所需的自定义节点。
+
+正式 HTTPS 下载默认同时处理 **两个文件**，在连接设置中可将 Parallel downloads 改为 1–4；CLI 用 `--workers 1` 回退串行。每个文件独立续传、完整 SHA256 后发布；进度及校验记录由主进程统一写入。Drive 模式仅缺失文件的下载并发，Drive → VM 复制仍顺序进行。改清单不会改动已经运行的远端任务，需要任务结束后再 Prepare / refresh。
 
 当前 Colab 属于 self-hosted 网页版，模板的 Download 按钮通常把模型下载到你电脑的浏览器，不能替启动器把文件放到 Colab；ComfyUI Desktop 才有直接安装到服务端的流程，见[官方模板说明](https://docs.comfy.org/interface/features/template)。因此优先通过清单准备模型，既可在启动前，也可在启动后执行。
 

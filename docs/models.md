@@ -1,5 +1,21 @@
 # 追加与准备模型
 
+## 在 TUI 管理下载清单
+
+首页、启动配置摘要或 Advanced actions → **Manage models · add / select files** 打开模型列表。`[✓]` 表示每次准备都纳入此文件，`[×]` 表示跳过；上下键仅选择，Enter 切换并立即保存。内置六个模型默认勾选，选择写入对应 JSON 的 `auto_download` 布尔字段，后续 TUI、CLI、部署和新 VM 准备都会读取。缺省该字段等同 `true`。取消勾选不删除或隐藏已有文件；仍在 VM 上的文件可被 ComfyUI 发现。关闭必需模型会使新 VM 上的相关工作流缺模型。所有文件均可关闭，用于只开编辑器；这不表示 H3 已具备推理条件。
+
+选择 **Add model · Hugging Face file URL**，粘贴 `https://huggingface.co/owner/repo/blob/main/path/model.safetensors` 或 resolve 文件链接，再选择 loader 要求的目录类别，最后确认。仅查询公共元数据，将 main 等引用解析为固定 commit，获取 LFS SHA256 和大小，保存 `models/extra-added-*.json` 并默认勾选；没有下载模型、创建 VM 或安装节点。添加后回到高级操作选择 **Prepare / refresh models**，或在下一次完整启动时准备。文件名保留原名称，来源路径与本地目录可不同。
+
+目前交互添加支持公开、提供 LFS SHA256 的 Hugging Face 模型文件。私有或 gated 文件、没有可靠 SHA256 的小文件，使用手动核实的清单；不要在网址中附 token。网络或元数据校验失败不改清单。无论是否勾选，所有清单先检查路径、固定来源及目的路径冲突；关闭一个文件不能绕过无效配置。
+
+## 并发和缓存
+
+正式下载默认 2 路文件并发，`download` / `prepare --workers 1` 可回退串行，允许范围 1–4；TUI 在 SSH and storage settings → Parallel downloads 设置当前流程的数量。Drive 模式先并发下载缺失文件，再顺序复制并同步 SHA 到 VM；临时模式直接并发下载到 VM。已验证文件仍按原规则复用。后台主进程统一发布逐文件进度及 receipt；整体截止或单文件失败会停止本批其他文件 worker，保留完整验证成功的文件和可续传 partial，不自动重新提交任务。
+
+自动下载选择会长期保存到模型清单；并发数量是当前 TUI 配置，重新启动 TUI 默认回到 2。生产并发已由真实本地 HTTP 传输验证，不能拿此前的两文件 GPU 基准当作新实现的云端测速。
+
+## 手工编辑清单
+
 默认清单是 `models/h3.json`。把自己的附加文件写到 **`models/extra.json`** 的 `files` 列表；该文件初始为空，不额外下载模型。还可为其他仓库创建 **`models/extra-名称.json`**，例如 `models/extra-sd.json`。使用默认 H3 清单时，启动向导、下载、准备和启动前的本地就绪检查都会自动合并这些清单；`extra-*.json` 按文件名排序。无需为了追加模型修改 Python 代码或重建 VM。
 
 附加清单文件名使用英文字母、数字、点、下划线或短横线，例如 `extra-sd.json`，不使用目录分隔符。默认 H3 清单包含四个基础权重、模板当前选择的 **8 步 Turbo LoRA**，以及一个可选风格 embedding `minimaxh3_art_is_explosion.safetensors`，共六文件、约 42.03 GB。

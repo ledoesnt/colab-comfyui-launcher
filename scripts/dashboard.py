@@ -92,6 +92,9 @@ class Config:
     create_key: bool = False
     verify_cache: bool = False
     gpu: str = "G4"
+    download_workers: int = 2
+    model_url: str = ""
+    model_path: str = ""
 
 
 def require_session(config: Config) -> None:
@@ -189,9 +192,11 @@ class Backend:
                     "Temporary GPU models download directly during preparation; use Full startup / Prepare instead of a separate cache download."
                 )
             argv.extend(["--max-seconds", "1800"])
+            argv.extend(["--workers", str(config.download_workers)])
             argv.extend(["--models-root", config.storage_root.rstrip("/") + "/models"])
         elif action == "prepare":
             argv.extend(["--max-seconds", "1800"])
+            argv.extend(["--workers", str(config.download_workers)])
             argv.extend(
                 ["--ephemeral"]
                 if config.ephemeral
@@ -386,6 +391,60 @@ class Backend:
             "ready": ready,
         }
 
+    def account_status(self) -> dict[str, str]:
+        """Verify OAuth through a read-only CLI request without answering login.
+
+        The provider owns its OAuth cache and may refresh it. This check never
+        reads credentials itself, starts a VM, opens a browser, or retains the
+        CLI's raw output/authorization link. Network failure is not logout.
+        """
+        command = ["colab", "--auth=oauth2", "sessions"]
+        try:
+            result = self.run(
+                command,
+                text=True,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "state": "unavailable",
+                "reason": "timeout",
+                "message": "Colab login check timed out. Check the connection and retry; login has not been disproved.",
+            }
+        except OSError:
+            return {
+                "state": "unavailable",
+                "reason": "cli_unavailable",
+                "message": "Colab CLI could not run. Check its installation before checking login again.",
+            }
+        output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout or "")
+        diagnostic = (output + "\n" + (result.stderr or "")).lower()
+        if (
+            "to authorize colab-cli, visit this url" in diagnostic
+            and "enter the authorization code:" in diagnostic
+        ):
+            return {
+                "state": "not_authenticated",
+                "reason": "login_required",
+                "message": "Colab login is required. Choose Authorize / check Colab login; no runtime has been created.",
+            }
+        listed = "No active sessions found on server." in output or re.search(
+            r"(?m)^\[[^\]\s]+\].+\|\s*Hardware:\s*[^|\n]+", output
+        )
+        if result.returncode == 0 and listed:
+            return {
+                "state": "authenticated",
+                "reason": "verified_sessions",
+                "message": "Colab login verified by the official read-only session request.",
+            }
+        return {
+            "state": "unavailable",
+            "reason": "request_failed" if result.returncode else "unverified_response",
+            "message": "Colab login could not be verified. Check the network and CLI, then retry; this does not mean you are signed out.",
+        }
+
     @staticmethod
     def account_terminal(
         _config: Config, on_event: Callable[[dict[str, Any]], None]
@@ -437,6 +496,7 @@ class Worker:
         self.tasks: queue.Queue[tuple[str, Config]] = queue.Queue(maxsize=1)
         self.cancelled = threading.Event()
         self.operation_cancelled = threading.Event()
+        self.account_cancelled = threading.Event()
         self.lock = threading.Lock()
         self.busy = False
         self.active_action: str | None = None
@@ -474,6 +534,8 @@ class Worker:
                 elif self.active_action != "status" or action == "status":
                     return False
             self.busy = True
+            if action in ("account_status", "account_login"):
+                self.account_cancelled.clear()
             self.pending_action = action
             self.tasks.put_nowait((action, replace(config)))
             return True
@@ -490,6 +552,21 @@ class Worker:
         if terminal is None:
             return False
         return bool(terminal.respond(text))
+
+    def cancel_account(self) -> bool:
+        """Cancel pending/active login checks only, retaining all resources."""
+        with self.lock:
+            if self.active_action not in (
+                "account_status",
+                "account_login",
+            ) and self.pending_action not in ("account_status", "account_login"):
+                return False
+            self.account_cancelled.set()
+            self.operation_cancelled.set()
+            terminal = self.auth_terminal
+        if terminal is not None:
+            terminal.close()
+        return True
 
     def _provider_embedded(
         self,
@@ -564,12 +641,46 @@ class Worker:
             self.auth_terminal = None
             self.events.put(("auth_clear", None))
 
-    def _ensure_account(self, config: Config) -> None:
-        if not self.account_checked:
-            self._provider_embedded(
-                config, self.backend.account_terminal, "checking Google account login"
+    def _check_account(self) -> dict[str, str]:
+        self._check_cancelled()
+        self.events.put(("stage", "checking Colab login"))
+        result = self.backend.account_status()
+        if not isinstance(result, dict) or result.get("state") not in (
+            "authenticated",
+            "not_authenticated",
+            "unavailable",
+        ):
+            result = {
+                "state": "unavailable",
+                "message": "Colab login response was not verified. Retry the read-only check.",
+            }
+        self._check_cancelled()
+        self.account_checked = result["state"] == "authenticated"
+        self.events.put(("account", result))
+        return result
+
+    def _authorize_account(self, config: Config) -> None:
+        self.account_checked = False
+        checked = self._check_account()
+        if checked["state"] == "authenticated":
+            return
+        if checked["state"] != "not_authenticated":
+            raise DashboardError(checked["message"])
+        self._provider_embedded(
+            config, self.backend.account_terminal, "authorizing Colab account"
+        )
+        verified = self._check_account()
+        if verified["state"] != "authenticated":
+            raise DashboardError(
+                "Authorization ended, but Colab login is not verified. Check login before choosing a runtime."
             )
-            self.account_checked = True
+
+    def _ensure_account(self, config: Config, *, fresh: bool = False) -> None:
+        if self.account_checked and not fresh:
+            return
+        checked = self._check_account()
+        if checked["state"] != "authenticated":
+            raise DashboardError(checked["message"])
 
     def _mount_embedded(self, config: Config) -> None:
         if config.ephemeral:
@@ -962,13 +1073,30 @@ class Worker:
                 self.active_config = config
                 self.pending_action = None
                 self.operation_cancelled.clear()
+                if (
+                    action in ("account_status", "account_login")
+                    and self.account_cancelled.is_set()
+                ):
+                    self.operation_cancelled.set()
             try:
                 self._check_cancelled()
                 self.events.put(("stage", action))
-                if action in ("wizard_create", "wizard_resume", "inspect", "sessions"):
-                    self._ensure_account(config)
+                if action in (
+                    "wizard_create",
+                    "wizard_resume",
+                    "inspect",
+                    "sessions",
+                    "new",
+                ):
+                    self._ensure_account(
+                        config, fresh=action in ("wizard_create", "new")
+                    )
                     self._check_cancelled()
-                if action in ("wizard_create", "wizard_resume"):
+                if action == "account_status":
+                    self._check_account()
+                elif action == "account_login":
+                    self._authorize_account(config)
+                elif action in ("wizard_create", "wizard_resume"):
                     if action == "wizard_create":
                         if not config.cpu:
                             validate_model_plan()
@@ -982,6 +1110,16 @@ class Worker:
                     self._mount_embedded(config)
                 elif action == "prepare_refresh":
                     self._prepare_refresh(config)
+                elif action == "model_add":
+                    module = _model_catalog_module()
+                    metadata = module.lookup(config.model_url)
+                    name = module.add(
+                        _model_manifest_module(),
+                        metadata,
+                        config.model_path,
+                        MODEL_SEARCH_CATEGORIES,
+                    )
+                    self.events.put(("model_added", (config.model_path, name)))
                 elif action == "pipeline":
                     self._pipeline(config)
                 elif action == "sessions":
@@ -1076,6 +1214,39 @@ def validate_model_plan() -> dict[str, Any]:
             + ". Update the runtime directory mapping before preparing these files."
         )
     return manifest
+
+
+@lru_cache(maxsize=1)
+def _model_catalog_module() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "launcher_model_catalog", ROOT / "scripts/model_catalog.py"
+    )
+    if spec is None or spec.loader is None:
+        raise DashboardError("Cannot load model catalog management")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def model_catalog_entries() -> list[dict[str, Any]]:
+    try:
+        return _model_catalog_module().entries(_model_manifest_module())
+    except Exception as exc:
+        raise DashboardError("Invalid model catalog: " + safe_error(exc)) from exc
+
+
+def toggle_model_choice(path: str) -> bool:
+    try:
+        return _model_catalog_module().toggle(_model_manifest_module(), path)
+    except Exception as exc:
+        raise DashboardError("Model choice was not saved: " + safe_error(exc)) from exc
+
+
+def parse_model_url(value: str) -> tuple[str, str, str]:
+    try:
+        return _model_catalog_module().parse_url(value)
+    except ValueError as exc:
+        raise DashboardError(str(exc)) from exc
 
 
 def pinned_model_summary(cpu: bool = False) -> str:

@@ -30,3 +30,5 @@ scripts/probe.py
 # SSH --state-dir overrides must never stage runtime endpoint credentials.
 **/proxy-session.json
 **/forward.json
+models/.catalog.lock
+models/.catalog-*

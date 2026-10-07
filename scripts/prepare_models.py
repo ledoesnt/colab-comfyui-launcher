@@ -232,7 +232,6 @@ def prepare_ephemeral(args, manifest, local, deadline, progress):
         receipts = cache.Receipts(
             local, manifest["repo_id"], manifest["revision"], boot_id()
         )
-        results = []
         for item in manifest["files"]:
             final = local / item["path"]
             cache.check_path(final, local)
@@ -242,22 +241,20 @@ def prepare_ephemeral(args, manifest, local, deadline, progress):
                 raise cache.DownloadError(
                     "Local model is missing; use --download-missing to download to VM"
                 )
-            results.append(
-                cache.download_file(
-                    local,
-                    manifest["repo_id"],
-                    manifest["revision"],
-                    item,
-                    deadline,
-                    receipts,
-                    getattr(args, "verify_cache", False),
-                    progress,
-                )
-            )
-    return results
+        return cache.download_files(
+            local,
+            manifest,
+            manifest["files"],
+            deadline,
+            receipts,
+            getattr(args, "verify_cache", False),
+            progress,
+            getattr(args, "workers", cache.DEFAULT_WORKERS),
+        )
 
 
 def run(args):
+    workers = cache.worker_count(getattr(args, "workers", cache.DEFAULT_WORKERS))
     with cache.time_budget(args.max_seconds) as deadline:
         extra_manifests = getattr(args, "extra_manifest", ())
         manifest = cache.load_manifests(args.manifest, extra_manifests)
@@ -292,6 +289,8 @@ def run(args):
             "cache_root": None if ephemeral else str(source),
             "models_root": str(local),
             "ephemeral": ephemeral,
+            "workers": workers,
+            "copy_workers": 1,
             "models_ready": True,
             "files": results,
             "total_size_bytes": sum(item["size_bytes"] for item in manifest["files"]),
@@ -307,24 +306,29 @@ def prepare_drive(args, manifest, source, local, deadline, progress):
             local, manifest["repo_id"], manifest["revision"], boot_id()
         )
         results = []
+        missing = []
         for item in manifest["files"]:
             source_file = source / item["path"]
             cache.check_path(source_file, source)
-            cache_status = "existing"
-            if cache.file_size(source_file) is None and getattr(
-                args, "download_missing", False
-            ):
-                downloaded = cache.download_file(
-                    source,
-                    manifest["repo_id"],
-                    manifest["revision"],
-                    item,
-                    deadline,
-                    source_receipts,
-                    False,
-                    progress,
+            size = cache.file_size(source_file)
+            if size is not None and size != item["size_bytes"]:
+                raise cache.DownloadError(
+                    "Drive cache has a pinned model with the wrong size"
                 )
-                cache_status = downloaded["status"]
+            if size is None and getattr(args, "download_missing", False):
+                missing.append(item)
+        downloaded = cache.download_files(
+            source,
+            manifest,
+            missing,
+            deadline,
+            source_receipts,
+            False,
+            progress,
+            getattr(args, "workers", cache.DEFAULT_WORKERS),
+        )
+        cache_statuses = {item["path"]: item["status"] for item in downloaded}
+        for item in manifest["files"]:
             prepared = copy_file(
                 source,
                 local,
@@ -335,7 +339,7 @@ def prepare_drive(args, manifest, source, local, deadline, progress):
                 progress,
                 getattr(args, "verify_cache", False),
             )
-            prepared["cache_status"] = cache_status
+            prepared["cache_status"] = cache_statuses.get(item["path"], "existing")
             results.append(prepared)
     return results
 
@@ -364,6 +368,12 @@ def main(argv=None):
         help="Must be /content/colab-comfyui-runtime/models",
     )
     parser.add_argument("--max-seconds", type=float, default=1800)
+    parser.add_argument(
+        "--workers",
+        type=cache.worker_count,
+        default=cache.DEFAULT_WORKERS,
+        help="Concurrent HTTPS files (1–4, default: 2); Drive copies stay sequential",
+    )
     parser.add_argument(
         "--verify-cache",
         action="store_true",

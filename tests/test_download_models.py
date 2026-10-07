@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import http.server
 import importlib.util
 import io
 import json
@@ -19,6 +20,138 @@ SPEC = importlib.util.spec_from_file_location(
 downloader = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(downloader)
 DATA = b"small deterministic model fixture, not model weights\n"
+
+
+class LoopbackDownloads:
+    """Real local HTTP transport; only the production HTTPS URL is redirected.
+
+    No external hostname is contacted and no TLS/CDN performance is inferred.
+    Responses, Range handling, partial writes and overlapping sockets are real.
+    """
+
+    def __init__(self, module, files, *, slots=2, slow_paths=(), corrupt_paths=()):
+        self.module, self.files, self.slots = module, files, slots
+        self.slow_paths, self.corrupt_paths = set(slow_paths), set(corrupt_paths)
+        context = module.multiprocessing.get_context("fork")
+        self.lock = context.Lock()
+        self.metrics = context.RawArray("q", [0] * 515)
+        self.paths = list(files)
+        self.overlap = context.Event()
+        self.release = context.Event()
+        fixture = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                path = self.path.split("/resolve/", 1)[1].split("/", 1)[1]
+                offset = int(self.headers.get("Range", "bytes=0-")[6:-1])
+                with fixture.lock:
+                    fixture.active += 1
+                    fixture.peak = max(fixture.peak, fixture.active)
+                    index = fixture.metrics[2]
+                    fixture.metrics[3 + 2 * index] = fixture.paths.index(path)
+                    fixture.metrics[4 + 2 * index] = offset
+                    fixture.metrics[2] = index + 1
+                    if fixture.active >= fixture.slots:
+                        fixture.overlap.set()
+                try:
+                    data = fixture.files[path]
+                    body = data[offset:]
+                    self.send_response(206 if offset else 200)
+                    self.send_header("Content-Length", str(len(body)))
+                    if offset:
+                        self.send_header(
+                            "Content-Range",
+                            f"bytes {offset}-{len(data) - 1}/{len(data)}",
+                        )
+                    self.end_headers()
+                    fixture.overlap.wait(0.3)
+                    if path in fixture.slow_paths:
+                        fixture.release.wait(5)
+                    if path in fixture.corrupt_paths:
+                        body = b"X" * len(body)
+                    time.sleep(0.03)
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    with fixture.lock:
+                        fixture.active -= 1
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.process = context.Process(
+            target=lambda: self.server.serve_forever(poll_interval=0.02),
+            name="loopback-model-fixture",
+            daemon=True,
+        )
+        self.opener = module.urllib.request.build_opener(
+            module.urllib.request.ProxyHandler({})
+        )
+
+    @property
+    def active(self):
+        return self.metrics[0]
+
+    @active.setter
+    def active(self, value):
+        self.metrics[0] = value
+
+    @property
+    def peak(self):
+        return self.metrics[1]
+
+    @peak.setter
+    def peak(self, value):
+        self.metrics[1] = value
+
+    @property
+    def requests(self):
+        with self.lock:
+            return [
+                (self.paths[self.metrics[3 + 2 * index]], self.metrics[4 + 2 * index])
+                for index in range(self.metrics[2])
+            ]
+
+    def __enter__(self):
+        # The server's request threads live in its owned process. The download
+        # controller stays single-threaded, like the standalone production CLI.
+        self.process.start()
+
+        def route(request, timeout):
+            # The manifest still generates a fixed production HTTPS URL. The
+            # fixture translates only its origin to the loopback HTTP server.
+            url = (
+                "http://127.0.0.1:"
+                + str(self.server.server_port)
+                + self.module.urllib.parse.urlsplit(request.full_url).path
+            )
+            local = self.module.urllib.request.Request(
+                url, headers=dict(request.header_items())
+            )
+            response = self.opener.open(local, timeout=timeout)
+            response.geturl = lambda: request.full_url
+            return response
+
+        self.patch = mock.patch.object(
+            self.module.urllib.request, "urlopen", side_effect=route
+        )
+        self.patch.start()
+        return self
+
+    def __exit__(self, *args):
+        self.patch.stop()
+        self.release.set()
+        self.process.terminate()
+        self.process.join(2)
+        if self.process.is_alive():
+            self.process.kill()
+            self.process.join(0.5)
+        self.process.close()
+        self.server.server_close()
 
 
 class Response(io.BytesIO):
@@ -62,6 +195,7 @@ class ModelDownloadTests(unittest.TestCase):
             models_root=self.root,
             ephemeral=True,
             max_seconds=10.0,
+            workers=1,
         )
         # Every test defaults to a failing network mock, including unexpected calls.
         patch = mock.patch.object(
@@ -864,6 +998,257 @@ class ModelDownloadTests(unittest.TestCase):
             status = downloader.main(["--unexpected-option"])
         self.assertEqual(status, 1)
         self.assertFalse(json.loads(output.getvalue())["ok"])
+
+
+class ConcurrentDownloadTests(unittest.TestCase):
+    write_manifest = ModelDownloadTests.write_manifest
+
+    def setUp(self):
+        ModelDownloadTests.setUp(self)
+        self.args.workers = 2
+        self.children_before = {
+            child.pid for child in downloader.multiprocessing.active_children()
+        }
+
+    def multi_manifest(self, count=4):
+        self.files = {
+            f"diffusion_models/file-{index}.bin": bytes([65 + index]) * (32 * 1024)
+            for index in range(count)
+        }
+        self.items = [
+            {
+                "path": path,
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+            for path, data in self.files.items()
+        ]
+        self.write_manifest(
+            files=self.items,
+            total_size_bytes=sum(len(data) for data in self.files.values()),
+        )
+
+    def assert_no_workers(self):
+        self.assertEqual(
+            {
+                child.pid
+                for child in downloader.multiprocessing.active_children()
+                if child.name != "loopback-model-fixture"
+            },
+            self.children_before,
+        )
+
+    def test_default_two_workers_overlap_real_http_and_publish_every_receipt(self):
+        self.multi_manifest()
+        del self.args.workers
+        with LoopbackDownloads(downloader, self.files) as server:
+            result = downloader.run(self.args)
+            self.assertEqual(server.peak, 2)
+            self.assertEqual(len(server.requests), len(self.items))
+        self.assertEqual(result["workers"], 2)
+        self.assertEqual([item["path"] for item in result["files"]], list(self.files))
+        receipts = downloader.Receipts(self.root, "Fixture-Org/Fixture-Model", "a" * 40)
+        for item in self.items:
+            self.assertEqual(
+                (self.root / item["path"]).read_bytes(), self.files[item["path"]]
+            )
+            self.assertTrue(receipts.matches(self.root / item["path"], item))
+        self.assertEqual(len(receipts.records), len(self.items))
+        progress = json.loads(
+            (self.content / "colab-comfyui-runtime/model-progress.json").read_text()
+        )
+        self.assertEqual(progress["status"], "succeeded")
+        self.assertTrue(
+            all(item["verification"] == "stream_sha256" for item in progress["files"])
+        )
+        self.assert_no_workers()
+
+    def test_worker_limits_one_and_four_match_actual_socket_overlap(self):
+        for workers in (1, 4):
+            with self.subTest(workers=workers):
+                self.multi_manifest()
+                self.args.workers = workers
+                self.args.models_root = self.content / f"models-{workers}"
+                with LoopbackDownloads(downloader, self.files, slots=workers) as server:
+                    downloader.run(self.args)
+                    self.assertEqual(server.peak, workers)
+                self.assert_no_workers()
+
+    def test_parallel_receipt_reuse_never_reopens_http_or_model_contents(self):
+        self.multi_manifest()
+        with LoopbackDownloads(downloader, self.files):
+            downloader.run(self.args)
+        with mock.patch.object(
+            downloader,
+            "hash_file",
+            side_effect=AssertionError("No reread on verified metadata"),
+        ):
+            result = downloader.run(self.args)
+        self.assertTrue(
+            all(
+                item["verification"] == "verified_receipt_metadata"
+                for item in result["files"]
+            )
+        )
+        self.http.assert_not_called()
+        self.assert_no_workers()
+
+    def test_parallel_real_http_range_resume_keeps_complete_hash_and_receipts(self):
+        self.multi_manifest(2)
+        offset = 1001
+        for item in self.items:
+            final = self.root / item["path"]
+            final.parent.mkdir(parents=True, exist_ok=True)
+            final.with_name(final.name + ".partial").write_bytes(
+                self.files[item["path"]][:offset]
+            )
+        with LoopbackDownloads(downloader, self.files) as server:
+            result = downloader.run(self.args)
+            self.assertEqual(server.peak, 2)
+            self.assertTrue(all(start == offset for _path, start in server.requests))
+        self.assertTrue(all(item["status"] == "resumed" for item in result["files"]))
+        for item in self.items:
+            self.assertEqual(
+                (self.root / item["path"]).read_bytes(), self.files[item["path"]]
+            )
+        self.assert_no_workers()
+
+    def test_deadline_kills_only_owned_workers_even_while_http_reads_stall(self):
+        self.multi_manifest(3)
+        self.args.max_seconds = 0.5
+        with LoopbackDownloads(
+            downloader, self.files, slow_paths=list(self.files)
+        ) as server:
+            started = time.monotonic()
+            with self.assertRaisesRegex(downloader.DownloadError, "deadline"):
+                downloader.run(self.args)
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertEqual(server.peak, 2)
+            self.assertEqual(len(server.requests), 2)
+            self.assert_no_workers()
+        self.assertFalse((self.root / downloader.RECEIPT_NAME).exists())
+        self.assertFalse(
+            any((self.root / item["path"]).exists() for item in self.items)
+        )
+        with downloader.root_lock(self.root):
+            pass
+
+    def test_bad_hash_cancels_stalled_peer_and_does_not_start_pending_files(self):
+        self.multi_manifest(3)
+        bad, slow, pending = list(self.files)
+        with LoopbackDownloads(
+            downloader, self.files, slow_paths=[slow], corrupt_paths=[bad]
+        ) as server:
+            started = time.monotonic()
+            with self.assertRaisesRegex(downloader.DownloadError, "SHA256"):
+                downloader.run(self.args)
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertNotIn(pending, [path for path, _offset in server.requests])
+            self.assert_no_workers()
+        self.assertFalse((self.root / bad).exists())
+        self.assertTrue((self.root / bad).with_name("file-0.bin.partial").exists())
+        progress = json.loads(
+            (self.content / "colab-comfyui-runtime/model-progress.json").read_text()
+        )
+        self.assertEqual(progress["status"], "failed")
+        self.assertFalse(any(item["status"] == "running" for item in progress["files"]))
+        self.assertTrue(all(item["verification"] is None for item in progress["files"]))
+
+    def test_abrupt_child_exit_fails_closed_and_releases_every_owned_worker(self):
+        self.multi_manifest(3)
+
+        def crash(*args):
+            downloader.os._exit(17)
+
+        started = time.monotonic()
+        with (
+            mock.patch.object(downloader, "download_worker", side_effect=crash),
+            self.assertRaisesRegex(downloader.DownloadError, "verified result"),
+        ):
+            downloader.run(self.args)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assert_no_workers()
+        self.http.assert_not_called()
+        self.assertFalse((self.root / downloader.RECEIPT_NAME).exists())
+        progress = json.loads(
+            (self.content / "colab-comfyui-runtime/model-progress.json").read_text()
+        )
+        self.assertEqual(progress["status"], "failed")
+        self.assertFalse(any(item["status"] == "running" for item in progress["files"]))
+        with downloader.root_lock(self.root):
+            pass
+
+    def test_disabled_selection_can_be_empty_but_catalog_keeps_every_file(self):
+        self.write_manifest(files=[dict(self.item, auto_download=False)])
+        selected = downloader.load_manifests(self.manifest)
+        self.assertEqual(selected["files"], [])
+        self.assertEqual(selected["total_size_bytes"], 0)
+        catalog = downloader.load_manifests(self.manifest, include_disabled=True)
+        self.assertEqual(catalog["files"][0]["path"], self.item["path"])
+        self.assertFalse(catalog["files"][0]["auto_download"])
+        self.write_manifest(files=[])
+        with self.assertRaisesRegex(downloader.DownloadError, "nonempty"):
+            downloader.load_manifests(self.manifest)
+
+    def test_selection_flag_is_strict_and_receipt_identity_does_not_change(self):
+        for value in (0, 1, "false", None):
+            with self.subTest(value=value):
+                self.write_manifest(files=[dict(self.item, auto_download=value)])
+                with self.assertRaisesRegex(downloader.DownloadError, "boolean"):
+                    downloader.load_manifest(self.manifest)
+        receipts = downloader.Receipts(self.root, "Fixture-Org/Fixture-Model", "a" * 40)
+        self.assertEqual(
+            receipts.key(dict(self.item, auto_download=False)),
+            receipts.key(dict(self.item, auto_download=True)),
+        )
+
+    def test_disabled_collision_or_bad_metadata_cannot_be_hidden_by_selection(self):
+        extra = self.content / "disabled-extra.json"
+        extra.write_text(
+            json.dumps(
+                {
+                    "repo_id": "Fixture-Org/Other-Model",
+                    "revision": "b" * 40,
+                    "files": [dict(self.item, auto_download=False)],
+                }
+            )
+        )
+        with self.assertRaisesRegex(downloader.DownloadError, "Duplicate"):
+            downloader.load_manifests(self.manifest, [extra])
+        value = json.loads(extra.read_text())
+        value["files"][0].update(path="vae/bad.bin", sha256="invalid")
+        extra.write_text(json.dumps(value))
+        with self.assertRaisesRegex(downloader.DownloadError, "sha256"):
+            downloader.load_manifests(self.manifest, [extra])
+
+    def test_worker_limits_fail_before_filesystem_or_network_side_effects(self):
+        for value in (0, 5, True, "two", 1.5):
+            with self.subTest(value=value):
+                self.args.workers = value
+                with self.assertRaisesRegex(downloader.DownloadError, "workers"):
+                    downloader.run(self.args)
+        self.http.assert_not_called()
+        self.assertFalse((self.root / ".download.lock").exists())
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            self.assertEqual(downloader.main(["--workers", "5"]), 1)
+        self.assertFalse(json.loads(output.getvalue())["ok"])
+
+    def test_progress_keeps_independent_rates_and_fails_every_active_file(self):
+        self.multi_manifest(2)
+        with mock.patch.object(
+            downloader.time, "monotonic", side_effect=[0, 1, 2, 3, 4, 5]
+        ):
+            progress = downloader.Progress(None, "download", self.items)
+            progress.update(self.items[0], "download", 0)
+            progress.update(self.items[1], "download", 0)
+            progress.update(self.items[0], "download", 1024)
+            progress.update(self.items[1], "download", 1024)
+            progress.finish(False)
+        for entry in progress.value["files"]:
+            self.assertEqual(entry["elapsed_seconds"], 2)
+            self.assertEqual(entry["rate_bytes_per_second"], 512)
+            self.assertEqual(entry["status"], "failed")
 
 
 if __name__ == "__main__":
