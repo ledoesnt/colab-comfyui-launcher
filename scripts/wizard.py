@@ -70,6 +70,7 @@ class Wizard:
         self.page = "home"
         self.selected = 0
         self.detail_offset = 0
+        self.detail_page_size = 8
         self.status: dict[str, Any] = {}
         self.ssh: dict[str, Any] = {}
         self.provider: dict[str, Any] = {}
@@ -1128,9 +1129,12 @@ class Wizard:
             self._page("home")
 
     def _key(self, key: str) -> bool:
-        if key in ("KEY_NPAGE", "KEY_PPAGE"):
+        paging = {"KEY_NPAGE": 1, "KEY_PPAGE": -1, "\x06": 1, "\x02": -1}
+        if self.page != "input":
+            paging.update(KEY_RIGHT=1, KEY_LEFT=-1)
+        if key in paging:
             self.detail_offset = max(
-                0, self.detail_offset + (8 if key == "KEY_NPAGE" else -8)
+                0, self.detail_offset + paging[key] * self.detail_page_size
             )
             return True
         if key == "\x1b":
@@ -1887,17 +1891,6 @@ class Wizard:
             rows.extend(
                 (("Next / status", "accent"), (self.notice, "normal"), ("", "normal"))
             )
-        choices = self._choices()
-        if self.page != "input" and choices and "choice" not in omit:
-            selected = choices[min(self.selected, len(choices) - 1)]
-            if selected.detail:
-                rows.extend(
-                    (
-                        ("ABOUT THIS CHOICE · " + selected.label, "info_heading"),
-                        (selected.detail, "info"),
-                        ("", "normal"),
-                    )
-                )
         if self.page != "pipeline":
             rows.extend(self._model_rows(width))
         wrapped = []
@@ -2080,18 +2073,6 @@ class Wizard:
                             + Path(item.get("manifest", "manifest")).name,
                             "good" if enabled else "warn",
                         ),
-                        (
-                            "Enter toggles and saves. Existing files are retained.",
-                            "info",
-                        ),
-                    )
-                )
-            elif selected.detail:
-                omitted.add("choice")
-                rows.extend(
-                    (
-                        ("ABOUT THIS CHOICE · " + selected.label, "info_heading"),
-                        (selected.detail, "info"),
                     )
                 )
         if self.page in ("pipeline", "ready", "failure", "advanced", "inspect"):
@@ -2112,16 +2093,59 @@ class Wizard:
                 details.append((value, role))
         if not any(value for value, _ in details):
             return wrapped
-        return (
-            wrapped
-            + [("", "normal"), ("DETAILS · PgUp/PgDn", "info_heading")]
-            + details
-        )
+        return wrapped + [("", "normal"), ("DETAILS", "info_heading")] + details
+
+    def _choice_help(self, width: int) -> list[tuple[str, str]]:
+        """Keep contextual help separate from scrolling execution evidence."""
+        choices = self._choices()
+        if self.page == "input" or not choices:
+            return []
+        choice = choices[min(self.selected, len(choices) - 1)]
+        if not choice.detail:
+            return []
+        detail = choice.detail
+        if self.page == "models" and choice.key.startswith("model:"):
+            # Paths and metadata already appear in the main model panel.
+            detail = "Enter toggles and saves. Existing files are retained."
+        return [("ABOUT THIS CHOICE", "info_heading")] + [
+            (line, "info") for line in textwrap.wrap(detail, max(8, width))
+        ]
+
+    def _footer_help(self, width: int) -> list[tuple[str, str]]:
+        rows = self._choice_help(width)
+        # Wrap the complete built-in explanations, even on 50x24 terminals.
+        # Keep unusually long provider descriptions from consuming the menu.
+        if len(rows) > 7:
+            rows = rows[:7]
+            rows[-1] = (clip_cells(rows[-1][0], max(8, width) - 1) + "…", "info")
+        return rows
+
+    def _scroll_hint(
+        self, screen: Any, row: int, width: int, offset: int, count: int, total: int
+    ) -> None:
+        if total > count:
+            above = offset > 0
+            below = offset + count < total
+            previous, following = (
+                ("Ctrl+B", "Ctrl+F") if self.page == "input" else ("←", "→")
+            )
+            hint = (
+                f"{previous} previous / {following} more details"
+                if above and below
+                else (
+                    f"{previous} previous details"
+                    if above
+                    else f"{following} more details"
+                )
+            )
+            self._write(screen, row, 1, hint, width - 2, "info")
 
     def _draw_compact(self, screen: Any) -> None:
         """Keep navigation and six model meters visible on ordinary terminals."""
         height, width = screen.getmaxyx()
         content_width = width - 4
+        help_rows = self._footer_help(width - 2)
+        body_bottom = height - 3 - len(help_rows)
         stage = (
             self.stage
             if self.page in ("pipeline", "inspect", "listing", "model_adding")
@@ -2173,7 +2197,11 @@ class Wizard:
             detail_top = choice_top + 4
         else:
             choices = self._choices()
-            reserved = (14 if self.page == "models" else 11) + (choice_top - 4)
+            reserved = (
+                (14 if self.page == "models" else 11)
+                + (choice_top - 4)
+                + len(help_rows)
+            )
             available = min(len(choices), max(1, height - reserved))
             offset = max(
                 0, min(self.selected - available + 1, max(0, len(choices) - available))
@@ -2199,23 +2227,18 @@ class Wizard:
                 )
             detail_top = choice_top + 2 + available
         rows = self._compact_details(content_width)
-        count = max(1, height - 3 - detail_top)
+        count = max(1, body_bottom - detail_top)
+        self.detail_page_size = max(1, count - 1)
         offset = min(self.detail_offset, max(0, len(rows) - count))
         self.detail_offset = offset
         for row, (value, role) in enumerate(rows[offset : offset + count], detail_top):
             self._write(screen, row, 2, value, content_width, role)
-        self._write(
-            screen,
-            height - 3,
-            1,
-            f"Details {offset + 1}-{min(offset + count, len(rows))}/{len(rows)} · PgUp/PgDn · + ready > current - skipped",
-            width - 2,
-            "muted",
-        )
+        self._scroll_hint(screen, body_bottom, width, offset, count, len(rows))
 
     def _draw(self, screen: Any) -> None:
         """Compose a whole frame before a single terminal update."""
         height, width = screen.getmaxyx()
+        help_rows = self._footer_help(width - 2) if height >= 24 and width >= 50 else []
         screen.erase()
         self._write(
             screen,
@@ -2262,7 +2285,7 @@ class Wizard:
         else:
             split = width >= 86
             left = max(30, min(46, int(width * 0.37))) if split else width - 2
-            body_bottom = height - 3
+            body_bottom = height - 3 - len(help_rows)
             self._write(screen, 3, 1, "YOUR STARTUP STEPS", left - 2, "accent")
             for index, (key, title) in enumerate(STEPS if split else ()):
                 marker, role = self._step_style(key)
@@ -2346,28 +2369,23 @@ class Wizard:
                 detail_top, detail_column, detail_width = 15, 2, width - 4
             rows = self._details(detail_width)
             count = max(1, body_bottom - detail_top)
+            self.detail_page_size = max(1, count - 1)
             offset = min(self.detail_offset, max(0, len(rows) - count))
             self.detail_offset = offset
             for row, (value, role) in enumerate(
                 rows[offset : offset + count], detail_top
             ):
                 self._write(screen, row, detail_column, value, detail_width, role)
-            if len(rows) > count:
-                self._write(
-                    screen,
-                    height - 3,
-                    detail_column,
-                    f"Details {offset + 1}-{min(offset + count, len(rows))}/{len(rows)} · PgUp/PgDn",
-                    detail_width,
-                    "muted",
-                )
+            self._scroll_hint(screen, body_bottom, width, offset, count, len(rows))
+        for row, (value, role) in enumerate(help_rows, height - 2 - len(help_rows)):
+            self._write(screen, row, 1, value, width - 2, role)
         self._write(
             screen,
             height - 2,
             1,
-            "Enter submit   Esc cancel"
+            "Enter submit  Esc cancel  Ctrl+B/F details"
             if self.page == "input"
-            else "Up/Down choose   Enter confirm   Esc back   PgUp/PgDn details",
+            else "↑/↓ choose  Enter confirm  Esc back  ←/→ details",
             width - 2,
             "muted",
         )
@@ -2438,6 +2456,7 @@ class Wizard:
                     f"{index}. {choice.label}"
                     for index, choice in enumerate(choices, 1)
                 ),
+                *(value for value, _role in self._choice_help(100)),
                 "Enter a choice number, then Enter. 'back' returns. Exit retains resources.",
             ]
         )

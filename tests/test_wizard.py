@@ -969,10 +969,10 @@ finally:
         keys = [choice.key for choice in self.ui._choices()]
         self.ui.selected = keys.index("prepare_refresh")
         self.assertEqual(self.worker.submitted, [])
-        details = self.ui._details(80)
+        details = self.ui._choice_help(80)
         self.assertTrue(
             any(
-                role == "info_heading" and "Prepare / refresh models" in text
+                role == "info_heading" and "ABOUT THIS CHOICE" in text
                 for text, role in details
             )
         )
