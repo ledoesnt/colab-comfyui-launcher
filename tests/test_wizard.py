@@ -228,6 +228,9 @@ class WizardTests(unittest.TestCase):
 
     def test_selected_choice_help_uses_distinct_blue_heading_and_body_roles(self):
         self.ui.theme.roles.update(info_heading=123, info=456, accent=789)
+        self.ui.selected = next(
+            i for i, choice in enumerate(self.ui._choices()) if choice.key == "new"
+        )
         screen = Frame()
         with mock.patch.object(wizard.curses, "doupdate"):
             self.ui._draw(screen)
@@ -290,7 +293,7 @@ class WizardTests(unittest.TestCase):
                 self.assertFalse(self.ui.model_paths_need_restart)
                 self.assertEqual(self.ui.model_registration_notice, "")
                 self.assertIn("cleanup", self.ui.cleanup_warning)
-                self.assertEqual(self.ui._complete_steps(), set())
+                self.assertEqual(self.ui._complete_steps(), {"account"})
                 self.assertFalse(self.ui._ready())
                 self.assertEqual(self.worker.submitted, [])
 
@@ -494,12 +497,15 @@ class WizardTests(unittest.TestCase):
         with mock.patch.object(wizard.curses, "doupdate"):
             self.ui._draw(screen)
             self.assertIn("> 8188", screen.text)
-            self.assertEqual(screen.attributes[16][2], 456)
+            row = next(
+                i for i, line in enumerate(screen.rows) if "> 8188" in "".join(line)
+            )
+            self.assertEqual(screen.attributes[row][2], 456)
             self.ui._key("9")
             self.ui._draw(screen)
-        self.assertIn("> 9", "".join(screen.rows[16]))
-        self.assertNotIn("8188", "".join(screen.rows[16]))
-        self.assertEqual(screen.attributes[16][2], 123)
+        self.assertIn("> 9", "".join(screen.rows[row]))
+        self.assertNotIn("8188", "".join(screen.rows[row]))
+        self.assertEqual(screen.attributes[row][2], 123)
 
     def test_frame_is_committed_once_and_never_calls_immediate_refresh(self):
         for page in (
@@ -834,8 +840,12 @@ finally:
         screen = Frame()
         with mock.patch.object(wizard.curses, "doupdate"):
             self.ui._draw(screen)
-        self.assertIn("+ ComfyUI + SSH", "".join(screen.rows[11]))
-        self.assertEqual(screen.attributes[11][2], 123)
+        row = next(
+            i
+            for i, line in enumerate(screen.rows)
+            if "+ ComfyUI + SSH" in "".join(line)
+        )
+        self.assertEqual(screen.attributes[row][2], 123)
         self.assertEqual(self.worker.submitted, [])
 
     def test_ssh_probe_failure_invalidates_previous_ready_snapshot(self):

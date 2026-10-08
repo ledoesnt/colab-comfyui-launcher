@@ -15,7 +15,9 @@ class FooterTests(unittest.TestCase):
             "message": "Fixture login verified.",
         }
         self.ui.notice = self.ui.account["message"]
-        self.ui.selected = 1  # View existing runtimes, without activating it.
+        self.ui.selected = next(
+            i for i, choice in enumerate(self.ui._choices()) if choice.key == "existing"
+        )
 
     def draw(self, height=24, width=80):
         screen = Frame(height, width)
@@ -35,7 +37,7 @@ class FooterTests(unittest.TestCase):
                 self.assertEqual(screen.attributes[top][1], 123)
                 self.assertEqual(screen.attributes[top + 1][1], 456)
                 self.assertIn("Enter confirm", "".join(screen.rows[height - 2]))
-                self.assertIn("←/→ details", "".join(screen.rows[height - 2]))
+                self.assertNotIn("details", "".join(screen.rows[height - 2]))
                 self.assertNotIn(
                     "ABOUT THIS CHOICE",
                     "\n".join("".join(row) for row in screen.rows[:top]),
@@ -59,7 +61,7 @@ class FooterTests(unittest.TestCase):
     def test_arrow_paging_keeps_footer_selection_and_does_not_submit(self):
         self.ui.error = " ".join(f"diagnostic-{i:02d}" for i in range(120))
         before = self.draw()
-        self.assertIn("→ more details", before.text)
+        self.assertNotIn("more details", before.text)
         original = (self.ui.page, self.ui.selected, self.ui.config)
         self.ui._key("KEY_RIGHT")
         after = self.draw()
@@ -82,7 +84,7 @@ class FooterTests(unittest.TestCase):
             self.draw()
         end = self.ui.detail_offset
         self.assertGreater(end, 0)
-        self.assertIn("← previous details", self.draw().text)
+        self.assertNotIn("previous details", self.draw().text)
         self.ui._key("KEY_RIGHT")
         self.draw()
         self.assertEqual(self.ui.detail_offset, end)
@@ -148,20 +150,21 @@ class FooterTests(unittest.TestCase):
         self.assertIn("Auto-download: enabled", text)
         self.assertEqual(self.worker.submitted, [])
 
-    def test_control_paging_keeps_typed_input_and_matches_input_hint(self):
+    def test_overflow_paging_hint_is_at_bottom_and_keeps_input(self):
         self.ui._input("model_url", "home")
         self.ui.input_value = (
             "https://huggingface.co/owner/model/blob/main/style.safetensors"
         )
         before = self.draw()
-        self.assertIn("Ctrl+F more details", before.text)
+        self.assertNotIn("Ctrl+F", before.text)
         self.assertNotIn("→ more details", before.text)
         self.ui._key("\x06")
         after = self.draw()
         self.assertGreater(self.ui.detail_offset, 0)
         self.assertNotEqual(before.text, after.text)
         self.assertIn(self.ui.input_value, after.text)
-        self.assertIn("Ctrl+B/F details", after.text)
+        self.assertIn("Ctrl+B/F details", "".join(after.rows[-2]))
+        self.assertEqual(after.text.count("Ctrl+B/F details"), 1)
         self.ui._key("\x02")
         self.assertEqual(self.ui.detail_offset, 0)
         self.assertEqual(self.worker.submitted, [])

@@ -14,6 +14,7 @@ import os
 import queue
 import re
 import select
+import stat
 import subprocess
 import sys
 import termios
@@ -33,6 +34,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STORAGE = "/content/drive/MyDrive/colab-comfyui-launcher-test"
 DEFAULT_IDENTITY = Path.home() / ".ssh/colab_comfyui_launcher"
 REFRESH_SECONDS = 10.0
+ACCOUNT_ACTIONS = frozenset(
+    ("account_status", "account_login", "account_logout", "account_switch")
+)
 MODEL_SEARCH_CATEGORIES = frozenset(
     (
         "diffusion_models",
@@ -52,6 +56,10 @@ NOT_DEPLOYED_NOTICE = "VM ready; launcher not deployed. Use d + Enter to deploy,
 
 class DashboardError(RuntimeError):
     """An action failed or its result could not be verified."""
+
+
+class AccountCacheChanged(DashboardError):
+    """OAuth cache changed, but final local sign-out could not be verified."""
 
 
 class OperationCancelled(DashboardError):
@@ -428,7 +436,7 @@ class Backend:
             return {
                 "state": "not_authenticated",
                 "reason": "login_required",
-                "message": "Colab login is required. Choose Authorize / check Colab login; no runtime has been created.",
+                "message": "Colab login is required. Choose Sign in from Colab login; no runtime has been created.",
             }
         listed = "No active sessions found on server." in output or re.search(
             r"(?m)^\[[^\]\s]+\].+\|\s*Hardware:\s*[^|\n]+", output
@@ -456,6 +464,89 @@ class Backend:
         return ProviderTerminal(
             ["colab", "--auth=oauth2", "sessions"], on_event, timeout=650
         )
+
+    def account_logout(
+        self, *, check_cancelled: Callable[[], None] | None = None
+    ) -> dict[str, str]:
+        """Forget only the standard CLI 0.7.4 local OAuth cache.
+
+        That official version has no logout command. Its public auth.py fixes
+        TOKEN_CONFIG_PATH to this path regardless of XDG_CONFIG_HOME/config.
+        Never read credentials or query sessions here: a session query after
+        removal would immediately start the provider's interactive login.
+        Browser login, Google grants, ADC, Drive, SSH and VM state are retained.
+        """
+        try:
+            version = self.run(
+                ["colab", "version"],
+                text=True,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DashboardError(
+                "Colab CLI version check timed out; local sign-out was not performed."
+            ) from exc
+        except OSError as exc:
+            raise DashboardError(
+                "Colab CLI could not run; local sign-out was not performed."
+            ) from exc
+        if version.returncode != 0 or version.stdout.strip() != "Version: 0.7.4":
+            raise DashboardError(
+                "Local sign-out supports the verified OAuth cache of Colab CLI 0.7.4 only; no credential file was changed."
+            )
+        if check_cancelled is not None:
+            check_cancelled()
+        home = Path.home()
+        cache = home / ".config" / "colab-cli" / "token.json"
+        removed = False
+        try:
+            # Refuse unusual layouts instead of following links into another
+            # credential store. Missing parents also prove this cache absent.
+            for directory in (home / ".config", cache.parent):
+                try:
+                    metadata = directory.lstat()
+                except FileNotFoundError:
+                    break
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise DashboardError(
+                        "Local sign-out refused a nonstandard OAuth cache directory; no credential file was changed."
+                    )
+            try:
+                metadata = cache.lstat()
+            except FileNotFoundError:
+                metadata = None
+            if metadata is not None:
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise DashboardError(
+                        "Local sign-out refused a nonregular OAuth cache; no credential file was changed."
+                    )
+                if check_cancelled is not None:
+                    check_cancelled()
+                cache.unlink()
+                removed = True
+            try:
+                cache.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                error_type = AccountCacheChanged if removed else DashboardError
+                raise error_type(
+                    "The Colab OAuth cache is still present or was recreated; local sign-out is not verified. Close other CLI login attempts and retry."
+                )
+        except OSError as exc:
+            error_type = AccountCacheChanged if removed else DashboardError
+            raise error_type(
+                "The local Colab OAuth cache could not be cleared or checked; sign-out is not verified."
+            ) from exc
+        return {
+            "state": "not_authenticated",
+            "reason": "local_oauth_cache_removed"
+            if removed
+            else "local_oauth_cache_absent",
+            "message": "Local Colab CLI sign-out verified. Browser login and Google authorization remain; existing VMs, Drive and SSH are retained.",
+        }
 
     @staticmethod
     def provider_terminal(
@@ -534,7 +625,7 @@ class Worker:
                 elif self.active_action != "status" or action == "status":
                     return False
             self.busy = True
-            if action in ("account_status", "account_login"):
+            if action in ACCOUNT_ACTIONS:
                 self.account_cancelled.clear()
             self.pending_action = action
             self.tasks.put_nowait((action, replace(config)))
@@ -554,12 +645,12 @@ class Worker:
         return bool(terminal.respond(text))
 
     def cancel_account(self) -> bool:
-        """Cancel pending/active login checks only, retaining all resources."""
+        """Cancel account coordination without stopping runtime resources."""
         with self.lock:
-            if self.active_action not in (
-                "account_status",
-                "account_login",
-            ) and self.pending_action not in ("account_status", "account_login"):
+            if (
+                self.active_action not in ACCOUNT_ACTIONS
+                and self.pending_action not in ACCOUNT_ACTIONS
+            ):
                 return False
             self.account_cancelled.set()
             self.operation_cancelled.set()
@@ -673,6 +764,52 @@ class Worker:
         if verified["state"] != "authenticated":
             raise DashboardError(
                 "Authorization ended, but Colab login is not verified. Check login before choosing a runtime."
+            )
+
+    def _logout_account(self, action: str) -> None:
+        self._check_cancelled()
+        self.account_checked = False
+        self.events.put(("stage", "signing out of local Colab CLI"))
+        try:
+            result = self.backend.account_logout(check_cancelled=self._check_cancelled)
+            if (
+                not isinstance(result, dict)
+                or result.get("state") != "not_authenticated"
+                or result.get("reason")
+                not in ("local_oauth_cache_removed", "local_oauth_cache_absent")
+            ):
+                raise DashboardError("Local Colab CLI sign-out was not verified.")
+        except OperationCancelled:
+            raise
+        except DashboardError as exc:
+            unavailable = {
+                "state": "unavailable",
+                "reason": "logout_unverified",
+                "message": "Local Colab CLI sign-out could not be verified. Check the error before retrying; no replacement account was authorized.",
+            }
+            if isinstance(exc, AccountCacheChanged):
+                self.events.put(
+                    ("account_invalidated", {"action": action, **unavailable})
+                )
+            self.events.put(("account", unavailable))
+            raise
+        # A cancellation racing after removal must not hide the credential
+        # change. Clear old UI account/runtime proofs before any new login.
+        self.events.put(("account_signed_out", {"action": action, **result}))
+        self.events.put(("account", result))
+        self._check_cancelled()
+
+    def _switch_account(self, config: Config) -> None:
+        self._logout_account("account_switch")
+        self._provider_embedded(
+            config,
+            self.backend.account_terminal,
+            "signing in to Colab; choose the Google account in your browser",
+        )
+        verified = self._check_account()
+        if verified["state"] != "authenticated":
+            raise DashboardError(
+                "Replacement login ended, but Colab login is not verified. Check login before choosing a runtime."
             )
 
     def _ensure_account(self, config: Config, *, fresh: bool = False) -> None:
@@ -1073,10 +1210,7 @@ class Worker:
                 self.active_config = config
                 self.pending_action = None
                 self.operation_cancelled.clear()
-                if (
-                    action in ("account_status", "account_login")
-                    and self.account_cancelled.is_set()
-                ):
+                if action in ACCOUNT_ACTIONS and self.account_cancelled.is_set():
                     self.operation_cancelled.set()
             try:
                 self._check_cancelled()
@@ -1096,6 +1230,10 @@ class Worker:
                     self._check_account()
                 elif action == "account_login":
                     self._authorize_account(config)
+                elif action == "account_logout":
+                    self._logout_account(action)
+                elif action == "account_switch":
+                    self._switch_account(config)
                 elif action in ("wizard_create", "wizard_resume"):
                     if action == "wizard_create":
                         if not config.cpu:
@@ -1448,6 +1586,7 @@ class Theme:
         "accent": "#F9AA00",
         "info_heading": "#75BFFF",
         "info": "#BDDFFF",
+        "progress_complete": "#8ED98C",
     }
 
     def __init__(self, color: bool = True):
@@ -1464,6 +1603,7 @@ class Theme:
             "input": curses.A_BOLD,
             "info_heading": curses.A_BOLD,
             "info": curses.A_NORMAL,
+            "progress_complete": curses.A_BOLD,
         }
         self.unicode = "utf" in (sys.stdout.encoding or "").lower()
 
@@ -1488,6 +1628,7 @@ class Theme:
                     (214, self.BRAND["accent"]),
                     (75, self.BRAND["info_heading"]),
                     (153, self.BRAND["info"]),
+                    (114, self.BRAND["progress_complete"]),
                 ):
                     rgb = tuple(
                         round(int(value[index : index + 2], 16) * 1000 / 255)
@@ -1509,6 +1650,7 @@ class Theme:
                 ("input", 255 if extended else curses.COLOR_WHITE),
                 ("info_heading", 75 if extended else curses.COLOR_CYAN),
                 ("info", 153 if extended else curses.COLOR_CYAN),
+                ("progress_complete", 114 if extended else curses.COLOR_GREEN),
             ]
             for pair, (role, foreground) in enumerate(colors, 1):
                 curses.init_pair(pair, foreground, background)

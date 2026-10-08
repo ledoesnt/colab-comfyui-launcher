@@ -12,6 +12,10 @@ class CompactWizardTests(unittest.TestCase):
     def setUp(self):
         self.worker = LocalWorker()
         self.ui = wizard.Wizard(dashboard.Config(), object(), self.worker)
+        self.ui.account = {
+            "state": "authenticated",
+            "message": "Fixture login verified.",
+        }
         self.ui.config.session = "compact-layout-test"
         self.ui.page = "pipeline"
         self.ui.stage = "Preparing verified local models"
@@ -205,9 +209,9 @@ class CompactWizardTests(unittest.TestCase):
             "message": "Authorize Colab before creating a runtime.",
         }
         screen = self.draw((24, 80))
-        self.assertIn("COLAB LOGIN · NOT AUTHENTICATED", screen.text)
-        self.assertIn(self.ui.account["message"], screen.text)
-        self.assertEqual(screen.text.count("COLAB LOGIN · NOT AUTHENTICATED"), 1)
+        self.assertIn("Colab · signed out", "".join(screen.rows[2]))
+        self.assertNotIn("COLAB LOGIN · NOT AUTHENTICATED", screen.text)
+        self.assertNotIn(self.ui.account["message"], screen.text)
         self.assertIn("Manage models", screen.text)
         for choice in self.ui._choices():
             self.assertIn(choice.label, screen.text)
@@ -290,7 +294,8 @@ class CompactWizardTests(unittest.TestCase):
         self.assertFalse("".join(screen.rows[2]).strip())
         self.assertIn("STARTUP FLOW", "".join(screen.rows[3]))
         flow = "".join(screen.rows[4])
-        self.assertEqual(flow.count("→"), 6)
+        self.assertEqual(flow.count("→"), 7)
+        self.assertIn("+ Colab", flow)
         self.assertIn("> VM", flow)
         self.assertNotIn("> Models", flow)
         self.assertFalse("".join(screen.rows[5]).strip())
@@ -300,7 +305,7 @@ class CompactWizardTests(unittest.TestCase):
         self.ui.page = "models"
         self.ui.status["models_ready"] = True
         self.ui.status["model_prepare"]["running"] = False
-        self.ui.theme.roles.update(comfy=123, accent=456)
+        self.ui.theme.roles.update(comfy=123, title=456)
         for size in ((24, 80), (36, 120)):
             with self.subTest(size=size):
                 frame = self.draw(size)

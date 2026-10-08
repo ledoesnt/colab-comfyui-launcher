@@ -1512,6 +1512,7 @@ class ThemeTests(unittest.TestCase):
                 mock.call(214, 976, 667, 0),
                 mock.call(75, 459, 749, 1000),
                 mock.call(153, 741, 875, 1000),
+                mock.call(114, 557, 851, 549),
             ],
         )
         pairs = dashboard.curses.init_pair.call_args_list

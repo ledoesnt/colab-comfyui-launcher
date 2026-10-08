@@ -80,12 +80,17 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(self.ui.page, "home")
         self.assertFalse(self.ui.quitting)
 
-    def test_verified_account_offers_only_read_only_recheck_and_back(self):
+    def test_verified_account_offers_check_switch_sign_out_and_back(self):
         self.choose("account")
         choices = self.ui._choices()
         self.assertEqual(
             [(row.key, row.label) for row in choices],
-            [("account_check", "Recheck login"), ("back", "Back")],
+            [
+                ("account_check", "Recheck login"),
+                ("account_switch", "Switch account"),
+                ("account_logout", "Sign out"),
+                ("back", "Back"),
+            ],
         )
         self.choose("account_check")
         self.assertNotIn("verified", self.ui.account["message"])
@@ -105,6 +110,8 @@ class NavigationTests(unittest.TestCase):
                     [
                         ("account_check", "Check login status"),
                         ("account_login", "Sign in"),
+                        ("account_switch", "Switch account"),
+                        ("account_logout", "Sign out"),
                         ("back", "Back"),
                     ],
                 )

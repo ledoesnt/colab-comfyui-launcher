@@ -39,7 +39,15 @@ from dashboard import (
 )
 
 GPU_CHOICES = ("G4", "H100", "A100", "L4", "T4")
+ACCOUNT_ACTIONS = (
+    "account_status",
+    "account_login",
+    "account_logout",
+    "account_switch",
+)
+LOGIN_ACTIONS = ("account_login", "account_switch")
 STEPS = (
+    ("account", "Colab login"),
     ("session", "Session"),
     ("hardware", "Compute"),
     ("storage", "Storage"),
@@ -93,6 +101,10 @@ class Wizard:
         self.account_intent: str | None = None
         self.account_return_page = "home"
         self.account_dismissed = False
+        self.account_change_action = ""
+        self.confirmed_steps: set[str] = set()
+        self.runtime_events_allowed = True
+        self.detached_runtime_notice = ""
         self.listing_return_page = "home"
         self.sessions_return_page = "home"
         self.listing_dismissed = False
@@ -111,6 +123,7 @@ class Wizard:
         self.model_entries: list[dict[str, Any]] = []
         self.models_return = "home"
         self.model_adding_dismissed = False
+        self.details_overflow = False
         if self.demo:
             self.config.session = self.config.session or "offline-demo"
             self.status = backend.bridge(self.config, "status")
@@ -160,10 +173,7 @@ class Wizard:
     def _require_account(self, intent: str) -> bool:
         if self.demo or self.account.get("state") == "authenticated":
             return True
-        if self.worker.busy and self.last_operation not in (
-            "account_status",
-            "account_login",
-        ):
+        if self.worker.busy and self.last_operation not in ACCOUNT_ACTIONS:
             self.notice = (
                 "Wait for the current operation; runtime resources are retained."
             )
@@ -239,6 +249,7 @@ class Wizard:
                 "required_model_categories",
                 "model_paths_need_restart",
                 "model_registration_notice",
+                "confirmed_steps",
             )
         }
         self.inspect_previous["config"] = replace(self.config)
@@ -247,6 +258,8 @@ class Wizard:
             self.resume = True
             self.observe_runtime = False
             self.status, self.ssh = {}, {}
+            self.confirmed_steps = set()
+        self.runtime_events_allowed = True
         self._page("inspect")
         return True
 
@@ -305,6 +318,11 @@ class Wizard:
         if self.page == "home":
             return [
                 Choice(
+                    "account",
+                    "Colab login",
+                    "Check login, sign in, switch accounts or sign out. No VM is created.",
+                ),
+                Choice(
                     "new",
                     "Create a new runtime",
                     "Choose compute and storage before creation.",
@@ -323,11 +341,6 @@ class Wizard:
                     "quit",
                     "Exit and keep resources",
                     "Exiting this UI does not stop any runtime.",
-                ),
-                Choice(
-                    "account",
-                    "Colab login",
-                    "View login status, check the connection or sign in. No runtime is created.",
                 ),
             ]
         if self.page == "account":
@@ -361,6 +374,20 @@ class Wizard:
                             "Use the provider's browser authorization and masked code input if login is required. Existing login is retained.",
                         )
                     )
+                choices.extend(
+                    [
+                        Choice(
+                            "account_switch",
+                            "Switch account",
+                            "Sign out of the local Colab CLI, then choose an account on Google's sign-in page. Existing VMs and SSH keep running.",
+                        ),
+                        Choice(
+                            "account_logout",
+                            "Sign out",
+                            "Remove only the Colab CLI's local OAuth cache. This does not sign out your browser or stop any VM.",
+                        ),
+                    ]
+                )
             elif not self.auth.get("waiting"):
                 choices.append(
                     Choice(
@@ -378,6 +405,21 @@ class Wizard:
                 )
             )
             return choices
+        if self.page == "account_confirm":
+            return [
+                Choice(
+                    "account_cancel_change",
+                    "Cancel",
+                    "Keep the current Colab login and return to its menu.",
+                ),
+                Choice(
+                    "account_confirm_change",
+                    "Confirm · switch account"
+                    if self.account_change_action == "account_switch"
+                    else "Confirm · sign out",
+                    "Clear only local Colab CLI login. Existing VMs, Drive data and SSH resources are retained.",
+                ),
+            ]
         if self.page in ("listing", "inspect", "model_adding"):
             descriptions = {
                 "listing": "Waiting for the provider's runtime list.",
@@ -719,6 +761,7 @@ class Wizard:
             candidate.session = self._new_name()
         action = "wizard_resume" if self.resume else "wizard_create"
         if self._submit(action, candidate):
+            self.runtime_events_allowed = True
             self.config = candidate
             self.observe_runtime = True
             self._page("pipeline")
@@ -766,7 +809,7 @@ class Wizard:
                 self.auth.update(waiting=False, needs_code=False)
             self.input_value = ""
             self._page(
-                "account" if self.last_operation == "account_login" else "pipeline"
+                "account" if self.last_operation in LOGIN_ACTIONS else "pipeline"
             )
             self.notice = (
                 "Provider input submitted; waiting for verification."
@@ -843,6 +886,7 @@ class Wizard:
                 self.config, session="", access="local-only", email=""
             )
             self.status, self.ssh, self.provider = {}, {}, {}
+            self.confirmed_steps = {"session"}
             self.required_model_categories = None
             self.model_paths_need_restart = False
             self.model_registration_notice = ""
@@ -869,6 +913,8 @@ class Wizard:
                 self._start_listing()
         elif self.page == "hardware":
             self.config.cpu = key == "cpu"
+            if self.config.cpu:
+                self.confirmed_steps.add("hardware")
             self.notice = (
                 "Choose where models and outputs are saved."
                 if self.config.cpu
@@ -880,12 +926,14 @@ class Wizard:
             )
         elif self.page == "gpu":
             self.config.gpu = key
+            self.confirmed_steps.add("hardware")
             self.notice = "Choose where models and outputs are saved."
             self._page("storage", int(self.config.ephemeral))
         elif self.page == "storage":
             if self.config.ephemeral != (key == "ephemeral"):
                 self.observe_runtime = False
             self.config.ephemeral = key == "ephemeral"
+            self.confirmed_steps.add("storage")
             self.notice = "Review the selected settings before confirming startup."
             self._page("summary")
             self.notice = "Storage selected. Review the configuration, then continue the missing steps."
@@ -929,7 +977,7 @@ class Wizard:
         elif key == "auth_code":
             self._input(
                 "auth_code",
-                "account" if self.last_operation == "account_login" else "pipeline",
+                "account" if self.last_operation in LOGIN_ACTIONS else "pipeline",
             )
         elif key == "account":
             if self.page != "account":
@@ -948,6 +996,26 @@ class Wizard:
                     self.account_dismissed = False
                     self._account_checking(signing_in=key == "account_login")
                     self._page("account")
+        elif key in ("account_logout", "account_switch"):
+            if not self.worker.busy:
+                self.account_change_action = key
+                self._page("account_confirm")
+        elif key == "account_cancel_change":
+            self._page("account")
+        elif key == "account_confirm_change":
+            if self.account_change_action not in ("account_logout", "account_switch"):
+                return True
+            if self._submit(self.account_change_action):
+                self.account_intent = None
+                self.account_dismissed = False
+                self.account = {
+                    "state": "checking",
+                    "message": "Switching local Colab login; existing runtimes remain running."
+                    if self.account_change_action == "account_switch"
+                    else "Signing out of the local Colab CLI; existing runtimes remain running.",
+                }
+                self.notice = self.account["message"]
+                self._page("account")
         elif key == "release":
             self.input_return = self.page
             self._page("release_confirm", 1)
@@ -1048,7 +1116,7 @@ class Wizard:
             if callable(cancel):
                 cancel()
             if self.account.get("state") == "checking" or (
-                self.worker.busy and self.last_operation == "account_login"
+                self.worker.busy and self.last_operation in LOGIN_ACTIONS
             ):
                 self.account = {
                     "state": "unknown",
@@ -1104,6 +1172,7 @@ class Wizard:
             )
             return
         parents = {
+            "account_confirm": "account",
             "hardware": "home",
             "gpu": "hardware",
             "storage": "sessions"
@@ -1126,6 +1195,38 @@ class Wizard:
             target = parents[self.page]
             self._page(target, int(self.config.ephemeral) if target == "storage" else 0)
         elif self.page not in ("home", "ready", "pipeline", "failure"):
+            self._page("home")
+
+    def _detach_account_runtime(self) -> None:
+        """Withdraw account-specific UI evidence without stopping any resource."""
+        if self.config.session:
+            self.detached_runtime_notice = (
+                "Previous runtime "
+                + self.config.session
+                + " was not stopped. Sign back into its account to inspect it."
+            )
+        self.config = replace(self.config, session="", create_key=False)
+        self.status, self.ssh, self.provider = {}, {}, {}
+        self.sessions = []
+        self.confirmed_steps.clear()
+        self.required_model_categories = None
+        self.model_paths_need_restart = False
+        self.model_registration_notice = ""
+        self.updated = self.last_refresh = 0.0
+        self.observe_runtime = self.resume = False
+        self.runtime_events_allowed = False
+        self.listing_dismissed = self.inspect_dismissed = True
+        self.inspect_previous = None
+        self.account_intent = None
+        self.account_return_page = "home"
+        if self.account_dismissed and self.page in (
+            "ready",
+            "summary",
+            "advanced",
+            "pipeline",
+            "failure",
+            "sessions",
+        ):
             self._page("home")
 
     def _key(self, key: str) -> bool:
@@ -1172,6 +1273,19 @@ class Wizard:
                 kind, value = self.worker.events.get_nowait()
             except queue.Empty:
                 return
+            if not self.runtime_events_allowed and kind in (
+                "status",
+                "ssh",
+                "ssh_error",
+                "provider",
+                "config",
+                "inspection",
+                "model_registration",
+                "created",
+                "session",
+                "released",
+            ):
+                continue
             if kind == "status":
                 self.status, self.updated = value, time.monotonic()
                 self._check_model_registration()
@@ -1226,6 +1340,8 @@ class Wizard:
                     self._page("storage", int(self.config.ephemeral))
                     self.notice = "Runtime selected; storage configuration is not yet known. Choose storage before continuing."
             elif kind == "sessions":
+                if not self.runtime_events_allowed and self.listing_dismissed:
+                    continue
                 self.sessions = value
                 if self.config.session and not any(
                     row["name"] == self.config.session for row in value
@@ -1233,6 +1349,7 @@ class Wizard:
                     # This event is emitted only after a verified provider list.
                     # Retain settings for inspection, but withdraw old VM proof.
                     self.status, self.ssh, self.provider = {}, {}, {}
+                    self.confirmed_steps.clear()
                     self.updated = 0.0
                     self.resume = False
                     self.observe_runtime = False
@@ -1255,16 +1372,21 @@ class Wizard:
                     self.notice = str(
                         value.get("message", "Colab login is unverified.")
                     )
+            elif kind in ("account_signed_out", "account_invalidated"):
+                self.account = dict(value)
+                self.auth.clear()
+                self.input_value = ""
+                self._detach_account_runtime()
             elif kind == "notice":
                 self.notice = str(value)
             elif kind == "auth":
-                if self.last_operation == "account_login" and self.account_dismissed:
+                if self.last_operation in LOGIN_ACTIONS and self.account_dismissed:
                     continue
                 self.auth.update(value)
                 if self.page != "input":
                     self._page(
                         "account"
-                        if self.last_operation == "account_login"
+                        if self.last_operation in LOGIN_ACTIONS
                         else "pipeline"
                     )
             elif kind == "auth_clear":
@@ -1272,7 +1394,7 @@ class Wizard:
                 if self.page == "input" and self.input_field == "auth_code":
                     self._page(
                         "account"
-                        if self.last_operation == "account_login"
+                        if self.last_operation in LOGIN_ACTIONS
                         else "pipeline"
                     )
             elif kind == "error":
@@ -1287,10 +1409,7 @@ class Wizard:
                     and self.inspect_dismissed
                 ):
                     continue
-                if (
-                    self.last_operation in ("account_status", "account_login")
-                    and self.account_dismissed
-                ):
+                if self.last_operation in ACCOUNT_ACTIONS and self.account_dismissed:
                     self.account = {
                         "state": "unavailable",
                         "message": safe_error(value),
@@ -1299,7 +1418,7 @@ class Wizard:
                 self.auth.clear()
                 self.input_value = ""
                 self.error = safe_error(value)
-                if self.last_operation in ("account_status", "account_login"):
+                if self.last_operation in ACCOUNT_ACTIONS:
                     self.account = {"state": "unavailable", "message": self.error}
                     if not self.account_dismissed and self.page == "account":
                         self._page("account")
@@ -1320,6 +1439,7 @@ class Wizard:
                     )
                     self.config = replace(self.config, session="", create_key=False)
                     self.status, self.ssh, self.provider = {}, {}, {}
+                    self.confirmed_steps.clear()
                     self.required_model_categories = None
                     self.model_paths_need_restart = False
                     self.model_registration_notice = ""
@@ -1332,7 +1452,7 @@ class Wizard:
                     )
             elif kind == "done":
                 self.auth.clear()
-                if value in ("account_status", "account_login"):
+                if value in ACCOUNT_ACTIONS:
                     self._finish_account()
                     continue
                 if value == "status" and self.page == "ready" and not self._ready():
@@ -1373,6 +1493,8 @@ class Wizard:
                 and bool(self.config.session)
             )
             and not self.demo
+            and self.runtime_events_allowed
+            and bool(self.config.session)
             and not self.worker.busy
             and now - self.last_refresh >= REFRESH_SECONDS
             and self.worker.submit("status", self.config)
@@ -1388,6 +1510,10 @@ class Wizard:
             or self.last_operation
         )
         label = {
+            "account_status": "Checking Colab login",
+            "account_login": "Signing in to Colab",
+            "account_logout": "Signing out of local Colab login",
+            "account_switch": "Switching Colab account",
             "sessions": "Loading runtimes from Colab",
             "inspect": "Inspecting selected runtime",
             "status": "Refreshing ComfyUI + SSH status",
@@ -1409,6 +1535,7 @@ class Wizard:
         return {
             "home": "Start a ComfyUI session",
             "account": "Colab account login · no runtime allocation",
+            "account_confirm": "Confirm Colab account change",
             "hardware": "Choose compute",
             "gpu": "Choose GPU model",
             "storage": "Choose model and output storage",
@@ -1436,6 +1563,8 @@ class Wizard:
 
     def _complete_steps(self) -> set[str]:
         complete = set()
+        if self.account.get("state") == "authenticated":
+            complete.add("account")
         runtime_known = bool(
             self.config.session and (self.provider or self.status or self.resume)
         )
@@ -1465,11 +1594,17 @@ class Wizard:
         return complete
 
     def _active_step(self) -> str:
-        if self.page in ("home", "account", "sessions", "listing", "inspect"):
-            return "session"
-        if self.page == "account" or (
-            self.auth and self.last_operation == "account_login"
+        if (
+            self.page in ("account", "account_confirm")
+            or (self.auth and self.last_operation in LOGIN_ACTIONS)
+            or (self.worker.busy and self.last_operation in ACCOUNT_ACTIONS)
         ):
+            return "account"
+        if self.page == "home":
+            return (
+                "session" if self.account.get("state") == "authenticated" else "account"
+            )
+        if self.page in ("sessions", "listing", "inspect"):
             return "session"
         if self.page in (
             "models",
@@ -1524,12 +1659,20 @@ class Wizard:
             ]
             if not files:
                 continue
-            rows.append((f"{label} · {task.get('status', 'unknown')}", "accent"))
-            for item in files:
+            rows.append(
+                (
+                    f"{label.upper()}  {str(task.get('status', 'unknown')).upper()}",
+                    "info_heading",
+                )
+            )
+            for index, item in enumerate(files, 1):
                 if not isinstance(item, dict):
                     continue
                 displayed.add(str(item.get("path", "model")))
-                rows.append((str(item.get("path", "model")), "normal"))
+                phase = str(item.get("phase", item.get("status", "queued")))
+                rows.append(
+                    (f"{index:02d}  {item.get('path', 'model')} / {phase}", "normal")
+                )
                 done, total = item.get("done_bytes"), item.get("total_bytes")
                 try:
                     fraction = (
@@ -1539,17 +1682,17 @@ class Wizard:
                     )
                 except (TypeError, ValueError, ZeroDivisionError):
                     fraction = None
-                size = max(4, min(22, width - 12))
+                metrics = f"{human_bytes(done)}/{human_bytes(total)} {human_bytes(item.get('rate_bytes_per_second'))}/s"
+                size = max(4, min(12, width - len(metrics) - 9))
+                full, empty = ("█", "░") if self.theme.unicode else ("#", "-")
                 if fraction is None:
-                    bar, percent = "-" * size, " ?%"
+                    bar, percent = empty * size, " ?%"
                 else:
                     filled = int(size * fraction)
                     bar, percent = (
-                        "#" * filled + "-" * (size - filled),
+                        full * filled + empty * (size - filled),
                         f"{fraction * 100:3.0f}%",
                     )
-                rows.append((f"[{bar}] {percent}", "comfy"))
-                phase = str(item.get("phase", item.get("status", "queued")))
                 verification = item.get("verification")
                 checked = {
                     "stream_sha256": "new streamed SHA256 verified",
@@ -1557,17 +1700,18 @@ class Wizard:
                     "verified_receipt_metadata": "receipt metadata reused; no new SHA256",
                 }
                 verified = verification in checked
-                suffix = (
-                    " · " + checked[verification]
-                    if verified
-                    else (" · final validation pending" if fraction == 1 else "")
-                )
                 rows.append(
                     (
-                        f"{human_bytes(done)} / {human_bytes(total)} · {human_bytes(item.get('rate_bytes_per_second'))}/s · {phase}{suffix}",
-                        "good" if verified else "normal",
+                        f"{bar}  {percent} {metrics}",
+                        "progress_complete"
+                        if verified
+                        else ("bad" if phase in ("failed", "error") else "title"),
                     )
                 )
+                if verified:
+                    rows.append((checked[verification], "progress_complete"))
+                elif fraction == 1:
+                    rows.append(("final validation pending", "warn"))
             rows.append(("", "normal"))
         return rows
 
@@ -1580,8 +1724,8 @@ class Wizard:
         if self.page == "ready" and key in self._complete_steps():
             return "+", "comfy"
         if key == self._active_step():
-            return ">", "accent"
-        if key in self._complete_steps():
+            return ">", "title"
+        if key in self._complete_steps() or key in self.confirmed_steps:
             return "+", "comfy"
         return "o", "muted"
 
@@ -1589,6 +1733,36 @@ class Wizard:
         self, width: int, *, omit: frozenset[str] = frozenset()
     ) -> list[tuple[str, str]]:
         rows: list[tuple[str, str]] = []
+        if "selected_model" not in omit:
+            rows.extend(self._selected_model_details())
+        if self.page == "account_confirm":
+            rows.extend(
+                [
+                    (
+                        "Switch account"
+                        if self.account_change_action == "account_switch"
+                        else "Sign out",
+                        "title",
+                    ),
+                    (
+                        "Remove only the local Colab CLI OAuth cache. No Google browser sign-out or authorization revocation.",
+                        "normal",
+                    ),
+                    (
+                        "Existing VMs, local SSH and Drive data are retained. Their running resources are not released.",
+                        "warn",
+                    ),
+                    (
+                        "Choose another account on Google's sign-in page."
+                        if self.account_change_action == "account_switch"
+                        else "You can sign in again later from Colab login.",
+                        "info",
+                    ),
+                    ("", "normal"),
+                ]
+            )
+        if self.detached_runtime_notice:
+            rows.extend([(self.detached_runtime_notice, "warn"), ("", "normal")])
         if self.page == "model_add_confirm" and "model_add" not in omit:
             rows.extend(
                 (
@@ -1607,7 +1781,7 @@ class Wizard:
             or (
                 self.page == "input"
                 and self.input_field == "auth_code"
-                and self.last_operation == "account_login"
+                and self.last_operation in LOGIN_ACTIONS
             )
         ):
             state = str(self.account.get("state", "unknown"))
@@ -1713,7 +1887,7 @@ class Wizard:
                     ("Selected configuration", "accent"),
                     (
                         "Runtime: " + (self.config.session or "Not created yet"),
-                        "normal",
+                        "field",
                     ),
                     (
                         "Compute: "
@@ -1722,7 +1896,7 @@ class Wizard:
                             if self.config.cpu
                             else getattr(self.config, "gpu", "G4") + " · H3 video"
                         ),
-                        "normal",
+                        "field",
                     ),
                     (
                         "Storage: "
@@ -1731,31 +1905,31 @@ class Wizard:
                             if self.config.ephemeral
                             else "Google Drive"
                         ),
-                        "normal",
+                        "field",
                     ),
                     (
                         "Models: " + pinned_model_summary(self.config.cpu),
-                        "normal",
+                        "field",
                     ),
                     (
                         f"Parallel downloads: {self.config.download_workers} · Drive copy: 1",
-                        "normal",
+                        "field",
                     ),
                     (
                         f"Browser: SSH · 127.0.0.1:{self.config.local_port}"
                         if self.config.access == "local-only"
                         else f"Browser access: {self.config.access}",
-                        "normal",
+                        "field",
                     ),
                 ]
             )
             if not self.config.ephemeral:
-                rows.append(("Drive directory: " + self.config.storage_root, "normal"))
+                rows.append(("Drive directory: " + self.config.storage_root, "field"))
             if self.config.access == "local-only":
                 rows.append(
                     (
                         "SSH key: " + str(self.config.identity or DEFAULT_IDENTITY),
-                        "normal",
+                        "field",
                     )
                 )
             if self.config.ephemeral:
@@ -1767,7 +1941,7 @@ class Wizard:
                     (
                         "Runtime: "
                         + (self.config.session or "Awaiting provider confirmation"),
-                        "normal",
+                        "field",
                     )
                 )
             rows.append(("Current step: " + self.stage, "accent"))
@@ -1891,15 +2065,53 @@ class Wizard:
             rows.extend(
                 (("Next / status", "accent"), (self.notice, "normal"), ("", "normal"))
             )
-        if self.page != "pipeline":
+        if self.page in ("ready", "failure", "advanced", "inspect"):
             rows.extend(self._model_rows(width))
         wrapped = []
         for value, role in rows:
-            for line in textwrap.wrap(
-                value, max(8, width), replace_whitespace=True, drop_whitespace=True
-            ) or [""]:
-                wrapped.append((line, role))
+            for index, line in enumerate(
+                textwrap.wrap(
+                    value, max(8, width), replace_whitespace=True, drop_whitespace=True
+                )
+                or [""]
+            ):
+                wrapped.append((line, "normal" if role == "field" and index else role))
         return wrapped
+
+    def _selected_model_details(self) -> list[tuple[str, str]]:
+        if self.page != "models":
+            return []
+        choices = self._choices()
+        if not choices:
+            return []
+        selected = choices[min(self.selected, len(choices) - 1)]
+        if not selected.key.startswith("model:"):
+            return []
+        path = selected.key.removeprefix("model:")
+        item = next((item for item in self.model_entries if item["path"] == path), {})
+        enabled = item.get("auto_download", True)
+        return [
+            ("ABOUT THIS MODEL", "info_heading"),
+            ("Name: " + Path(path).name, "normal"),
+            ("Path: " + path, "normal"),
+            (
+                "Auto-download: "
+                + ("enabled" if enabled else "disabled")
+                + " · "
+                + human_bytes(item.get("size_bytes"))
+                + " · "
+                + Path(item.get("manifest", "manifest")).name,
+                "good" if enabled else "warn",
+            ),
+            ("", "normal"),
+        ]
+
+    @staticmethod
+    def _menu_label(value: str, width: int) -> str:
+        """Leave an explicit truncation marker within the available cell width."""
+        if clip_cells(value, width) == value:
+            return value
+        return clip_cells(value, max(0, width - 3)) + "." * min(3, width)
 
     def _input_default(self) -> str:
         if self.input_field == "model_url":
@@ -1929,6 +2141,21 @@ class Wizard:
         allowed = min(width, total_width - column - (1 if row == height - 1 else 0))
         if allowed <= 0:
             return
+        if role == "field":
+            label, separator, body = value.partition(":")
+            if separator:
+                prefix = label + separator
+                self._write(screen, row, column, prefix, allowed, "comfy")
+                prefix_width = len(prefix)
+                self._write(
+                    screen,
+                    row,
+                    column + prefix_width,
+                    body,
+                    allowed - prefix_width,
+                    "normal",
+                )
+                return
         text = clip_cells(value, allowed)
         if not text:
             # Some real ncurses/Python versions reject addnstr('', 0).
@@ -1961,7 +2188,7 @@ class Wizard:
             rows.append(
                 (
                     f"LOCAL MODELS · {label.lower()} {task.get('status', 'unknown')}",
-                    "accent",
+                    "info_heading",
                 )
             )
             for item in items:
@@ -1978,31 +2205,32 @@ class Wizard:
                     fraction = None
                 bar_width = 8 if width < 85 else 12
                 filled = int(bar_width * fraction) if fraction is not None else 0
-                bar = "[" + "#" * filled + "-" * (bar_width - filled) + "]"
+                full, empty = ("█", "░") if self.theme.unicode else ("#", "-")
+                bar = "[" + full * filled + empty * (bar_width - filled) + "]"
                 percent = f"{fraction * 100:3.0f}%" if fraction is not None else "  ?%"
                 verification = item.get("verification")
                 phase = str(item.get("phase", item.get("status", "queued")))
                 if verification == "verified_receipt_metadata":
-                    phase, role = "receipt reuse", "good"
+                    phase, role = "receipt reuse", "progress_complete"
                 elif verification in ("stream_sha256", "full_sha256"):
-                    phase, role = "SHA verified", "good"
+                    phase, role = "SHA verified", "progress_complete"
                 elif phase in ("failed", "error"):
                     role = "bad"
                 elif fraction == 1:
                     phase, role = "validation pending", "warn"
                 else:
-                    role = "comfy" if fraction else "muted"
+                    role = "title"
                 amount = f"{human_bytes(item.get('done_bytes'))}/{human_bytes(item.get('total_bytes'))}"
                 metrics = f"{bar} {percent} {amount} {phase}"
                 name_width = max(10, width - len(metrics) - 2)
-                name = clip_cells(path.rsplit("/", 1)[-1], name_width)
+                name = self._menu_label(path.rsplit("/", 1)[-1], name_width)
                 rows.append((name.ljust(name_width) + "  " + metrics, role))
         return rows
 
     def _compact_details(self, width: int) -> list[tuple[str, str]]:
         """Prioritize actionable errors, authorization and model progress."""
         rows: list[tuple[str, str]] = []
-        omitted = {"account", "attention", "auth", "url"}
+        omitted = {"account", "attention", "auth", "url", "selected_model"}
         if self.page == "model_add_confirm":
             omitted.update(("model_add", "catalog"))
             rows.extend(
@@ -2033,48 +2261,10 @@ class Wizard:
                 rows.append((str(self.auth["url"]), "normal"))
         if self._url():
             rows.append(("Open ComfyUI: " + (self._url() or ""), "comfy"))
-        if self.page in ("home", "account"):
+        if self.page == "account":
             account = getattr(self, "account", {})
-            state = str(account.get("state", "unknown"))
-            rows.append(
-                (
-                    "COLAB LOGIN · " + state.replace("_", " ").upper(),
-                    "good" if state == "authenticated" else "warn",
-                )
-            )
             rows.append((str(account.get("message", "Login is unverified.")), "normal"))
-        choices = self._choices()
-        if choices and self.page not in (
-            "pipeline",
-            "ready",
-            "failure",
-            "advanced",
-            "inspect",
-            "input",
-        ):
-            selected = choices[min(self.selected, len(choices) - 1)]
-            omitted.add("choice")
-            if self.page == "models" and selected.key.startswith("model:"):
-                path = selected.key.removeprefix("model:")
-                item = next(
-                    (item for item in self.model_entries if item["path"] == path), {}
-                )
-                enabled = item.get("auto_download", True)
-                rows.extend(
-                    (
-                        ("ABOUT THIS MODEL", "info_heading"),
-                        ("Path: " + path, "normal"),
-                        (
-                            "Auto-download: "
-                            + ("enabled" if enabled else "disabled")
-                            + " · "
-                            + human_bytes(item.get("size_bytes"))
-                            + " · "
-                            + Path(item.get("manifest", "manifest")).name,
-                            "good" if enabled else "warn",
-                        ),
-                    )
-                )
+        rows.extend(self._selected_model_details())
         if self.page in ("pipeline", "ready", "failure", "advanced", "inspect"):
             rows.extend(self._compact_model_rows(width))
         wrapped = []
@@ -2084,16 +2274,17 @@ class Wizard:
             )
         details = []
         for value, role in self._details(width, omit=frozenset(omitted)):
-            if not (
-                role == "comfy"
-                and value.startswith("[")
-                and "]" in value
-                and set(value.partition("]")[0][1:]) <= {"#", "-"}
-            ):
+            # Compact rows already carry each meter; retain the full metrics
+            # and paths in paged details without repeating the solid bar.
+            meter, separator, metrics = value.partition("  ")
+            if meter and set(meter) <= {"█", "░", "#", "-"}:
+                if separator:
+                    details.append((metrics, role))
+            else:
                 details.append((value, role))
         if not any(value for value, _ in details):
             return wrapped
-        return wrapped + [("", "normal"), ("DETAILS", "info_heading")] + details
+        return wrapped + [("", "normal")] + details
 
     def _choice_help(self, width: int) -> list[tuple[str, str]]:
         """Keep contextual help separate from scrolling execution evidence."""
@@ -2120,26 +2311,6 @@ class Wizard:
             rows[-1] = (clip_cells(rows[-1][0], max(8, width) - 1) + "…", "info")
         return rows
 
-    def _scroll_hint(
-        self, screen: Any, row: int, width: int, offset: int, count: int, total: int
-    ) -> None:
-        if total > count:
-            above = offset > 0
-            below = offset + count < total
-            previous, following = (
-                ("Ctrl+B", "Ctrl+F") if self.page == "input" else ("←", "→")
-            )
-            hint = (
-                f"{previous} previous / {following} more details"
-                if above and below
-                else (
-                    f"{previous} previous details"
-                    if above
-                    else f"{following} more details"
-                )
-            )
-            self._write(screen, row, 1, hint, width - 2, "info")
-
     def _draw_compact(self, screen: Any) -> None:
         """Keep navigation and six model meters visible on ordinary terminals."""
         height, width = screen.getmaxyx()
@@ -2155,9 +2326,26 @@ class Wizard:
             self._write(screen, 2, 1, self._busy_text(), width - 2, "accent")
         elif self.page in ("pipeline", "inspect", "listing", "model_adding"):
             self._write(screen, 2, 1, "Now: " + stage, width - 2, "accent")
+        elif self.page in ("home", "account", "account_confirm"):
+            state = self.account.get("state", "unknown")
+            if self.page != "home" or state != "authenticated":
+                label = {
+                    "authenticated": "signed in",
+                    "not_authenticated": "signed out · sign in to continue",
+                    "checking": "checking login",
+                    "unavailable": "login unverified · check failed",
+                }.get(state, "login unverified")
+                self._write(
+                    screen,
+                    2,
+                    1,
+                    "Colab · " + label,
+                    width - 2,
+                    "comfy" if state == "authenticated" else "warn",
+                )
         self._write(screen, 3, 1, "STARTUP FLOW", content_width, "accent")
         row, column = 4, 2
-        labels = ("VM", "Compute", "Disk", "Drive", "Env", "Models", "SSH")
+        labels = ("Colab", "VM", "Compute", "Disk", "Drive", "Env", "Models", "SSH")
         for index, ((key, _), label) in enumerate(zip(STEPS, labels)):
             marker, role = self._step_style(key)
             value = marker + " " + label
@@ -2219,7 +2407,7 @@ class Wizard:
                     choice_top + 1 + index - offset,
                     2,
                     ("> " if self.selected == index and enabled else "  ")
-                    + choice.label,
+                    + self._menu_label(choice.label, content_width - 2),
                     content_width,
                     "muted"
                     if not enabled
@@ -2228,16 +2416,17 @@ class Wizard:
             detail_top = choice_top + 2 + available
         rows = self._compact_details(content_width)
         count = max(1, body_bottom - detail_top)
+        self.details_overflow = len(rows) > count
         self.detail_page_size = max(1, count - 1)
         offset = min(self.detail_offset, max(0, len(rows) - count))
         self.detail_offset = offset
         for row, (value, role) in enumerate(rows[offset : offset + count], detail_top):
             self._write(screen, row, 2, value, content_width, role)
-        self._scroll_hint(screen, body_bottom, width, offset, count, len(rows))
 
     def _draw(self, screen: Any) -> None:
         """Compose a whole frame before a single terminal update."""
         height, width = screen.getmaxyx()
+        self.details_overflow = False
         help_rows = self._footer_help(width - 2) if height >= 24 and width >= 50 else []
         screen.erase()
         self._write(
@@ -2313,7 +2502,7 @@ class Wizard:
                     left - 3,
                     "muted",
                 )
-            choice_top = 14 if split else 9
+            choice_top = len(STEPS) + 8 if split else 9
             self._write(
                 screen, choice_top - 1, 1, "CHOOSE / CONFIRM", left - 2, "accent"
             )
@@ -2355,7 +2544,7 @@ class Wizard:
                         choice_top + index - offset,
                         2,
                         ("> " if self.selected == index and enabled else "  ")
-                        + choice.label,
+                        + self._menu_label(choice.label, left - 5),
                         left - 3,
                         "muted"
                         if not enabled
@@ -2369,6 +2558,7 @@ class Wizard:
                 detail_top, detail_column, detail_width = 15, 2, width - 4
             rows = self._details(detail_width)
             count = max(1, body_bottom - detail_top)
+            self.details_overflow = len(rows) > count
             self.detail_page_size = max(1, count - 1)
             offset = min(self.detail_offset, max(0, len(rows) - count))
             self.detail_offset = offset
@@ -2376,16 +2566,22 @@ class Wizard:
                 rows[offset : offset + count], detail_top
             ):
                 self._write(screen, row, detail_column, value, detail_width, role)
-            self._scroll_hint(screen, body_bottom, width, offset, count, len(rows))
         for row, (value, role) in enumerate(help_rows, height - 2 - len(help_rows)):
             self._write(screen, row, 1, value, width - 2, role)
+        keyboard_hint = (
+            "Enter submit  Esc cancel"
+            if self.page == "input"
+            else "↑/↓ choose  Enter confirm  Esc back"
+        )
+        if self.details_overflow:
+            keyboard_hint += (
+                "  Ctrl+B/F details" if self.page == "input" else "  ←/→ details"
+            )
         self._write(
             screen,
             height - 2,
             1,
-            "Enter submit  Esc cancel  Ctrl+B/F details"
-            if self.page == "input"
-            else "↑/↓ choose  Enter confirm  Esc back  ←/→ details",
+            keyboard_hint,
             width - 2,
             "muted",
         )

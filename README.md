@@ -33,20 +33,25 @@ colab --auth=oauth2 sessions
 
 ## 终端界面
 
-默认是逐步启动向导，采用 ComfyUI `#F2FF59`、Colab `#E77012` / `#F9AA00` 配色。**↑/↓ 选择，Enter 确认，←/→ 翻看详情**；移动选中项不会执行操作。可回退页面统一选择 **Back**，Esc 也可返回或取消输入。Ctrl+B / Ctrl+F 和 PgUp / PgDn 仍兼容，但主要界面提示使用左右键。输入页的左右键不会滚动详情，可用 **Ctrl+B / Ctrl+F** 翻看详情，**Enter** 提交；字段为空时显示默认值，开始输入后提示消失，普通输入使用高对比文字。
+默认是逐步启动向导，采用 ComfyUI `#F2FF59`、Colab `#E77012` / `#F9AA00` 配色。**↑/↓ 选择，Enter 确认**；移动选中项不会执行操作。可回退页面统一选择 **Back**，Esc 也可返回或取消输入。输入字段为空时显示默认值，开始输入后提示消失，普通输入使用高对比文字。详情可翻页：只有超出可见区域时，底部键盘行才提示 **←/→ details**；输入页提示 **Ctrl+B/F**，左右键仍用于输入。界面不显示 Details 行号计数，也不再额外添加正文 DETAILS 标题。
 
-窗口不足 110 列或 32 行时采用紧凑布局：**STARTUP FLOW** 下用箭头连接步骤，步骤与操作区之间留出空行，优先展示当前阶段和逐模型进度；50×24 起可用，完整详情仍可翻页。足够大的窗口保留双栏。选中项的 **ABOUT THIS CHOICE** 说明固定在底部蓝色区域，翻看详情时仍可见；只有详情超出可见区域时才显示翻页提示，不显示详情行号计数。两种布局共用步骤状态：`+` 表示已验证，使用黄绿色；`>` 表示当前步骤，使用橙色；`-` 表示跳过，使用灰色。登录状态、操作说明、提示与模型来源各显示一次。GPU 的 `project-tested H3 profile` / `H3 profile untested` 表示项目记录的测试覆盖，不会因为一次启动成功自动改变。
+窗口不足 110 列或 32 行时采用紧凑布局：**STARTUP FLOW** 从 **Colab** 登录节点开始，随后是 VM、Compute、Disk、Drive、Env、Models、SSH；箭头连接步骤，步骤与操作区之间留出空行，优先展示当前阶段和逐模型进度，50×24 起可用。足够大的窗口保留双栏。选中项的 **ABOUT THIS CHOICE** 说明固定在底部蓝色区域。两种布局共用步骤状态：`+` 表示已完成，使用 `#F2FF59`；`>` 表示当前步骤，使用 `#E77012`；待办和跳过项使用灰色。配置阶段确认过的计算与存储选择也会标记完成；这不表示 VM 已分配、模型已准备或服务已就绪，后续操作仍须实际验证。配置的 Runtime、Compute 等字段名使用 `#F2FF59`，值使用白色。小窗首页已核实的登录只由 Colab 节点表示，不再重复两行成功说明；未核实或异常的简短状态放在顶部，账号页保留完整状态与授权提示。GPU 的 `project-tested H3 profile` / `H3 profile untested` 表示项目记录的测试覆盖，不会因为一次启动成功自动改变。
 
 首次使用：
 
-启动先显示 Colab 登录状态并执行只读检查；首页只保留一个 **Colab login** 入口。进入后，已验证登录的账号显示 **Recheck login** 和 **Back**；未验证时显示 **Check login status**、**Sign in** 和 **Back**。Check / Recheck 只查询会话，不启动授权或创建实例；Sign in 先检查已有登录，仅在需要时引导提供方浏览器授权。登录确认后才进入实例流程。网络失败显示未核实，不当作退出登录。首页也能直接打开 **Manage models**，不需要先分配 VM。
+首页第一项是 **Colab login**，最后一项是 **Exit and keep resources**。启动先执行只读登录检查，登录确认后才进入实例流程。账号页可 **Check login status / Recheck login**、未登录时 **Sign in**、**Switch account**、**Sign out** 或 **Back**。Check / Recheck 只查询会话，不启动授权或创建实例；Sign in 先检查已有登录，仅在需要时引导提供方浏览器授权。网络失败显示未核实，不当作退出登录。首页也能直接打开 **Manage models**，不需要先登录或分配 VM。
 
-1. 选择 **Create a new runtime**，选择 GPU 或 CPU；GPU 再选择型号。G4 是本项目已测型号，其余型号的 H3 兼容性未验证。
-2. 选择 **Google Drive** 或 **VM disk**。前者长期缓存模型和保存输出；后者跳过挂载，直接下载到 VM，释放后不保留模型与输出。
-3. 检查配置摘要，再确认创建。首次缺少专用 SSH key 时，明确选择创建或填写已有 key 路径；不会覆盖已有 key。
-4. 若官方 CLI 登录或 Drive 挂载要求授权，右侧显示本轮链接和操作提示，选择 **Open authorization in browser**。按提供方要求完成后，选择 **I have authorized · continue**；若官方 CLI 要求 code，在屏内遮罩输入。官方交互运行在真正拥有控制终端的子 PTY，不切走 TUI；实际挂载和 MyDrive 检查通过才继续。授权链接和 code 只在本轮显示，不保存授权画面或原始交互日志。
-5. 自动部署、安装、准备 GPU 模型并启动 ComfyUI。右侧显示每个文件的下载、复制或校验进度；CPU 跳过 H3。下载和复制同步计算 SHA256，已有同 VM 验证记录复用会明确标注没有新计算 SHA。
-6. 自动建立 SSH 转发并验证本机 HTTP；出现 **ComfyUI is ready** 后选择 **Open ComfyUI in browser**。
+**Switch account** 和 **Sign out** 都先显示独立确认页，默认选择 **Cancel**。官方 Colab CLI 0.7.4 没有 logout 命令；这里的退出仅清除本机 CLI 专用的 `~/.config/colab-cli/token.json` 缓存，不读取 token、不撤销 Google 授权，也不登出浏览器。CLI 版本不匹配或缓存路径是符号链接等异常情况会拒绝清除。Switch account 在清除后重新进入提供方登录；请在 Google 页面选择要使用的账号，浏览器已有登录可能仍默认原账号。只读会话查询验证 CLI 可用，但不返回邮箱，不能用它证明具体登录了哪个邮箱。
+
+成功退出后，界面丢弃旧账号的实例列表、已选 VM 和 SSH 就绪信息，需在新账号下重新查询；实际 VM、服务和本机 SSH 不会因此停止，原账号的计算费用仍可能继续。要释放原账号的实例，应在退出前明确结束该实例，或重新登录原账号后查询并处理。
+
+1. 先核实 **Colab login**。已有登录通过只读检查即可；未登录时选择 **Sign in**，按提供方要求在浏览器完成授权。
+2. 选择 **Create a new runtime**，选择 GPU 或 CPU；GPU 再选择型号。G4 是本项目已测型号，其余型号的 H3 兼容性未验证。
+3. 选择 **Google Drive** 或 **VM disk**。前者长期缓存模型和保存输出；后者跳过挂载，直接下载到 VM，释放后不保留模型与输出。
+4. 检查配置摘要，再确认创建。首次缺少专用 SSH key 时，明确选择创建或填写已有 key 路径；不会覆盖已有 key。
+5. 若官方 CLI 登录或 Drive 挂载要求授权，右侧显示本轮链接和操作提示，选择 **Open authorization in browser**。按提供方要求完成后，选择 **I have authorized · continue**；若官方 CLI 要求 code，在屏内遮罩输入。官方交互运行在真正拥有控制终端的子 PTY，不切走 TUI；实际挂载和 MyDrive 检查通过才继续。授权链接和 code 只在本轮显示，不保存授权画面或原始交互日志。
+6. 自动部署、安装、准备 GPU 模型并启动 ComfyUI。右侧显示每个文件的下载、复制或校验进度，保留实心块 + 浅纹理进度条：进行中橙色，明确验证或 receipt 复用后变绿；100% 但未完成验证仍显示等待校验；CPU 跳过 H3。下载和复制同步计算 SHA256，已有同 VM 验证记录复用会明确标注没有新计算 SHA。
+7. 自动建立 SSH 转发并验证本机 HTTP；出现 **ComfyUI is ready** 后选择 **Open ComfyUI in browser**。
 
 **View existing runtimes** 会先核对真实状态、恢复已有配置，再显示概览或继续缺少的步骤。查询期间显示不可执行的 **Loading...** 和可用的 **Back**；Back 返回，保留已有实例与任务。不会因为 CLI 超时自动重复新建。配置未知时重新选择存储；已有运行服务的存储和访问模式不能直接覆盖。更改已运行 SSH 的端口或 key 前，先到 Advanced actions 停止旧转发。
 
@@ -95,7 +100,7 @@ Demo 是只读 fixture，可预览导航、输入与进度，不作为云端成�
 
 浏览器测试使用 **Templates → Popular → MiniMax H3: Image to Video**；仓库保存了完全一致的 [UI 模板](workflows/h3-i2v-ui.json)。模板来源、输入图片、参数和测试方式见 [I2V 说明](docs/h3-i2v.md)。原 T2V API 工作流仍保留为 `workflows/h3-api.json`。
 
-首页、启动摘要或 **Advanced actions → Manage models** 都可查看和编辑清单。六个内置模型默认为 `[✓]`；选中模型按 Enter 切换 `[✓]` 自动准备 / `[×]` 跳过，并立即保存到清单的 `auto_download` 字段。添加模型时粘贴公共 Hugging Face 文件网址，选择目录类别，再 Enter 确认；启动器读取公开元数据，固定 commit、文件大小与 SHA256，保存到 `models/extra-added-*.json`，此时不下载权重。下次启动或 **Prepare / refresh models** 自动使用保存的选择。取消勾选保留已下载文件，停用必需模型可能使工作流提示 Missing Models。
+首页、启动摘要或 **Advanced actions → Manage models** 都可查看和编辑清单。六个内置模型默认为 `[✓]`；菜单中的长模型名保留前缀并以 `...` 缩略，右侧详情（小窗为菜单下方）显示完整 **Name** 与 **Path**。详情超出屏幕时按底部键盘行提示翻页。选中模型按 Enter 切换 `[✓]` 自动准备 / `[×]` 跳过，并立即保存到清单的 `auto_download` 字段。添加模型时粘贴公共 Hugging Face 文件网址，选择目录类别，再 Enter 确认；启动器读取公开元数据，固定 commit、文件大小与 SHA256，保存到 `models/extra-added-*.json`，此时不下载权重。下次启动或 **Prepare / refresh models** 自动使用保存的选择。取消勾选保留已下载文件，停用必需模型可能使工作流提示 Missing Models。
 
 仍可手工编辑 [models/extra.json](models/extra.json)，不同仓库各用 `models/extra-名称.json`。缺少公开 SHA256 或需要认证的文件，使用独立核实的固定清单；TUI 不收集 Hugging Face token。详见 [追加模型说明](docs/models.md)。下载权重不会自动安装它所需的自定义节点。
 
