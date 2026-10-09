@@ -318,11 +318,6 @@ class Wizard:
         if self.page == "home":
             return [
                 Choice(
-                    "account",
-                    "Colab login",
-                    "Check login, sign in, switch accounts or sign out. No VM is created.",
-                ),
-                Choice(
                     "new",
                     "Create a new runtime",
                     "Choose compute and storage before creation.",
@@ -336,6 +331,11 @@ class Wizard:
                     "models",
                     "Manage models",
                     "Add model files and save which models are automatically prepared. No runtime is required.",
+                ),
+                Choice(
+                    "account",
+                    "Manage Colab account",
+                    "Check login, sign in, switch accounts or sign out. No VM is created.",
                 ),
                 Choice(
                     "quit",
@@ -1534,7 +1534,7 @@ class Wizard:
     def _title(self) -> str:
         return {
             "home": "Start a ComfyUI session",
-            "account": "Colab account login · no runtime allocation",
+            "account": "Manage Colab account",
             "account_confirm": "Confirm Colab account change",
             "hardware": "Choose compute",
             "gpu": "Choose GPU model",
@@ -1755,7 +1755,7 @@ class Wizard:
                     (
                         "Choose another account on Google's sign-in page."
                         if self.account_change_action == "account_switch"
-                        else "You can sign in again later from Colab login.",
+                        else "You can sign in again later from Manage Colab account.",
                         "info",
                     ),
                     ("", "normal"),

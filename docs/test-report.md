@@ -1,5 +1,13 @@
 # 实测记录
 
+## 2026-10-09 创建入口优先与 Colab 账号管理
+
+首页恢复 **Create a new runtime** 为第一项，账号入口改为 **Manage Colab account**，放在 **Exit and keep resources** 前。账号页标题与未登录、退出后的入口提示同步使用新名称。账号管理仍提供登录状态检查、登录、切换账号与退出。
+
+保留既有登录前置流程：未登录时直接选择新建会进入账号页，用户选择 **Sign in** 并通过验证后继续新建配置，无需先单独打开账号管理。既有认证回归验证这一跳转及登录后回到硬件选择，且未提前创建 VM。
+
+625 项 unittest 全部通过，bootstrap shell 语法与 diff 检查通过。另用真实本机 PTY 运行生产文字界面，以拒绝非只读请求的本机 CLI fixture 核实首页顺序、选择新建进入账号页、Back 返回及正常退出。本轮没有登录真实 Google 账号、创建或操作 Colab 实例，fixture 与离线测试不作为云端验收证据。
+
 ## 2026-10-08 登录首步、账号切换与完整模型详情
 
 首页将 Colab login 放在首项，流程栏加入 Colab 节点；小窗已登录首页只通过节点表示完成，不重复账号成功标题及正文。已确认的计算与存储选择使用 `#F2FF59`，当前步骤使用 `#E77012`，但确认配置不等于证明 VM 已分配或模型已就绪。配置摘要的 Runtime、Compute、Storage、Models、Parallel downloads、Browser、Drive directory 和 SSH key 字段名黄绿，具体值白色；值换行后的冒号不会被误当作另一个字段名。

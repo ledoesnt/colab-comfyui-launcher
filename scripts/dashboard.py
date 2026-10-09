@@ -436,7 +436,7 @@ class Backend:
             return {
                 "state": "not_authenticated",
                 "reason": "login_required",
-                "message": "Colab login is required. Choose Sign in from Colab login; no runtime has been created.",
+                "message": "Colab login is required. Choose Sign in from Manage Colab account; no runtime has been created.",
             }
         listed = "No active sessions found on server." in output or re.search(
             r"(?m)^\[[^\]\s]+\].+\|\s*Hardware:\s*[^|\n]+", output

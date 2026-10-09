@@ -66,12 +66,12 @@ class NavigationTests(unittest.TestCase):
         self.worker.busy = False
         self.emit("done", action)
 
-    def test_home_has_one_login_entry_without_check_or_sign_in_commands(self):
+    def test_home_has_one_account_management_entry_without_direct_login_commands(self):
         choices = self.ui._choices()
         entries = [choice for choice in choices if choice.key.startswith("account")]
         self.assertEqual(
             [(choice.key, choice.label) for choice in entries],
-            [("account", "Colab login")],
+            [("account", "Manage Colab account")],
         )
         self.choose("account")
         self.assertEqual(self.ui.page, "account")

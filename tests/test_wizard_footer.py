@@ -129,7 +129,9 @@ class FooterTests(unittest.TestCase):
     def test_plain_snapshot_keeps_help_once_after_menu(self):
         text = self.ui.snapshot()
         self.assertEqual(text.count("ABOUT THIS CHOICE"), 1)
-        self.assertLess(text.index("Colab login"), text.index("ABOUT THIS CHOICE"))
+        self.assertLess(
+            text.index("Manage Colab account"), text.index("ABOUT THIS CHOICE")
+        )
         self.assertNotIn(
             "ABOUT THIS CHOICE", "\n".join(value for value, _ in self.ui._details(80))
         )

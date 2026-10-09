@@ -1,12 +1,13 @@
 # 启动向导与恢复流程
 
-在仓库根目录运行 `python3 scripts/dashboard.py`。↑/↓ 选择，Enter 确认；可回退页面统一选择 **Back**，Esc 也可返回或取消输入。先核实 Colab 登录，真正创建前再查看摘要。详情超出可见区域时，底部键盘行提示 **←/→ details**；输入页提示 **Ctrl+B/F**，不改变输入内容或提交表单。不显示 Details 行号计数或额外的正文 DETAILS 标题。主流程默认使用 SSH 本机访问，无需进入 `colab console`。
+在仓库根目录运行 `python3 scripts/dashboard.py`。↑/↓ 选择，Enter 确认；可回退页面统一选择 **Back**，Esc 也可返回或取消输入。直接选择新建或已有实例，向导会先核实 Colab 登录；未登录时进入账号页，验证后继续原流程，真正创建前再查看摘要。详情超出可见区域时，底部键盘行提示 **←/→ details**；输入页提示 **Ctrl+B/F**，不改变输入内容或提交表单。不显示 Details 行号计数或额外的正文 DETAILS 标题。主流程默认使用 SSH 本机访问，无需进入 `colab console`。
 
 ```mermaid
 flowchart TD
-    A[启动向导 Colab 首节点] --> AUTH{Colab 只读登录检查}
-    AUTH -->|已验证| B{新建或已有实例}
-    A --> ACCOUNT[首页第一项 Colab login]
+    A[启动向导 Colab 首节点] --> SELECT{首页选择实例流程}
+    SELECT -->|Create a new runtime 第一项<br/>或 View existing runtimes| AUTH{Colab 只读登录检查}
+    AUTH -->|已验证| B{继续所选实例流程}
+    A --> ACCOUNT[Manage Colab account 倒数第二项]
     AUTH -->|未登录或未核实| ACCOUNT
     ACCOUNT --> CHECK[Check login status 或 Recheck login<br/>只读查询 不发起授权]
     CHECK --> AUTH
@@ -54,7 +55,7 @@ flowchart TD
     J --> Y
 ```
 
-首页第一项是 **Colab login**，最后一项是 **Exit and keep resources**。流程先核实 Colab 登录，再选择新建或已有实例。首页自动执行只读检查；账号页可选择 **Check login status / Recheck login**、未登录时 **Sign in**、**Switch account**、**Sign out** 与 **Back**。Check / Recheck 只查询会话，不发起交互授权或分配实例；Sign in 先检查已有登录，仅在需要时进入浏览器授权。网络错误显示未核实，不表示已退出登录。创建前再次核实登录。**Manage models** 可独立使用，不需要账号或 VM。
+首页第一项是 **Create a new runtime**，倒数第二项是 **Manage Colab account**，最后一项是 **Exit and keep resources**。首页自动执行只读检查；直接选择新建或已有实例时，未登录或未核实会进入账号页，登录验证成功后继续原流程。账号管理页可选择 **Check login status / Recheck login**、未登录时 **Sign in**、**Switch account**、**Sign out** 与 **Back**。Check / Recheck 只查询会话，不发起交互授权或分配实例；Sign in 先检查已有登录，仅在需要时进入浏览器授权。网络错误显示未核实，不表示已退出登录。创建前再次核实登录。**Manage models** 可独立使用，不需要账号或 VM。
 
 切换或退出账号先进入独立确认页，默认选中 **Cancel**。官方 Colab CLI 0.7.4 不提供 logout；本功能只清除本机 CLI 的 `~/.config/colab-cli/token.json` 专用缓存，不读取 token、不撤销 Google 授权，也不退出浏览器登录。版本不匹配或符号链接等异常路径会拒绝操作。Switch account 清除后进入提供方登录，在 Google 页面选择其他账号；浏览器仍可能默认原账号。只读会话请求不提供邮箱，成功只能证明 CLI 登录可用，不能证明已换成某个邮箱。
 

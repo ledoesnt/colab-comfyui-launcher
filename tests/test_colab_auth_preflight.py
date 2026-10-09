@@ -338,7 +338,7 @@ class AccountPTYTests(unittest.TestCase):
         ui.status = {"http_ready": True}
         ui.ssh = {"running": True}
         (self.directory / "mode").write_text("delayed_verified")
-        ui._activate(wizard.Choice("account", "Colab login"))
+        ui._activate(wizard.Choice("account", "Manage Colab account"))
         ui._activate(wizard.Choice("account_check", "Recheck login"))
         pump_until(lambda: (self.directory / "entered").exists())
         self.assertTrue(self.worker.busy)

@@ -98,12 +98,15 @@ class AccountSwitchUITests(unittest.TestCase):
         self.assertIn(original.session, self.ui.detached_runtime_notice)
         self.assertIn("was not stopped", self.ui.detached_runtime_notice)
 
-    def test_home_places_single_account_entry_before_runtime_choices(self):
+    def test_home_prioritizes_creation_and_places_account_before_exit(self):
         choices = self.ui._choices()
-        self.assertEqual(choices[0].key, "account")
-        self.assertEqual(choices[0].label, "Colab login")
-        self.assertEqual(choices[1].key, "new")
-        self.assertEqual(choices[2].key, "existing")
+        self.assertEqual(choices[0].key, "new")
+        self.assertEqual(choices[0].label, "Create a new runtime")
+        self.assertEqual(choices[1].key, "existing")
+        self.assertEqual(choices[-2].key, "account")
+        self.assertEqual(choices[-2].label, "Manage Colab account")
+        self.assertEqual(choices[-1].key, "quit")
+        self.assertEqual(choices[-1].label, "Exit and keep resources")
         self.assertEqual(sum(choice.key.startswith("account") for choice in choices), 1)
         self.choose("account")
         self.assertEqual(self.ui.page, "account")
