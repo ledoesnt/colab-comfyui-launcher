@@ -10,6 +10,7 @@ import argparse
 import curses
 import importlib.util
 import json
+import math
 import os
 import queue
 import re
@@ -453,6 +454,33 @@ class Backend:
             "message": "Colab login could not be verified. Check the network and CLI, then retry; this does not mean you are signed out.",
         }
 
+    def account_usage(self) -> dict[str, Any]:
+        """Read the official CLI's account balance without interactive login."""
+        unavailable = {"ok": False}
+        try:
+            result = self.run(
+                ["colab", "--auth=oauth2", "usage"],
+                text=True,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=15,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return unavailable
+        if result.returncode:
+            return unavailable
+        output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout or "")
+        balance = re.search(
+            r"(?m)^Current balance: (\d+(?:\.\d+)?) compute units\s*$", output
+        )
+        rate = re.search(r"(?m)^Usage rate: (\d+(?:\.\d+)?)/hr\s*$", output)
+        if not balance or not rate:
+            return unavailable
+        balance_value, rate_value = float(balance[1]), float(rate[1])
+        if not all(math.isfinite(value) for value in (balance_value, rate_value)):
+            return unavailable
+        return {"ok": True, "balance": balance_value, "rate_hourly": rate_value}
+
     @staticmethod
     def account_terminal(
         _config: Config, on_event: Callable[[dict[str, Any]], None]
@@ -622,7 +650,10 @@ class Worker:
                         return False
                     config = self.active_config
                     self.operation_cancelled.set()
-                elif self.active_action != "status" or action == "status":
+                elif self.active_action not in ("status", "usage") or action in (
+                    "status",
+                    "usage",
+                ):
                     return False
             self.busy = True
             if action in ACCOUNT_ACTIONS:
@@ -1214,7 +1245,8 @@ class Worker:
                     self.operation_cancelled.set()
             try:
                 self._check_cancelled()
-                self.events.put(("stage", action))
+                if action != "usage":
+                    self.events.put(("stage", action))
                 if action in (
                     "wizard_create",
                     "wizard_resume",
@@ -1228,6 +1260,13 @@ class Worker:
                     self._check_cancelled()
                 if action == "account_status":
                     self._check_account()
+                elif action == "usage":
+                    # Balance failures must not interrupt startup.
+                    try:
+                        usage = self.backend.account_usage()
+                    except Exception:  # noqa: BLE001
+                        usage = {"ok": False}
+                    self.events.put(("usage", usage))
                 elif action == "account_login":
                     self._authorize_account(config)
                 elif action == "account_logout":

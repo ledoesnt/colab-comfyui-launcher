@@ -158,8 +158,10 @@ class WizardTests(unittest.TestCase):
             [choice.key for choice in self.ui._choices()],
             list(wizard.GPU_CHOICES) + ["back"],
         )
-        self.assertIn("tested", self.ui._choices()[0].label)
-        self.assertIn("H3 profile untested", self.ui._choices()[1].label)
+        self.assertEqual(
+            [choice.label for choice in self.ui._choices()],
+            list(wizard.GPU_CHOICES) + ["Back"],
+        )
         self.choose("L4")
         self.choose("ephemeral")
         with mock.patch.object(Path, "is_file", return_value=True):
@@ -459,6 +461,26 @@ class WizardTests(unittest.TestCase):
         )
         self.assertEqual(self.ui.page, "pipeline")
         self.assertIn("auth_open", [choice.key for choice in self.ui._choices()])
+        for page in ("account", "pipeline"):
+            self.ui.page = page
+            for width in (50, 80, 120):
+                for rows in (
+                    self.ui._details(width),
+                    self.ui._compact_details(width),
+                ):
+                    text = "\n".join(value for value, _role in rows)
+                    self.assertNotIn(self.ui.auth["url"], text)
+                    self.assertNotIn("accounts.example.test", text)
+                    self.assertIn("Open authorization in browser", text)
+            self.assertNotIn(self.ui.auth["url"], self.ui._plain_snapshot())
+            with mock.patch.object(
+                wizard.webbrowser, "open", return_value=True
+            ) as browser:
+                self.choose("auth_open")
+            browser.assert_called_once_with(self.ui.auth["url"])
+        with mock.patch.object(wizard.webbrowser, "open", return_value=False):
+            self.choose("auth_open")
+        self.assertIn("Check your default browser", self.ui.notice)
         self.assertEqual(self.worker.responses, [])
         self.choose("auth_continue")
         self.assertEqual(self.worker.responses, [""])
@@ -797,6 +819,7 @@ finally:
     def test_overviews_refresh_known_runtime_without_restarting_services(self):
         self.ui.config.session = "selected"
         self.ui.observe_runtime = True
+        self.ui.last_usage_attempt = 42
         for page in ("summary", "advanced", "ready"):
             with self.subTest(page=page):
                 self.ui._page(page)
@@ -811,6 +834,7 @@ finally:
 
     def test_unknown_configuration_and_busy_list_never_poll_or_promote_ready(self):
         self.ui.config.session = "selected"
+        self.ui.last_usage_attempt = time.monotonic()
         self.ready_status()
         for page in ("summary", "advanced", "storage", "listing", "failure"):
             with self.subTest(page=page):
@@ -878,6 +902,7 @@ finally:
         self.assertEqual(self.ui.page, "summary")
 
     def test_run_shortens_escape_delay_and_preserves_arrow_navigation(self):
+        self.ui.last_usage_attempt = time.monotonic()
         screen = Frame()
         screen.timeout = mock.Mock()
         quit_index = [choice.key for choice in self.ui._choices()].index("quit")

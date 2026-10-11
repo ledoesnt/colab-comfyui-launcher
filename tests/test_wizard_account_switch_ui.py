@@ -392,7 +392,7 @@ class AccountSwitchUITests(unittest.TestCase):
         self.assert_detached(original)
         self.ui._refresh()
         self.assertEqual(
-            [item[0] for item in self.worker.submitted], ["account_switch"]
+            [item[0] for item in self.worker.submitted], ["account_switch", "usage"]
         )
 
     def test_explicit_new_account_listing_and_inspection_restore_verified_context(self):

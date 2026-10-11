@@ -349,6 +349,7 @@ class CompactWizardTests(unittest.TestCase):
         self.assertEqual(self.worker.submitted, [])
 
     def test_resize_repaints_without_submitting_or_changing_selection(self):
+        self.ui.last_usage_attempt = wizard.time.monotonic()
         self.ui.page = "home"
         quit_index = next(
             i for i, choice in enumerate(self.ui._choices()) if choice.key == "quit"

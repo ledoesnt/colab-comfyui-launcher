@@ -489,7 +489,7 @@ class AccountNavigationTests(unittest.TestCase):
         self.assertEqual(self.ui.page, "models")
         self.assertEqual(self.worker.submitted, [])
 
-    def test_authorization_url_stays_in_details_and_code_requires_masked_enter(self):
+    def test_authorization_url_is_hidden_and_code_requires_masked_enter(self):
         self.choose("account_login")
         address = "https://accounts.google.com/o/oauth2/auth?state=fixture-only"
         self.worker.events.put(
@@ -497,7 +497,10 @@ class AccountNavigationTests(unittest.TestCase):
         )
         self.ui._events()
         self.assertEqual(self.ui.page, "account")
-        self.assertIn(address, "\n".join(row[0] for row in self.ui._details(90)))
+        self.assertNotIn(address, "\n".join(row[0] for row in self.ui._details(90)))
+        with mock.patch.object(wizard.webbrowser, "open", return_value=True) as browser:
+            self.choose("auth_open")
+        browser.assert_called_once_with(address)
         self.choose("auth_code")
         for character in "fixture-accepted":
             self.ui._key(character)

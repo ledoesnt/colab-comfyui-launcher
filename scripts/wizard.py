@@ -39,6 +39,7 @@ from dashboard import (
 )
 
 GPU_CHOICES = ("G4", "H100", "A100", "L4", "T4")
+USAGE_REFRESH_SECONDS = 300.0
 ACCOUNT_ACTIONS = (
     "account_status",
     "account_login",
@@ -92,6 +93,10 @@ class Wizard:
         self.model_registration_notice = ""
         self.updated = 0.0
         self.last_refresh = 0.0
+        self.usage: dict[str, Any] = {}
+        self.usage_updated = 0.0
+        self.last_usage_attempt: float | None = None
+        self.usage_failed = False
         self.resume = False
         self.auth: dict[str, Any] = {}
         self.account: dict[str, Any] = {
@@ -446,7 +451,7 @@ class Wizard:
                 Choice(
                     "gpu",
                     "GPU · render video",
-                    "Next: choose a GPU model. G4 has been tested.",
+                    "Next: choose a GPU model.",
                 ),
                 Choice(
                     "cpu",
@@ -459,13 +464,8 @@ class Wizard:
             return [
                 Choice(
                     gpu,
-                    gpu
-                    + (
-                        " · project-tested H3 profile"
-                        if gpu == "G4"
-                        else " · H3 profile untested"
-                    ),
-                    "Project test coverage is a fixed label, not this runtime's status. Starting a GPU does not prove H3 rendering compatibility. Allocation depends on your account.",
+                    gpu,
+                    "Allocation depends on your account.",
                 )
                 for gpu in GPU_CHOICES
             ] + [Choice("back", "Back")]
@@ -775,7 +775,11 @@ class Wizard:
             self.notice = "Offline demo: no browser is opened."
             return
         if not webbrowser.open(address):
-            self.notice = "The browser did not accept the address. Open the displayed URL manually."
+            self.notice = (
+                "The browser did not accept the address. Check your default browser and choose Open authorization in browser again."
+                if address == self.auth.get("url")
+                else "The browser did not accept the address. Open the displayed URL manually."
+            )
 
     def _input(self, field: str, return_page: str) -> None:
         self.input_field, self.input_return = field, return_page
@@ -1368,15 +1372,24 @@ class Wizard:
                     self.stage = str(value)
             elif kind == "account":
                 self.account = dict(value)
+                if value.get("state") != "authenticated":
+                    self._clear_usage()
                 if not self.account_dismissed and self.page in ("home", "account"):
                     self.notice = str(
                         value.get("message", "Colab login is unverified.")
                     )
             elif kind in ("account_signed_out", "account_invalidated"):
                 self.account = dict(value)
+                self._clear_usage()
                 self.auth.clear()
                 self.input_value = ""
                 self._detach_account_runtime()
+            elif kind == "usage":
+                if self.account.get("state") == "authenticated":
+                    self.usage_failed = value.get("ok") is not True
+                    if not self.usage_failed:
+                        self.usage = dict(value)
+                        self.usage_updated = time.monotonic()
             elif kind == "notice":
                 self.notice = str(value)
             elif kind == "auth":
@@ -1451,6 +1464,8 @@ class Wizard:
                         " Cleanup warning: " + safe_error(warning) if warning else ""
                     )
             elif kind == "done":
+                if value == "usage":
+                    continue
                 self.auth.clear()
                 if value in ACCOUNT_ACTIONS:
                     self._finish_account()
@@ -1486,6 +1501,19 @@ class Wizard:
     def _refresh(self) -> None:
         now = time.monotonic()
         if (
+            not self.demo
+            and not self.quitting
+            and self.account.get("state") == "authenticated"
+            and not self.worker.busy
+            and (
+                self.last_usage_attempt is None
+                or now - self.last_usage_attempt >= USAGE_REFRESH_SECONDS
+            )
+            and self.worker.submit("usage", self.config)
+        ):
+            self.last_usage_attempt = now
+            return
+        if (
             (
                 self.page == "ready"
                 or self.page in ("summary", "advanced")
@@ -1503,6 +1531,36 @@ class Wizard:
             self.last_operation = "status"
             self.operation_started = now
 
+    def _clear_usage(self) -> None:
+        self.usage = {}
+        self.usage_updated = 0.0
+        self.last_usage_attempt = None
+        self.usage_failed = False
+
+    def _header(self) -> str:
+        header = "COMFYUI / COLAB"
+        if self.demo:
+            return header + "  · OFFLINE DEMO"
+        if self.account.get("state") != "authenticated":
+            return header + "  · STARTUP"
+        if not self.usage:
+            return header + (
+                " · CU unavailable" if self.usage_failed else " · CU pending"
+            )
+        balance, rate = self.usage["balance"], self.usage["rate_hourly"]
+        if rate > 0:
+            minutes = int(balance / rate * 60)
+            duration = f"~{minutes // 60}h {minutes % 60:02d}m"
+        else:
+            duration = "idle"
+        header += f" · {balance:.2f} CU · {duration}"
+        if (
+            self.usage_failed
+            or time.monotonic() - self.usage_updated >= USAGE_REFRESH_SECONDS
+        ):
+            header += " · stale"
+        return header
+
     def _busy_text(self) -> str:
         action = (
             getattr(self.worker, "active_action", None)
@@ -1514,6 +1572,7 @@ class Wizard:
             "account_login": "Signing in to Colab",
             "account_logout": "Signing out of local Colab login",
             "account_switch": "Switching Colab account",
+            "usage": "Checking compute-unit balance",
             "sessions": "Loading runtimes from Colab",
             "inspect": "Inspecting selected runtime",
             "status": "Refreshing ComfyUI + SSH status",
@@ -2005,7 +2064,9 @@ class Wizard:
                 )
             )
             if self.auth.get("url"):
-                rows.append((str(self.auth["url"]), "normal"))
+                rows.append(
+                    ("Choose Open authorization in browser to authorize.", "normal")
+                )
             rows.extend(
                 (
                     (
@@ -2258,7 +2319,9 @@ class Wizard:
                 )
             )
             if self.auth.get("url"):
-                rows.append((str(self.auth["url"]), "normal"))
+                rows.append(
+                    ("Choose Open authorization in browser to authorize.", "normal")
+                )
         if self._url():
             rows.append(("Open ComfyUI: " + (self._url() or ""), "comfy"))
         if self.page == "account":
@@ -2433,7 +2496,7 @@ class Wizard:
             screen,
             0,
             1,
-            "COMFYUI / COLAB" + ("  · OFFLINE DEMO" if self.demo else "  · STARTUP"),
+            self._header(),
             width - 2,
             "title",
         )
@@ -2645,7 +2708,7 @@ class Wizard:
         choices = self._choices()
         return "\n".join(
             [
-                "COMFYUI / COLAB" + (" · OFFLINE DEMO" if self.demo else ""),
+                self._header(),
                 self._title(),
                 *(value for value, _role in self._details(100)),
                 *(
