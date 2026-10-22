@@ -1178,23 +1178,31 @@ def _render_request(args, report, workflow, deadline):
             submitted = {"prompt_id": prompt_id}
             report.update(reconciled=True)
         prompt_id = submitted.get("prompt_id")
-        if submitted.get("node_errors") or submitted.get("error"):
-            report.update(
-                status="rejected", terminal=True, job_may_still_be_running=False
-            )
-            raise RenderError(
-                "ComfyUI rejected the submitted workflow",
-                server_error=safe_server_error(submitted),
-            )
         if not isinstance(prompt_id, str) or not re.fullmatch(
             r"[A-Za-z0-9_-]{1,128}", prompt_id
         ):
+            if submitted.get("error"):
+                report.update(
+                    status="rejected", terminal=True, job_may_still_be_running=False
+                )
+                raise RenderError(
+                    "ComfyUI rejected the submitted workflow",
+                    server_error=safe_server_error(submitted),
+                )
             raise RenderError(
-                "ComfyUI returned no valid prompt_id; submission outcome is unknown"
+                "ComfyUI returned no valid prompt_id; submission outcome is unknown",
+                server_error=safe_server_error(submitted),
             )
-        report.update(
-            status="queued", prompt_id=prompt_id, job_may_still_be_running=True
-        )
+        # ComfyUI can enqueue valid outputs while reporting other node errors.
+        # Persist the accepted identity and diagnostics together before polling.
+        queued = {
+            "status": "queued",
+            "prompt_id": prompt_id,
+            "job_may_still_be_running": True,
+        }
+        if submitted.get("node_errors") or submitted.get("error"):
+            queued["submission_warnings"] = safe_server_error(submitted)
+        report.update(**queued)
     last_report = 0.0
     last_phase = None
     while True:

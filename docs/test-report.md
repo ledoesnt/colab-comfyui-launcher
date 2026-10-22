@@ -1,10 +1,44 @@
 # 实测记录
 
+## 2026-10-22 已接受渲染任务的节点诊断兼容修复
+
+基于工作分支提交 `071eb7b`，开始时工作区干净，fetch 后远端同分支与本地一致。独立核对[固定 ComfyUI 版本的提交处理](https://github.com/Comfy-Org/ComfyUI/blob/f1072eb0350638a3390ddb6afbcaa8c6b237c6fd/server.py)：有效输出入队后可以同时返回 `prompt_id` 与非空 `node_errors`。此前把任何节点诊断当作终态拒绝，会丢失已接受任务的 ID。
+
+现在先验证 `prompt_id` 是匹配 `[A-Za-z0-9_-]{1,128}` 的字符串。有有效 ID 时持久化 queued 身份，附带的 `node_errors` / `error` 经 `safe_server_error` 脱敏后保存为 `submission_warnings`，随后照常查询任务；诊断不代表没有任务在运行。无有效 ID 且只有节点诊断时保持 `submission_unknown`，无有效 ID 且有明确 `error` 才终态拒绝。HTTP 400 明确验证拒绝的原有行为保留。
+
+### 本环境独立执行
+
+```text
+修复前：PYTHONPATH=/tmp/launcher-render-test-deps python3 -m unittest discover -s tests -v
+Ran 791 tests in 29.232s
+OK
+
+修复后：PYTHONPATH=/tmp/launcher-render-test-deps python3 -m unittest discover -s tests -v
+Ran 794 tests in 29.476s
+OK
+```
+
+两次均零跳过，包含本机 PyAV / ffmpeg 集成。旧报告的 790 来自最后一项 `test_history_rotation_after_preflight_cannot_duplicate_old_request` 加入前的完整测试日志，不能代表最终已提交的 791 项；本次重新执行并更正这一差异。
+
+先将三个新增测试运行于旧实现：已接受任务和未知提交两组共 11 个子用例失败，HTTP 400 用例通过，独立复现了缺陷。修复后全量通过，新增覆盖如下：
+
+- 有效 ID 加 `node_errors`、`error` 或两者时，在首次 history 查询前已持久化 ID 与脱敏诊断；history 断线后记录保持非终态及可能仍在运行，再次 execute 成功恢复且 POST 总数为一。
+- 缺失、非字符串、路径样式、超长及带换行的无效 ID 加仅节点诊断时，重复查询仍为 `submission_unknown`，不得重新 POST。
+- 经真实 `http_json` / `HTTPError` 转换的 HTTP 400 验证拒绝保持终态并可直接重放；既有结构化诊断测试另覆盖无 ID 加明确顶层 `error` 的 JSON 响应拒绝与脱敏。
+
+全部 43 个 Python 文件的 Ruff check / format、`bash -n scripts/bootstrap.sh` 与 `git diff --check` 通过。测试使用本机 fixture，没有发起真实 Colab 分配或释放。
+
+### 独立 dot 环境只读验证（父任务提供）
+
+父任务报告已在独立 dot 云电脑使用官方 `google-colab-cli==0.7.4` 完成真实只读检查：登录有效、sessions 为空、当前消耗率为零，余额字段由新 provider 正确解析。该项由父环境执行并提供结果，本环境未重复调用；不记录账号、具体余额或凭证。未启动或释放 GPU。
+
+真实付费分配、预算达到保护点后的远端释放及平台核验仍未集成测试；本次本机故障注入与父环境只读结果均不替代这些验证。
+
 ## 2026-10-22 单实例 CU 守护与可恢复自动化接口（离线验收）
 
 基于 `3c6ef6e`（本轮 fetch 后与 `origin/main` 一致）在独立工作分支实现。开始时工作区干净，基线 634 项 unittest 通过。本轮没有运行真实 Colab 命令、分配 GPU/CPU、读取凭证内容、挂载 Drive、下载模型权重或公开服务。环境没有已安装的 `colab` 可执行文件，因此也未验证真实账号认证状态；只下载官方 `google-colab-cli==0.7.4` wheel 核对 sessions/usage/stop 输出和 API 限制。
 
-### 最终执行结果
+### 首次完整执行记录（最终提交复测见上节）
 
 ```text
 PYTHONPATH=/tmp/launcher-render-test-deps python3 -m unittest discover -s tests -v

@@ -52,8 +52,8 @@ class RequestRecoveryTests(unittest.TestCase):
         ):
             return renderer.render(args, report)
 
-    def record(self):
-        return json.loads((self.content / "jobs/durable-request.json").read_text())
+    def record(self, request_id="durable-request"):
+        return json.loads((self.content / "jobs" / f"{request_id}.json").read_text())
 
     def test_intent_is_durable_before_post_and_success_replays_without_requests(self):
         def http(path, deadline, payload=None):
@@ -341,6 +341,156 @@ class RequestRecoveryTests(unittest.TestCase):
             any(call.args[0] == "/prompt" for call in calls.call_args_list)
         )
 
+    def test_accepted_prompt_with_warnings_recovers_without_second_post(self):
+        node_errors = {
+            "unused-output": {
+                "errors": [
+                    {
+                        "type": "value_not_in_list",
+                        "extra_info": {"received_value": "PRIVATE-FIXTURE"},
+                    }
+                ]
+            }
+        }
+        error = {"type": "partial_output_warning"}
+        for index, diagnostics in enumerate(
+            (
+                {"node_errors": node_errors},
+                {"error": error},
+                {"node_errors": node_errors, "error": error},
+            )
+        ):
+            with self.subTest(diagnostics=list(diagnostics)):
+                request_id = f"accepted-warning-{index}"
+                prompt_id = "fixture-job" if index < 2 else "a" * 128
+                submitted = {
+                    "prompt_id": prompt_id,
+                    **diagnostics,
+                    "prompt": {"text": "PRIVATE-FIXTURE"},
+                    "authorization": "Bearer PRIVATE-FIXTURE",
+                }
+                unavailable = [True]
+
+                def http(
+                    path,
+                    deadline,
+                    payload=None,
+                    *,
+                    submitted=submitted,
+                    prompt_id=prompt_id,
+                    unavailable=unavailable,
+                    request_id=request_id,
+                ):
+                    if path == "/prompt":
+                        return submitted
+                    if path == f"/history/{prompt_id}":
+                        if unavailable[0]:
+                            queued = self.record(request_id)
+                            self.assertEqual(queued["status"], "queued")
+                            self.assertEqual(queued["prompt_id"], prompt_id)
+                            self.assertEqual(
+                                queued["submission_warnings"],
+                                renderer.safe_server_error(submitted),
+                            )
+                            raise renderer.RenderError(
+                                "History temporarily unavailable"
+                            )
+                        return {prompt_id: self.history}
+                    return self.http(path, deadline, payload)
+
+                with mock.patch.object(
+                    renderer, "http_json", side_effect=http
+                ) as calls:
+                    with self.assertRaisesRegex(renderer.RenderError, "History"):
+                        self.execute(request_id)
+                    record = self.record(request_id)
+                    self.assertEqual(record["prompt_id"], prompt_id)
+                    self.assertFalse(record.get("terminal", False))
+                    self.assertTrue(record["job_may_still_be_running"])
+                    self.assertFalse(record["resubmit_allowed"])
+                    self.assertNotIn("PRIVATE-FIXTURE", json.dumps(record))
+                    unavailable[0] = False
+                    result = self.execute(request_id)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["prompt_id"], prompt_id)
+                self.assertEqual(
+                    result["submission_warnings"],
+                    renderer.safe_server_error(submitted),
+                )
+                self.assertEqual(
+                    sum(call.args[0] == "/prompt" for call in calls.call_args_list), 1
+                )
+
+    def test_node_errors_without_valid_prompt_id_remain_unknown(self):
+        for index, prompt_id in enumerate(
+            (None, "", "../unsafe", 123, [], {}, "a" * 129, "unsafe\n")
+        ):
+            with self.subTest(prompt_id=prompt_id):
+                request_id = f"unknown-node-errors-{index}"
+                submitted = {
+                    "node_errors": {"1": {"errors": [{"type": "value_not_in_list"}]}}
+                }
+                if prompt_id is not None:
+                    submitted["prompt_id"] = prompt_id
+
+                def http(path, deadline, payload=None, *, submitted=submitted):
+                    if path == "/prompt":
+                        return submitted
+                    if path.startswith("/history"):
+                        return {}
+                    return self.http(path, deadline, payload)
+
+                with mock.patch.object(
+                    renderer, "http_json", side_effect=http
+                ) as calls:
+                    for _ in range(2):
+                        with self.assertRaisesRegex(renderer.RenderError, "unknown"):
+                            self.execute(request_id)
+                        record = self.record(request_id)
+                        self.assertEqual(record["status"], "submission_unknown")
+                        self.assertFalse(record.get("terminal", False))
+                        self.assertTrue(record["job_may_still_be_running"])
+                        self.assertFalse(record["resubmit_allowed"])
+                self.assertEqual(
+                    sum(call.args[0] == "/prompt" for call in calls.call_args_list), 1
+                )
+
+    def test_http_400_validation_response_is_terminal_and_not_reposted(self):
+        details = {
+            "error": {"type": "prompt_outputs_failed_validation"},
+            "node_errors": {"1": {"errors": [{"type": "value_not_in_list"}]}},
+        }
+        real_http = renderer.http_json
+
+        def http(path, deadline, payload=None):
+            if path == "/prompt":
+                with mock.patch.object(
+                    renderer.urllib.request,
+                    "urlopen",
+                    side_effect=urllib.error.HTTPError(
+                        renderer.ORIGIN + path,
+                        400,
+                        "Bad Request",
+                        {},
+                        io.BytesIO(json.dumps(details).encode()),
+                    ),
+                ):
+                    return real_http(path, deadline, payload)
+            return self.http(path, deadline, payload)
+
+        with mock.patch.object(renderer, "http_json", side_effect=http) as calls:
+            with self.assertRaisesRegex(renderer.RenderError, "HTTP 400"):
+                self.execute()
+            replay = self.execute()
+        self.assertEqual(replay["status"], "rejected")
+        self.assertTrue(replay["terminal"])
+        self.assertFalse(replay["job_may_still_be_running"])
+        self.assertEqual(replay["http_status"], 400)
+        self.assertEqual(replay["server_error"], details)
+        self.assertEqual(
+            sum(call.args[0] == "/prompt" for call in calls.call_args_list), 1
+        )
+
     def test_server_node_errors_remain_structured_and_terminal(self):
         details = {
             "error": {"type": "prompt_outputs_failed_validation"},
@@ -363,11 +513,7 @@ class RequestRecoveryTests(unittest.TestCase):
 
         def http(path, deadline, payload=None):
             if path == "/prompt":
-                raise renderer.RenderError(
-                    "ComfyUI request failed (HTTP 400)",
-                    http_status=400,
-                    server_error=renderer.safe_server_error(details),
-                )
+                return details
             return self.http(path, deadline, payload)
 
         with (

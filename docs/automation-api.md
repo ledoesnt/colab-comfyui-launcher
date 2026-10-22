@@ -22,6 +22,8 @@ python3 scripts/colabctl.py -s "$SESSION" status
 
 任务提交失败保留结构化 `server_error`/`node_errors` 信息，诊断中的常见凭证形式会脱敏。服务端节点 schema 是最终权威；泛型 `COMFY_MATCHTYPE_V3`/Switch 不会被本地不完整的类型知识改写成固定分支。当前主线原本已有泛型放行行为，本轮增加了针对真实官方 schema 的回归覆盖。
 
+ComfyUI 可能接受部分有效输出，同时返回节点诊断。有有效 `prompt_id` 的响应仍按已入队任务跟踪，脱敏诊断保存为 `submission_warnings`；最终结果须由 history 与输出核验确认。后续查询断线不丢弃 ID，也不把任务标为终态或重新 POST。无有效 ID 且只有 `node_errors` 时保持 `submission_unknown`；无有效 ID 加明确 `error` 或 HTTP 400 验证拒绝仍按终态拒绝处理。
+
 ## 准备模型
 
 `prepare --mode verify_only` 只使用已有、可校验的模型；在 Drive 模式下仍会复制并验证到 VM 磁盘，不下载缺失权重。`prepare --mode download_missing` 额外下载清单中缺失的已固定文件。`--download-missing` 作为兼容别名保留，但不能和显式 `verify_only` 并用。
