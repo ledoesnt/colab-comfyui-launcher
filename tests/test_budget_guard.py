@@ -258,6 +258,35 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(result["status"], "active")
         self.assertEqual(len(self.provider.created), 1)
 
+    def test_allocation_failure_persists_only_safe_classification_after_restart(self):
+        diagnostic = ProviderError(
+            "provider stderr: Bearer PRIVATE-FIXTURE token=PRIVATE-FIXTURE",
+            code="command_failed",
+            returncode=17,
+            outcome_unknown=True,
+        )
+        with mock.patch.object(
+            self.provider, "create", side_effect=diagnostic
+        ) as create:
+            result = self.create(request_id="failed-allocation")
+            self.assertEqual(result["status"], "allocation_unknown")
+            recovered = self.make_manager().create(
+                "session-test",
+                "T4",
+                limit_cu=10,
+                rate_ceiling=4,
+                reserve_cu=2,
+                request_id="failed-allocation",
+            )
+        create.assert_called_once()
+        stored = json.loads(self.manager._path("session-test").read_text())
+        for record in (result, recovered, stored):
+            self.assertEqual(record["allocation_error_code"], "command_failed")
+            self.assertEqual(record["allocation_error_returncode"], 17)
+            self.assertNotIn("PRIVATE-FIXTURE", json.dumps(record))
+            self.assertNotIn("provider stderr", json.dumps(record))
+        self.assertEqual(recovered["job_id"], result["job_id"])
+
     def test_explicit_adopt_recovers_unbound_request_without_resetting_budget(self):
         self.provider.create_visible = False
         first = self.create()

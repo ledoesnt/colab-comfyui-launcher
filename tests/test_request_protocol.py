@@ -64,6 +64,51 @@ class RequestProtocolTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("required", stderr)
 
+    def help_text(self, *args):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            code = bridge.main(["-s", "fixture", *args, "--help"])
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(self.manager.mock_calls, [])
+        return " ".join(stdout.getvalue().split())
+
+    def test_help_distinguishes_asset_total_deadline_from_provider_timeouts(self):
+        root = self.help_text()
+        self.assertIn("upload/collect share one total asset-operation deadline", root)
+        self.assertIn("CU protection", root)
+        self.assertIn("default: 120s", root)
+        self.assertIn("Budget allocation uses separate provider timeouts", root)
+        for action, cutoff in (
+            ("upload", "work_deadline"),
+            ("collect", "release_deadline"),
+        ):
+            with self.subTest(action=action):
+                text = self.help_text(action)
+                self.assertIn(f"global --timeout before {action}", text)
+                self.assertIn("total asset-operation deadline", text)
+                self.assertIn(cutoff, text)
+                self.assertIn("hold_deadline", text)
+
+    def test_help_explains_nonterminal_allocation_polling_and_refresh(self):
+        for action in ("new", "budget"):
+            with self.subTest(action=action):
+                text = self.help_text(action)
+                for required in (
+                    "allocation_pending",
+                    "allocation_unknown",
+                    "exit 1",
+                    "nonterminal",
+                    "request_id",
+                    "budget job_id",
+                    "do not repeat new",
+                ):
+                    self.assertIn(required, text)
+        text = self.help_text("budget")
+        self.assertIn("Read-only local status polling without --refresh", text)
+        self.assertIn("an expired budget may release the instance", text)
+        self.assertIn("'job ID' queries separate task records", text)
+
     def test_unknown_submission_restart_only_queries_original(self):
         calls = []
 

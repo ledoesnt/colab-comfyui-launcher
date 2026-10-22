@@ -579,12 +579,14 @@ class BudgetManager:
         self._mutate(session, record["job_id"], submitting)
         try:
             self.provider.create(session, gpu)
-        except ProviderError:
+        except ProviderError as error:
 
-            def unknown(value):
+            def unknown(value, code=error.code, returncode=error.returncode):
                 value["allocation_error"] = (
                     "Allocation request outcome is unknown; query this request, do not repeat new."
                 )
+                value["allocation_error_code"] = code
+                value["allocation_error_returncode"] = returncode
                 if not value.get("assignment_id") and value["status"] not in TERMINAL:
                     value["status"] = "allocation_unknown"
 

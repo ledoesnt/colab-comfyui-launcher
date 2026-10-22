@@ -135,6 +135,22 @@ class ProviderCommandTests(unittest.TestCase):
         self.run = mock.Mock()
         self.api = provider.ColabProvider(run=self.run, oauth_cache=self.cache)
 
+    def test_error_metadata_rejects_untrusted_classification_and_returncode(self):
+        for code, returncode in (
+            ("refresh_token=fixture-private-value", "fixture-private-value"),
+            ("unknown_future_classification", True),
+            (None, 1.5),
+            ({"token": "fixture-private-value"}, []),
+        ):
+            with self.subTest(code_type=type(code).__name__):
+                error = provider.ProviderError(
+                    "Safe failure.", code=code, returncode=returncode
+                )
+                self.assertEqual(error.code, "provider_error")
+                self.assertIsNone(error.returncode)
+                self.assertNotIn("fixture-private", repr(vars(error)))
+        self.run.assert_not_called()
+
     def test_read_queries_are_bounded_and_noninteractive(self):
         self.run.return_value = response(session())
         self.assertEqual(self.api.sessions()[0]["hardware"], "T4")
@@ -159,10 +175,14 @@ class ProviderCommandTests(unittest.TestCase):
 
     def test_provider_failure_never_exposes_response_or_subprocess_secrets(self):
         secret = "refresh_token=fixture-private-value https://private.invalid/oauth"
-        for failure in (
-            response(secret, secret, 1),
-            subprocess.TimeoutExpired(["colab"], 20, output=secret, stderr=secret),
-            OSError(secret),
+        for failure, code, returncode in (
+            (response(secret, secret, 1), "command_failed", 1),
+            (
+                subprocess.TimeoutExpired(["colab"], 20, output=secret, stderr=secret),
+                "timeout",
+                None,
+            ),
+            (OSError(secret), "unavailable", None),
         ):
             self.run.reset_mock()
             self.run.side_effect = failure if isinstance(failure, Exception) else None
@@ -176,6 +196,9 @@ class ProviderCommandTests(unittest.TestCase):
                 self.api.sessions()
             self.assertNotIn("fixture-private", str(caught.exception))
             self.assertNotIn("private.invalid", str(caught.exception))
+            self.assertEqual(caught.exception.code, code)
+            self.assertEqual(caught.exception.returncode, returncode)
+            self.assertNotIn("fixture-private", repr(vars(caught.exception)))
             self.assertEqual(stdout.getvalue(), "")
             self.assertEqual(stderr.getvalue(), "")
             self.run.assert_called_once()
@@ -187,6 +210,37 @@ class ProviderCommandTests(unittest.TestCase):
         with self.assertRaises(provider.ProviderError) as caught:
             self.api.sessions()
         self.assertEqual(caught.exception.code, "provider_diagnostics")
+        self.assertEqual(caught.exception.returncode, 0)
+
+    def test_failed_creation_retains_only_safe_process_diagnostics(self):
+        secret = (
+            "Authorization: Bearer fixture-private-value\nrefresh_token=fixture-secret"
+        )
+        for returncode in (1, 23, -15):
+            with self.subTest(returncode=returncode):
+                self.run.reset_mock()
+                self.run.return_value = response(secret, secret, returncode)
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with (
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                    self.assertRaises(provider.ProviderError) as caught,
+                ):
+                    self.api.create("selected", "T4")
+                error = caught.exception
+                self.assertEqual(
+                    vars(error),
+                    {
+                        "code": "command_failed",
+                        "outcome_unknown": True,
+                        "returncode": returncode,
+                    },
+                )
+                self.assertNotIn("fixture-private", str(error))
+                self.assertNotIn("fixture-secret", str(error))
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+                self.run.assert_called_once()
 
     def test_timeout_creation_is_unknown_and_never_retried(self):
         self.run.side_effect = subprocess.TimeoutExpired(["colab"], 300)

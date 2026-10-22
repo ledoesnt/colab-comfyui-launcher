@@ -17,6 +17,23 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+PROVIDER_ERROR_CODES = frozenset(
+    {
+        "provider_error",
+        "invalid_session",
+        "invalid_assignment",
+        "invalid_response",
+        "invalid_gpu",
+        "timeout",
+        "unavailable",
+        "command_failed",
+        "provider_diagnostics",
+        "scope_changed",
+        "assignment_absent",
+        "identity_mismatch",
+    }
+)
+
 
 class ProviderError(RuntimeError):
     """A safe error whose message contains no provider response material."""
@@ -27,10 +44,17 @@ class ProviderError(RuntimeError):
         *,
         code: str = "provider_error",
         outcome_unknown: bool = False,
+        returncode: int | None = None,
     ):
         super().__init__(message)
-        self.code = code
+        self.code = (
+            code
+            if type(code) is str and code in PROVIDER_ERROR_CODES
+            else "provider_error"
+        )
         self.outcome_unknown = outcome_unknown
+        # Preserve only process status, never captured provider response bytes.
+        self.returncode = returncode if type(returncode) is int else None
 
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -265,6 +289,7 @@ class ColabProvider:
                 "Colab command failed; use the official interactive login when authentication is required.",
                 code="command_failed",
                 outcome_unknown=mutation,
+                returncode=completed.returncode,
             )
         lines, stdout_notice = _lines(completed.stdout, mutation=mutation)
         errors, stderr_notice = _lines(completed.stderr or "", mutation=mutation)
@@ -278,6 +303,7 @@ class ColabProvider:
                 "Colab returned diagnostics; the provider result remains unverified.",
                 code="provider_diagnostics",
                 outcome_unknown=mutation,
+                returncode=completed.returncode,
             )
         return lines
 

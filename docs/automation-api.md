@@ -6,6 +6,8 @@
 
 写操作在本地和远端保存 `request_id`/`job_id`。CLI 自动生成 ID，也接受调用者提供的稳定 `--request-id`；同一 ID 不得用于不同参数。分配预算另有独立的分配请求与预算 job 记录。
 
+`new` 的 `allocation_pending` / `allocation_unknown` 即使退出 1 也仍为非终态，分配可能继续。保存原分配的 `request_id` 和预算 `job_id`，使用 `colabctl.py -s "$SESSION" budget` 只读轮询并核对 ID，不依据退出码重复 `new`。预算记录不属于下面的 `job ID` 接口；`budget --refresh` 会恢复守护且可能触发到期释放，不能当作只读轮询。详见[分配恢复说明](instance-budget.md#创建前设置)。
+
 ```bash
 python3 scripts/colabctl.py -s "$SESSION" --request-id prepare-001 prepare \
   --ephemeral --mode download_missing
@@ -39,6 +41,10 @@ python3 scripts/colabctl.py -s "$SESSION" upload ./input.png
 ```
 
 返回 `filename`/`relative_path`/`comfyui_name`、`sha256`、`bytes`、`session` 和 `assignment_id`。输入根目录中的名称包含完整实例摘要和内容 SHA，同名不同内容不会互相覆盖，原生 LoadImage 下拉菜单也能看到上传结果。CLI 传输先使用本地稳定快照，远端校验完成后才发布为可用输入。
+
+全局 `--timeout` 放在子命令之前，默认 120 秒。对 `upload` / `collect`，它是素材操作的**共享总期限**，覆盖快照/摘要、暂存或描述、传输、校验与提交；`collect` 的全部文件共用同一期限，每个步骤或文件不会获得新的完整窗口。上传还受 CU `work_deadline` 裁剪，收集受 `release_deadline` 裁剪，两者还受已有 `hold_deadline` 限制；增加 `--timeout` 不会延长这些保护点。应按文件大小、调用开销和校验时间设置足够的窗口，短窗口超时不等同于传输实现失败。
+
+初始平台身份与输出 manifest 查询在素材总期限建立之前，因此 `--timeout` 不是整个 CLI 进程严格的墙钟退出上限。其他远端控制调用通常按单次本地调用使用该值；预算分配使用提供方独立期限，后台安装/渲染另由 `--install-timeout` / `--max-seconds` 控制。
 
 生成完成后按 job 或保存的输出 manifest 收集：
 

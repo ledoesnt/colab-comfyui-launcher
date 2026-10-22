@@ -912,11 +912,22 @@ def parser() -> argparse.ArgumentParser:
         "--timeout",
         type=positive_seconds,
         default=120.0,
-        help="Local timeout for each short official CLI invocation (default: 120s)",
+        help=(
+            "Local call timeout; upload/collect share one total asset-operation "
+            "deadline, further limited by CU protection (default: 120s). "
+            "Budget allocation uses separate provider timeouts."
+        ),
     )
     actions = root.add_subparsers(dest="action", required=True)
     new = actions.add_parser(
-        "new", help="Allocate one instance with a persistent CU guard"
+        "new",
+        help="Allocate one instance with a persistent CU guard",
+        description=(
+            "allocation_pending or allocation_unknown with exit 1 is nonterminal; "
+            "allocation may still be in progress. Save the returned request_id and "
+            "budget job_id. Poll 'budget' for the same session and check both IDs; "
+            "do not repeat new based on the exit code."
+        ),
     )
     hardware = new.add_mutually_exclusive_group(required=True)
     hardware.add_argument("--gpu", choices=("T4", "L4", "G4", "H100", "A100"))
@@ -942,7 +953,14 @@ def parser() -> argparse.ArgumentParser:
         )
         command.add_argument("--reserve-cu", type=positive_seconds)
     budget = actions.add_parser(
-        "budget", help="Read the persisted single-allocation budget and guard status"
+        "budget",
+        help="Read the persisted single-allocation budget and guard status",
+        description=(
+            "Read-only local status polling without --refresh. For allocation_pending "
+            "or allocation_unknown (nonterminal, exit 1), check request_id and budget "
+            "job_id against the original request; do not repeat new. This reads the "
+            "current session budget; 'job ID' queries separate task records."
+        ),
     )
     budget.add_argument(
         "--refresh",
@@ -965,11 +983,23 @@ def parser() -> argparse.ArgumentParser:
         "jobs", help="List local durable request receipts for this session"
     )
     upload = actions.add_parser(
-        "upload", help="Upload an input with instance identity and SHA verification"
+        "upload",
+        help="Upload an input with instance identity and SHA verification",
+        description=(
+            "Set global --timeout before upload: one total asset-operation deadline "
+            "covers staging, hashing, transfer and verification, not a fresh timeout "
+            "per step. CU work_deadline and any hold_deadline can shorten it."
+        ),
     )
     upload.add_argument("source", type=Path)
     collect = actions.add_parser(
-        "collect", help="Collect and verify outputs into an instance/job directory"
+        "collect",
+        help="Collect and verify outputs into an instance/job directory",
+        description=(
+            "Set global --timeout before collect: all files and verification share "
+            "one total asset-operation deadline, not a fresh timeout per file. "
+            "CU release_deadline and any hold_deadline can shorten it."
+        ),
     )
     manifest = collect.add_mutually_exclusive_group(required=True)
     manifest.add_argument("--manifest", type=Path)
