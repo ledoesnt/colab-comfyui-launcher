@@ -74,6 +74,7 @@ class CatalogTests(unittest.TestCase):
             "download_models.py",
             "prepare_models.py",
             "render_workflow.py",
+            "assets.py",
         ):
             (root / "scripts" / name).write_text("fixture")
         first = catalog.entries(self.module)[0]["path"]

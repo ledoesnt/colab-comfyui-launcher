@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Deploy and control launcher services through the official Colab CLI.
 
-This bridge never allocates or stops Colab runtimes and never grants Drive
-permissions. Those actions remain explicit official ``colab`` commands.
+Runtime creation with an explicit CU budget and verified release use the
+official Colab CLI. Drive authorization remains interactive in the TUI.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -25,10 +27,18 @@ REMOTE_STATE = "/content/colab-comfyui-runtime"
 RESULT_PREFIX = "LAUNCHER_RESULT="
 REMOTE_EXEC_TIMEOUT = 60
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+if str(PROJECT_ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+
+from client_requests import ClientRequests, request_id
 
 
 class BridgeError(Exception):
     """An operation failed before its result was verified."""
+
+    def __init__(self, message: str, result: dict | None = None):
+        super().__init__(message)
+        self.result = result
 
 
 def sanitize_failure(value: str) -> str:
@@ -68,7 +78,7 @@ def _run_colab(
     if not executable:
         raise BridgeError("Official colab CLI was not found on PATH.")
     try:
-        return subprocess.run(
+        completed = subprocess.run(
             [executable, "--auth=oauth2", *arguments],
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -76,6 +86,9 @@ def _run_colab(
             timeout=timeout,
             check=False,
         )
+        if "[colab] A new version of Colab CLI is available:" in completed.stdout:
+            print("Colab CLI reported an available upgrade.", file=sys.stderr)
+        return completed
     except subprocess.TimeoutExpired as exc:
         raise BridgeError(
             "Local Colab command timed out. Check status before repeating an operation."
@@ -104,7 +117,7 @@ def parse_result(output: str) -> dict[str, Any]:
         raise BridgeError("Remote launcher response must contain a boolean ok field.")
     if result["ok"] is not True:
         message = result.get("error", "Remote launcher reported a failure.")
-        raise BridgeError(sanitize_failure(str(message)))
+        raise BridgeError(sanitize_failure(str(message)), result=result)
     return result
 
 
@@ -134,8 +147,12 @@ def redact(text):
     return "\\n".join(text.strip().splitlines()[-6:])[-1200:]
 
 def atomic_json(path, data):
-    temporary = path.with_name(path.name + '.tmp-' + str(os.getpid()))
-    temporary.write_text(json.dumps(data), encoding='utf-8')
+    temporary = path.with_name(path.name + '.tmp-' + uuid.uuid4().hex)
+    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+        json.dump(data, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
     os.chmod(temporary, 0o600)
     os.replace(temporary, path)
 
@@ -147,7 +164,7 @@ def deploy(payload):
     if destination.is_symlink():
         raise RuntimeError('Deployment directory must not be a symlink.')
     destination.mkdir(parents=True, exist_ok=True)
-    allowed = re.compile(r'(?:scripts/(?:bootstrap\\.sh|runtime\\.py|download_models\\.py|prepare_models\\.py|render_workflow\\.py)|(?:models|workflows)/[^/]+\\.json)')
+    allowed = re.compile(r'(?:scripts/(?:bootstrap\\.sh|runtime\\.py|download_models\\.py|prepare_models\\.py|render_workflow\\.py|assets\\.py)|(?:models|workflows)/[^/]+\\.json)')
     with zipfile.ZipFile(archive) as bundle:
         members = bundle.infolist()
         names = [member.filename for member in members]
@@ -187,15 +204,18 @@ def install(payload):
         script = Path('/content/colab-comfyui-launcher/scripts/bootstrap.sh')
         if not script.is_file():
             raise RuntimeError('Deploy the launcher before installing dependencies.')
+        command = ['timeout', '--signal=TERM', '--kill-after=15', str(payload['install_timeout']),
+                   'bash', str(script), 'install']
+        if payload.get('request_id'):
+            command = [sys.executable, '-c', INSTALL_SUPERVISOR, json.dumps(payload)]
         with (logs / 'install.log').open('a', encoding='utf-8') as log:
             process = subprocess.Popen(
-                ['timeout', '--signal=TERM', '--kill-after=15', str(payload['install_timeout']),
-                 'bash', str(script), 'install'],
+                command,
                 cwd='/content/colab-comfyui-launcher',
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 start_new_session=True, pass_fds=(lock_fd,),
             )
-        atomic_json(state / 'install-launch.json', {'pid': process.pid})
+        atomic_json(state / 'install-launch.json', {'pid': process.pid, 'request_id': payload.get('request_id')})
         return {'ok': True, 'status': 'started', 'pid': process.pid,
                 'installed': False, 'deadline_seconds': payload['install_timeout'],
                 'next': 'Use status to check install.json for ready or failed.'}
@@ -332,7 +352,12 @@ def background_arguments(payload):
     script = source / {'download': 'download_models.py', 'prepare': 'prepare_models.py', 'render': 'render_workflow.py'}[action]
     if not script.is_file() or not Path(executable).is_file():
         raise RuntimeError('Deploy and install required scripts before starting this task.')
-    arguments = [str(executable), str(script), '--max-seconds', str(payload['max_seconds'])]
+    seconds = payload['max_seconds']
+    if payload.get('not_after'):
+        seconds = min(seconds, payload['not_after'] - time.time())
+        if seconds <= 0:
+            raise RuntimeError('Work protection deadline passed before background task startup.')
+    arguments = [str(executable), str(script), '--max-seconds', str(seconds)]
     if action in ('download', 'prepare'):
         workers = payload.get('workers', 2)
         if type(workers) is not int or not 1 <= workers <= 4:
@@ -358,10 +383,28 @@ def background_arguments(payload):
             arguments.append('--download-missing')
     else:
         workflow = payload.get('workflow', 'h3-i2v-api.json')
-        if workflow not in ('h3-api.json', 'h3-i2v-api.json'):
-            raise RuntimeError('Choose a deployed launcher H3 workflow.')
-        arguments.extend(['--workflow', '/content/colab-comfyui-launcher/workflows/' + workflow,
+        if payload.get('workflow_data') is not None:
+            workflow_path = request_path(payload['request_id']).with_suffix('.workflow.json')
+            atomic_json(workflow_path, payload['workflow_data'])
+        else:
+            if workflow not in ('h3-api.json', 'h3-i2v-api.json', 'h3-first-last-api.json'):
+                raise RuntimeError('Choose a deployed launcher workflow or supply custom API JSON.')
+            workflow_path = Path('/content/colab-comfyui-launcher/workflows') / workflow
+        arguments.extend(['--workflow', str(workflow_path),
                           '--result-file', str(state / 'render-progress.json')])
+        if payload.get('request_id'):
+            arguments.extend(['--request-id', payload['request_id'], '--job-dir', str(state / 'render-jobs')])
+        for name in ('session', 'assignment_id'):
+            if payload.get(name):
+                arguments.extend(['--' + name.replace('_', '-'), payload[name]])
+        if payload.get('mapping_data') is not None:
+            mapping_path = request_path(payload['request_id']).with_suffix('.mapping.json')
+            atomic_json(mapping_path, payload['mapping_data'])
+            arguments.extend(['--mapping', str(mapping_path)])
+        for parameter in payload.get('parameters', []):
+            arguments.extend(['--param', parameter])
+        if payload.get('export_frames'):
+            arguments.append('--export-frames')
     return arguments
 
 def run_background(payload):
@@ -376,7 +419,8 @@ def run_background(payload):
             return {'ok': True, 'status': 'running', 'already_running': True,
                     'task': payload['action']}
         background_arguments(payload)
-        atomic_json(result_path, {'ok': True, 'status': 'starting', 'deadline_seconds': payload['max_seconds']})
+        atomic_json(result_path, {'ok': True, 'status': 'starting', 'deadline_seconds': payload['max_seconds'],
+                                 'request_id': payload.get('request_id')})
         progress_name = {'download': 'model-progress.json', 'prepare': 'prepare-progress.json', 'render': 'render-progress.json'}[payload['action']]
         atomic_json(state / progress_name, {'status': 'starting', 'phase': 'queued', 'files': []})
         with (logs / (name + '.log')).open('a', encoding='utf-8') as log:
@@ -386,7 +430,10 @@ def run_background(payload):
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                 pass_fds=(lock_fd,),
             )
-        atomic_json(process_path, {'pid': process.pid, 'stamp': process_stamp(process.pid)})
+        process_record = {'pid': process.pid, 'stamp': process_stamp(process.pid)}
+        if payload.get('request_id'):
+            process_record['request_id'] = payload['request_id']
+        atomic_json(process_path, process_record)
         return {'ok': True, 'status': 'started', 'task': payload['action'],
                 'deadline_seconds': payload['max_seconds'],
                 'next': 'Use status to verify this task result.'}
@@ -410,7 +457,10 @@ def stop_background(action):
             os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    atomic_json(result_path, {'ok': False, 'status': 'stopped', 'error': 'Owned task stopped by caller.'})
+    stopped = {'ok': False, 'status': 'stopped', 'error': 'Owned task stopped by caller.'}
+    atomic_json(result_path, stopped)
+    if process.get('request_id'):
+        finish_job(process, stopped)
 
 def start_service(payload):
     state = Path('/content/colab-comfyui-runtime')
@@ -424,7 +474,7 @@ def start_service(payload):
             return {'ok': True, 'status': 'starting', 'already_running': True}
         if not (state / '.venv/bin/python').is_file():
             raise RuntimeError('Installation must be ready before starting services.')
-        payload = dict(payload, request_id=uuid.uuid4().hex)
+        payload = dict(payload, request_id=payload.get('request_id') or uuid.uuid4().hex)
         atomic_json(state / 'start-result.json', {'ok': True, 'status': 'starting', 'request_id': payload['request_id']})
         atomic_json(state / 'startup-progress.json', {'status': 'starting', 'phase': 'queued', 'updated_at': time.time()})
         with (logs / 'start.log').open('a', encoding='utf-8') as log:
@@ -467,7 +517,16 @@ def runtime_action(payload):
         stop_background('download')
         stop_background('prepare')
         stop_background('render')
-    result = runtime_result(payload)
+    runtime_payload = dict(payload)
+    if payload['action'] == 'stop':
+        # User stop has its own journal ID; only failed-start cleanup is scoped
+        # to the startup request (and calls runtime_result directly).
+        runtime_payload.pop('request_id', None)
+    if payload.get('not_after') and payload['action'] not in ('status', 'stop'):
+        runtime_timeout = min(50, max(0.1, payload['not_after'] - time.time()))
+        result = runtime_result(runtime_payload, timeout=runtime_timeout)
+    else:
+        result = runtime_result(runtime_payload)
     if payload['action'] == 'status':
         result['startup'] = read_startup()
         result['model_download'] = background_status('download')
@@ -480,6 +539,150 @@ def runtime_action(payload):
 """
 
 
+REMOTE_HELPERS += r"""
+
+def request_path(identifier):
+    if not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', identifier):
+        raise RuntimeError('Invalid request_id.')
+    directory = Path('/content/colab-comfyui-runtime/jobs')
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return directory / (identifier + '.json')
+
+def bind_instance(payload):
+    if not payload.get('assignment_id'):
+        return
+    path = Path('/content/colab-comfyui-runtime/instance.json')
+    for component in (*reversed(path.parents), path, path.with_suffix('.lock')):
+        if component.is_symlink():
+            raise RuntimeError('Runtime identity paths must not contain symlinks.')
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    expected = {'session': payload['session'], 'assignment_id': payload['assignment_id']}
+    descriptor = os.open(path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.exists():
+            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW)) as source:
+                if json.load(source) != expected:
+                    raise RuntimeError('Runtime assignment identity differs from the saved instance marker.')
+        else:
+            atomic_json(path, expected)
+
+def job_status(identifier):
+    path = request_path(identifier)
+    if not path.exists():
+        return {'ok': False, 'status': 'not_found', 'request_id': identifier, 'job_id': identifier,
+                'error': 'No remote request record; an earlier uncertain submission must not be repeated automatically.'}
+    record = json.loads(path.read_text())
+    result = record.get('result')
+    response = dict(result) if isinstance(result, dict) else {
+        'ok': False, 'status': 'submission_unknown',
+        'error': 'Dispatch was recorded without a verified result. Inspect before any new submission.'}
+    response.update(request_id=identifier, job_id=identifier, action=record['action'],
+                    session=record.get('session'), assignment_id=record.get('assignment_id'))
+    if record['action'] == 'render':
+        render_path = Path('/content/colab-comfyui-runtime/render-jobs') / (identifier + '.json')
+        if render_path.exists():
+            render_record = safe_result(json.loads(render_path.read_text()))
+            executable = Path('/content/colab-comfyui-runtime/.venv/bin/python')
+            script = Path('/content/colab-comfyui-launcher/scripts/render_workflow.py')
+            if executable.is_file() and script.is_file():
+                try:
+                    completed = subprocess.run(
+                        [str(executable), str(script), '--query-only', '--request-id', identifier,
+                         '--job-dir', str(render_path.parent), '--max-seconds', '20'],
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=25, check=False)
+                    queried = json.loads(completed.stdout)
+                    if not isinstance(queried.get('result'), dict) or queried.get('request_id') != identifier:
+                        raise ValueError('Invalid render query response')
+                    render_record = safe_result(queried['result'])
+                    response['query_state'] = queried.get('query_state', 'verified')
+                    if queried.get('ok') is not True:
+                        response['query_error'] = safe_result(queried.get('error', 'Render query unavailable.'))
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    response['query_state'] = 'unavailable'
+            if render_record.get('request_id') != identifier or render_record.get('assignment_id') != record.get('assignment_id'):
+                raise RuntimeError('Render request identity differs from its launcher job.')
+            response.update(render_record=render_record, status=render_record.get('status', response['status']))
+            if render_record.get('terminal'):
+                response.update(render_record)
+    elif record['action'] in ('prepare', 'download') and response.get('status') in ('started', 'starting'):
+        state, process_path, result_path, name = background_paths(record['action'])
+        process = json.loads(process_path.read_text()) if process_path.exists() else {}
+        if process.get('request_id') == identifier and process_stamp(process.get('pid')) != process.get('stamp'):
+            response.update(ok=False, status='interrupted', error='Task controller exited without a final receipt; inspect status before a new request.')
+    return response
+
+def finish_job(payload, result):
+    identifier = payload.get('request_id')
+    if not identifier:
+        return
+    path = request_path(identifier)
+    with path.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not path.exists():
+            return
+        record = json.loads(path.read_text())
+        result = dict(result, request_id=identifier, job_id=identifier,
+                      session=record.get('session'), assignment_id=record.get('assignment_id'))
+        record.update(result=safe_result(result), updated_at=time.time())
+        atomic_json(path, record)
+
+def dispatch(payload):
+    bind_instance(payload)
+    action = payload['action']
+    if payload.get('not_after') and action not in ('status', 'job', 'stop') and time.time() >= payload['not_after']:
+        return {'ok': False, 'status': 'budget_expired', 'error': 'Work protection deadline passed before remote dispatch.'}
+    if payload.get('not_after') and action not in ('status', 'job', 'stop'):
+        payload = dict(payload)
+        remaining = payload['not_after'] - time.time()
+        for field in ('max_seconds', 'install_timeout', 'work_seconds_remaining'):
+            if field in payload:
+                payload[field] = min(payload[field], remaining)
+    if action == 'job':
+        return job_status(payload['request_id'])
+    if action.startswith('asset-'):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('launcher_asset_transfer', '/content/colab-comfyui-launcher/scripts/assets.py')
+        assets = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(assets)
+        return assets.remote_action(payload)
+    if action == 'deploy':
+        return deploy(payload)
+    if action == 'install':
+        return install(payload)
+    if action in ('download', 'prepare', 'render'):
+        return run_background(payload)
+    return runtime_action(payload)
+
+def dispatch_request(payload):
+    identifier = payload.get('request_id')
+    if not identifier or payload['action'] in ('status', 'job') or payload['action'].startswith('asset-'):
+        return dispatch(payload)
+    path = request_path(identifier)
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    with path.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.exists():
+            old = json.loads(path.read_text())
+            if old['payload_sha256'] != digest:
+                raise RuntimeError('request_id already belongs to different arguments.')
+            return job_status(identifier)
+        record = {'version': 1, 'request_id': identifier, 'job_id': identifier, 'action': payload['action'],
+                  'session': payload.get('session'), 'assignment_id': payload.get('assignment_id'),
+                  'payload_sha256': digest, 'created_at': time.time(), 'status': 'dispatching'}
+        atomic_json(path, record)
+        try:
+            result = dispatch(payload)
+        except Exception as error:
+            result = {'ok': False, 'status': 'submission_unknown', 'error': redact(str(error))}
+        result.update(request_id=identifier, job_id=identifier, session=record['session'],
+                      assignment_id=record['assignment_id'])
+        record.update(result=safe_result(result), updated_at=time.time())
+        atomic_json(path, record)
+        return result
+"""
+
+
 def remote_program(payload: dict[str, Any]) -> str:
     """Build Python source; all varying values enter through a JSON literal."""
     serialized = json.dumps(payload, ensure_ascii=True)
@@ -488,7 +691,7 @@ def remote_program(payload: dict[str, Any]) -> str:
         + """\
 payload = json.loads(sys.argv[1])
 try:
-    result = runtime_result(payload, timeout=210)
+    result = runtime_result(payload, timeout=min(210, payload.get('work_seconds_remaining', 210)))
 except Exception as error:
     result = {'ok': False, 'status': 'failed', 'error': redact(str(error))}
     try:
@@ -497,6 +700,7 @@ except Exception as error:
     except Exception:
         pass
 atomic_json(Path('/content/colab-comfyui-runtime/start-result.json'), result)
+finish_job(payload, result)
 """
     )
     background_supervisor = (
@@ -519,12 +723,31 @@ try:
     if completed.returncode != 0 and result['ok'] is True:
         raise RuntimeError('Task exited unsuccessfully despite its success result.')
     result = safe_result(result)
-    result['status'] = 'succeeded' if result['ok'] is True else 'failed'
+    result['status'] = 'succeeded' if result['ok'] is True else result.get('status', 'failed')
 except Exception as error:
     result = {'ok': False, 'status': 'failed', 'error': redact(str(error))}
     if payload['action'] == 'render':
         result['job_may_still_be_running'] = True
 atomic_json(result_path, result)
+finish_job(payload, result)
+"""
+    )
+    install_supervisor = (
+        REMOTE_HELPERS
+        + """\
+payload = json.loads(sys.argv[1])
+try:
+    completed = subprocess.run(
+        ['timeout', '--signal=TERM', '--kill-after=15', str(payload['install_timeout']),
+         'bash', '/content/colab-comfyui-launcher/scripts/bootstrap.sh', 'install'],
+        stdin=subprocess.DEVNULL, check=False)
+    path = Path('/content/colab-comfyui-runtime/install.json')
+    installation = json.loads(path.read_text()) if path.exists() else {}
+    success = completed.returncode == 0 and installation.get('status') == 'ready'
+    result = {'ok': success, 'status': 'succeeded' if success else 'failed', 'installation': installation}
+except Exception as error:
+    result = {'ok': False, 'status': 'failed', 'error': redact(str(error))}
+finish_job(payload, result)
 """
     )
     return (
@@ -532,16 +755,10 @@ atomic_json(result_path, result)
         + f"""\
 START_SUPERVISOR = {supervisor!r}
 BACKGROUND_SUPERVISOR = {background_supervisor!r}
+INSTALL_SUPERVISOR = {install_supervisor!r}
 payload = json.loads({serialized!r})
 try:
-    if payload['action'] == 'deploy':
-        result = deploy(payload)
-    elif payload['action'] == 'install':
-        result = install(payload)
-    elif payload['action'] in ('download', 'prepare', 'render'):
-        result = run_background(payload)
-    else:
-        result = runtime_action(payload)
+    result = dispatch_request(payload)
 except Exception as error:
     result = {{'ok': False, 'error': redact(str(error))}}
 print({RESULT_PREFIX!r} + json.dumps(result, ensure_ascii=True))
@@ -572,7 +789,9 @@ def execute_remote(
         result = parse_result(completed.stdout)
     except BridgeError as exc:
         detail = _failure_summary(completed)
-        raise BridgeError(f"{exc}\n{detail}" if detail else str(exc)) from exc
+        raise BridgeError(
+            f"{exc}\n{detail}" if detail else str(exc), result=exc.result
+        ) from exc
     if completed.returncode != 0:
         raise BridgeError(
             "Colab command exited unsuccessfully. " + _failure_summary(completed)
@@ -587,6 +806,7 @@ def build_archive(destination: Path) -> str:
         PROJECT_ROOT / "scripts/download_models.py",
         PROJECT_ROOT / "scripts/prepare_models.py",
         PROJECT_ROOT / "scripts/render_workflow.py",
+        PROJECT_ROOT / "scripts/assets.py",
     ]
     selection_name = "selected-extra-manifests.json"
     files.extend(
@@ -640,7 +860,7 @@ def build_archive(destination: Path) -> str:
     return hashlib.sha256(destination.read_bytes()).hexdigest()
 
 
-def deploy(session: str, timeout: float) -> dict[str, Any]:
+def deploy(session: str, timeout: float, payload: dict | None = None) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="colab-launcher-deploy-") as temporary:
         archive = Path(temporary) / "colab-comfyui-launcher.zip"
         checksum = build_archive(archive)
@@ -659,7 +879,9 @@ def deploy(session: str, timeout: float) -> dict[str, Any]:
                 "Deployment upload failed. " + _failure_summary(completed)
             )
         return execute_remote(
-            session, {"action": "deploy", "sha256": checksum}, timeout
+            session,
+            {**(payload or {}), "action": "deploy", "sha256": checksum},
+            timeout,
         )
 
 
@@ -679,12 +901,80 @@ def parser() -> argparse.ArgumentParser:
         "-s", "--session", required=True, help="Existing Colab session name"
     )
     root.add_argument(
+        "--request-id",
+        type=request_id,
+        help="Stable caller ID; reuse queries the original request",
+    )
+    root.add_argument(
+        "--json", action="store_true", help="JSON output (also the default)"
+    )
+    root.add_argument(
         "--timeout",
         type=positive_seconds,
         default=120.0,
         help="Local timeout for each short official CLI invocation (default: 120s)",
     )
     actions = root.add_subparsers(dest="action", required=True)
+    new = actions.add_parser(
+        "new", help="Allocate one instance with a persistent CU guard"
+    )
+    hardware = new.add_mutually_exclusive_group(required=True)
+    hardware.add_argument("--gpu", choices=("T4", "L4", "G4", "H100", "A100"))
+    hardware.add_argument("--cpu", action="store_true")
+    adopt = actions.add_parser(
+        "adopt", help="Explicitly take budget responsibility for an existing allocation"
+    )
+    adopt.add_argument("--assignment-id", required=True)
+    adopt.add_argument(
+        "--allocated-at",
+        type=positive_seconds,
+        required=True,
+        help="Original allocation Unix timestamp, never the reconnection time",
+    )
+    adopt.add_argument("--confirm", action="store_true", required=True)
+    for command in (new, adopt):
+        command.add_argument("--cu-limit", type=positive_seconds, required=True)
+        command.add_argument(
+            "--rate-ceiling",
+            type=positive_seconds,
+            required=True,
+            help="Conservative CU/hour bound; unknown rates cannot start managed work",
+        )
+        command.add_argument("--reserve-cu", type=positive_seconds)
+    budget = actions.add_parser(
+        "budget", help="Read the persisted single-allocation budget and guard status"
+    )
+    budget.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Resume the recorded guard and reconcile its allocation; an expired budget may release the instance",
+    )
+    hold = actions.add_parser(
+        "hold", help="Retain a managed idle VM for a bounded period"
+    )
+    hold.add_argument("--seconds", type=positive_seconds, required=True)
+    actions.add_parser(
+        "release",
+        help="Release only this allocation and verify absence on the platform",
+    )
+    job = actions.add_parser(
+        "job", help="Query a durable request after any client restart"
+    )
+    job.add_argument("identifier", type=request_id)
+    actions.add_parser(
+        "jobs", help="List local durable request receipts for this session"
+    )
+    upload = actions.add_parser(
+        "upload", help="Upload an input with instance identity and SHA verification"
+    )
+    upload.add_argument("source", type=Path)
+    collect = actions.add_parser(
+        "collect", help="Collect and verify outputs into an instance/job directory"
+    )
+    manifest = collect.add_mutually_exclusive_group(required=True)
+    manifest.add_argument("--manifest", type=Path)
+    manifest.add_argument("--job", type=request_id)
+    collect.add_argument("--destination", type=Path, required=True)
     actions.add_parser(
         "deploy", help="Upload only launcher scripts and JSON configurations"
     )
@@ -764,15 +1054,39 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Download missing pinned files into Drive cache, or directly to VM with --ephemeral",
     )
+    prepare.add_argument(
+        "--mode",
+        choices=("verify_only", "download_missing"),
+        help="Explicit preparation policy; default verify_only",
+    )
     render = actions.add_parser(
         "render", help="Start bounded execution of the deployed H3 API workflow"
     )
     render.add_argument("--max-seconds", type=positive_seconds, default=900.0)
     render.add_argument(
         "--workflow",
-        choices=("h3-i2v-api.json", "h3-api.json"),
+        choices=("h3-i2v-api.json", "h3-api.json", "h3-first-last-api.json"),
         default="h3-i2v-api.json",
         help="Official I2V template test (default), or the original T2V test",
+    )
+    render.add_argument(
+        "--workflow-file",
+        type=Path,
+        help="Complete custom ComfyUI API JSON, without requiring a parameter mapping",
+    )
+    render.add_argument(
+        "--mapping", type=Path, help="Optional named-parameter mapping JSON"
+    )
+    render.add_argument(
+        "--param",
+        action="append",
+        default=[],
+        help="Named parameter NAME=JSON, repeatable",
+    )
+    render.add_argument(
+        "--export-frames",
+        action="store_true",
+        help="Include optional decoded first/last frame assets",
     )
     for action in ("status", "smoke", "stop"):
         actions.add_parser(
@@ -786,8 +1100,7 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def main(argv: list[str] | None = None) -> int:
-    arguments = parser().parse_args(argv)
+def command_payload(arguments) -> dict[str, Any]:
     payload: dict[str, Any] = {"action": arguments.action}
     if arguments.action == "install":
         payload["install_timeout"] = arguments.install_timeout
@@ -797,25 +1110,41 @@ def main(argv: list[str] | None = None) -> int:
             payload["workers"] = arguments.workers
         if arguments.action == "render":
             payload["workflow"] = arguments.workflow
+            for option, key in (
+                ("workflow_file", "workflow_data"),
+                ("mapping", "mapping_data"),
+            ):
+                source = getattr(arguments, option)
+                if source:
+                    if source.stat().st_size > 4 * 1024 * 1024:
+                        raise ValueError(
+                            "Workflow/mapping JSON exceeds the 4 MiB limit."
+                        )
+                    data = json.loads(source.read_text())
+                    if not isinstance(data, dict):
+                        raise ValueError("Workflow/mapping must be a JSON object.")
+                    payload[key] = data
+            payload.update(
+                parameters=arguments.param, export_frames=arguments.export_frames
+            )
         if arguments.action == "download":
             if arguments.models_root and not arguments.models_root.startswith("/"):
-                print("Models root must be an absolute runtime path.", file=sys.stderr)
-                return 2
+                raise ValueError("Models root must be an absolute runtime path.")
             payload.update(
                 models_root=arguments.models_root,
                 ephemeral=arguments.ephemeral,
                 verify_cache=arguments.verify_cache,
             )
         elif arguments.action == "prepare":
+            if arguments.mode == "verify_only" and arguments.download_missing:
+                raise ValueError("verify_only conflicts with --download-missing.")
+            arguments.download_missing = (
+                arguments.download_missing or arguments.mode == "download_missing"
+            )
             if arguments.ephemeral and arguments.cache_root:
-                print(
-                    "--ephemeral cannot be combined with --cache-root.",
-                    file=sys.stderr,
-                )
-                return 2
+                raise ValueError("--ephemeral cannot be combined with --cache-root.")
             if arguments.cache_root and not arguments.cache_root.startswith("/"):
-                print("Cache root must be an absolute runtime path.", file=sys.stderr)
-                return 2
+                raise ValueError("Cache root must be an absolute runtime path.")
             payload.update(
                 cache_root=arguments.cache_root,
                 ephemeral=arguments.ephemeral,
@@ -826,11 +1155,9 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.allowed_email and not re.fullmatch(
             r"[^\s@]+@[^\s@]+\.[^\s@]+", arguments.allowed_email
         ):
-            print("Allowed email must be a valid email address.", file=sys.stderr)
-            return 2
+            raise ValueError("Allowed email must be a valid email address.")
         if not arguments.ephemeral and not arguments.storage_root.startswith("/"):
-            print("Storage root must be an absolute runtime path.", file=sys.stderr)
-            return 2
+            raise ValueError("Storage root must be an absolute runtime path.")
         payload.update(
             storage_root=arguments.storage_root,
             ephemeral=arguments.ephemeral,
@@ -839,17 +1166,356 @@ def main(argv: list[str] | None = None) -> int:
             local_only=arguments.local_only,
             cpu=arguments.cpu,
         )
-    try:
-        result = (
-            deploy(arguments.session, arguments.timeout)
-            if arguments.action == "deploy"
-            else execute_remote(arguments.session, payload, arguments.timeout)
+    return payload
+
+
+def budget_manager():
+    from budget_guard import BudgetManager
+
+    return BudgetManager()
+
+
+def provider():
+    from colab_provider import ColabProvider
+
+    return ColabProvider()
+
+
+def assignment(session: str) -> dict:
+    api = provider()
+    scope = api.account_scope()
+    matches = [row for row in api.sessions() if row["name"] == session]
+    if scope == "unknown" or api.account_scope() != scope:
+        raise BridgeError(
+            "Authentication scope changed during allocation verification."
         )
-    except (BridgeError, OSError, ValueError, zipfile.BadZipFile) as exc:
+    if len(matches) != 1:
+        raise BridgeError(
+            "The selected session has no unique verified platform allocation."
+        )
+    return dict(matches[0], account_scope=scope)
+
+
+def safe_structure(value):
+    if isinstance(value, dict):
+        return {key: safe_structure(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [safe_structure(item) for item in value]
+    return sanitize_failure(value) if isinstance(value, str) else value
+
+
+def query_job(
+    session: str, identifier: str, timeout: float, *, locked: bool = False
+) -> dict:
+    receipts = ClientRequests(session)
+    if not locked:
+        with receipts.lock(identifier):
+            return query_job(session, identifier, timeout, locked=True)
+    local = receipts.read(identifier)
+    cached = local.get("result") or {}
+    if local.get("action") == "release" and cached:
+        return dict(cached, source="local_receipt")
+    settled = cached.get("terminal") is True or (
+        cached.get("status")
+        in ("succeeded", "failed", "released", "completed", "not_submitted")
+        and cached.get("terminal") is not False
+        and not cached.get("job_may_still_be_running")
+    )
+    if settled:
+        return dict(cached, source="local_receipt")
+    current = assignment(session)
+    if local and local.get("assignment_id") != current["assignment_id"]:
+        raise BridgeError(
+            "Original allocation is unavailable; refusing to query a replacement instance."
+        )
+    result = execute_remote(
+        session,
+        {
+            "action": "job",
+            "request_id": identifier,
+            "assignment_id": current["assignment_id"],
+            "session": session,
+        },
+        timeout,
+    )
+    if local:
+        receipts.finish(identifier, safe_structure(result))
+    return result
+
+
+def submit_command(arguments, payload: dict) -> dict:
+    identifier = arguments.request_id or uuid.uuid4().hex
+    current = assignment(arguments.session)
+    payload = dict(
+        payload,
+        request_id=identifier,
+        session=arguments.session,
+        assignment_id=current["assignment_id"],
+    )
+    receipts = ClientRequests(arguments.session)
+    with receipts.lock(identifier):
+        _, fresh = receipts.begin(identifier, payload)
+        dispatched = not fresh
+        try:
+            if not fresh:
+                result = query_job(
+                    arguments.session, identifier, arguments.timeout, locked=True
+                )
+            else:
+                effective = dict(payload)
+                action = payload["action"]
+                seconds = payload.get("max_seconds", payload.get("install_timeout"))
+                allowed = budget_manager().authorize(arguments.session, action, seconds)
+                if allowed is not None:
+                    effective["work_seconds_remaining"] = allowed
+                    effective["not_after"] = time.time() + allowed
+                    if "max_seconds" in effective:
+                        effective["max_seconds"] = min(
+                            effective["max_seconds"], allowed
+                        )
+                    if "install_timeout" in effective:
+                        effective["install_timeout"] = min(
+                            effective["install_timeout"], allowed
+                        )
+                dispatched = True
+                result = (
+                    deploy(arguments.session, arguments.timeout, effective)
+                    if action == "deploy"
+                    else execute_remote(arguments.session, effective, arguments.timeout)
+                )
+            result = dict(
+                result,
+                request_id=identifier,
+                job_id=identifier,
+                session=arguments.session,
+                assignment_id=current["assignment_id"],
+            )
+            receipts.finish(identifier, safe_structure(result))
+            return result
+        except Exception as exc:
+            result = dict(
+                getattr(exc, "result", None) or {},
+                ok=False,
+                request_id=identifier,
+                job_id=identifier,
+                session=arguments.session,
+                assignment_id=current["assignment_id"],
+            )
+            result.setdefault("status", "submission_unknown")
+            if not dispatched:
+                result.update(
+                    status="not_submitted",
+                    terminal=True,
+                    job_may_still_be_running=False,
+                )
+            result.setdefault("error", sanitize_failure(str(exc)))
+            receipts.finish(identifier, safe_structure(result))
+            raise BridgeError(result["error"], result=result) from exc
+
+
+def release_unmanaged(arguments) -> dict:
+    """Persist explicit release identity so a timeout can be retried safely."""
+    receipts = ClientRequests(arguments.session)
+    identifier = arguments.request_id
+    previous = (
+        receipts.read(identifier)
+        if identifier
+        else next(
+            (
+                row
+                for row in receipts.list()
+                if row["action"] == "release" and row.get("status") != "released"
+            ),
+            {},
+        )
+    )
+    if previous:
+        if previous["action"] != "release":
+            raise ValueError("request_id belongs to a different action.")
+        identifier = previous["request_id"]
+        if previous.get("status") == "released":
+            return dict(previous["result"], source="local_receipt")
+        payload = {
+            "action": "release",
+            "assignment_id": previous["assignment_id"],
+            "account_scope": previous["account_scope"],
+        }
+    else:
+        current = assignment(arguments.session)
+        identifier = identifier or uuid.uuid4().hex
+        payload = {
+            "action": "release",
+            "assignment_id": current["assignment_id"],
+            "account_scope": current["account_scope"],
+        }
+    with receipts.lock(identifier):
+        receipts.begin(identifier, payload)
+        result = provider().verified_release(
+            arguments.session,
+            payload["assignment_id"],
+            expected_scope=payload["account_scope"],
+        )
+        result.update(request_id=identifier, job_id=identifier)
+        receipts.finish(identifier, safe_structure(result))
+        return result
+
+
+def run_command(arguments, payload: dict) -> dict:
+    action, session = arguments.action, arguments.session
+    if (
+        not session
+        or session.startswith("-")
+        or any(c.isspace() or ord(c) < 32 for c in session)
+    ):
+        raise ValueError("Choose a valid session name.")
+    if action == "new":
+        result = budget_manager().create(
+            session,
+            gpu=arguments.gpu,
+            limit_cu=arguments.cu_limit,
+            rate_ceiling=arguments.rate_ceiling,
+            reserve_cu=arguments.reserve_cu,
+            request_id=arguments.request_id,
+        )
+        if result.get("status") in ("active", "holding", "collect_only"):
+            current = assignment(session)
+            if current["assignment_id"] != result.get("assignment_id"):
+                raise BridgeError(
+                    "Allocation changed after creation; inspect the recorded budget before continuing."
+                )
+            result["provider"] = {
+                key: value for key, value in current.items() if key != "account_scope"
+            }
+        return result
+    if action == "adopt":
+        return budget_manager().adopt(
+            session,
+            arguments.assignment_id,
+            limit_cu=arguments.cu_limit,
+            rate_ceiling=arguments.rate_ceiling,
+            reserve_cu=arguments.reserve_cu,
+            allocated_at=arguments.allocated_at,
+            confirm=arguments.confirm,
+            request_id=arguments.request_id,
+        )
+    if action == "budget":
+        return budget_manager().status(session, refresh=arguments.refresh)
+    if action == "hold":
+        return budget_manager().hold(session, arguments.seconds)
+    if action == "release":
+        managed = budget_manager().status(session)
+        if managed.get("managed"):
+            return budget_manager().release(session)
+        return release_unmanaged(arguments)
+    if action == "jobs":
+        return {
+            "ok": True,
+            "session": session,
+            "requests": ClientRequests(session).list(),
+        }
+    if action == "job":
+        return query_job(session, arguments.identifier, arguments.timeout)
+    if action in ("upload", "collect"):
+        from assets import AssetsClient
+
+        current = assignment(session)
+        manifest = None
+        if action == "collect":
+            manifest = (
+                json.loads(arguments.manifest.read_text())
+                if arguments.manifest
+                else query_job(session, arguments.job, arguments.timeout)
+            )
+            for key in ("result", "render_record"):
+                if "assets" not in manifest and isinstance(manifest.get(key), dict):
+                    nested = manifest[key]
+                    if nested.get("status") == "succeeded":
+                        manifest = {**manifest, **nested}
+        allowed = budget_manager().authorize(session, action, arguments.timeout)
+        seconds = (
+            min(arguments.timeout, allowed)
+            if allowed is not None
+            else arguments.timeout
+        )
+        cutoff = time.monotonic() + seconds
+
+        def remaining():
+            value = cutoff - time.monotonic()
+            if value <= 0:
+                raise BridgeError("Asset transfer protection deadline reached.")
+            return value
+
+        def checked_identity(selected):
+            nonlocal cutoff
+            allowance = budget_manager().authorize(selected, action, remaining())
+            if allowance is not None:
+                cutoff = min(cutoff, time.monotonic() + allowance)
+            return assignment(selected)["assignment_id"]
+
+        def transfer(argv, timeout):
+            return _run_colab(argv, min(timeout, remaining()))
+
+        def remote(selected, operation, timeout):
+            operation = dict(operation, not_after=time.time() + remaining())
+            return execute_remote(selected, operation, min(timeout, remaining()))
+
+        client = AssetsClient(
+            session,
+            current["assignment_id"],
+            transfer,
+            remote,
+            checked_identity,
+            timeout=seconds,
+        )
+        if action == "upload":
+            return client.upload(arguments.source)
+        return client.collect(manifest, arguments.destination, job_id=arguments.job)
+    if action == "status":
+        result = execute_remote(session, payload, arguments.timeout)
+        result["budget"] = budget_manager().status(session)
+        result["recent_requests"] = [
+            {
+                key: row.get(key)
+                for key in ("request_id", "job_id", "action", "status", "assignment_id")
+            }
+            for row in ClientRequests(session).list()[:20]
+        ]
+        return result
+    return submit_command(arguments, payload)
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        arguments = parser().parse_args(argv)
+    except SystemExit as exc:
+        if exc.code:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error": "Invalid arguments; see stderr.",
+                    }
+                )
+            )
+        return int(exc.code or 0)
+    try:
+        result = run_command(arguments, command_payload(arguments))
+    except Exception as exc:  # noqa: BLE001 - always emit structured errors at the CLI boundary.
+        result = dict(getattr(exc, "result", None) or {})
+        result.update(ok=False)
+        result.setdefault(
+            "status", "invalid_arguments" if isinstance(exc, ValueError) else "failed"
+        )
+        result.setdefault("error", sanitize_failure(str(exc)))
+        if arguments.request_id:
+            result.setdefault("request_id", arguments.request_id)
+            result.setdefault("job_id", arguments.request_id)
         print(sanitize_failure(str(exc)), file=sys.stderr)
-        return 1
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0
+        print(json.dumps(safe_structure(result), ensure_ascii=False, indent=2))
+        return 2 if isinstance(exc, ValueError) else 1
+    print(json.dumps(safe_structure(result), ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") is True else 1
 
 
 if __name__ == "__main__":

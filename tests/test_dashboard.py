@@ -209,21 +209,31 @@ class BackendTests(unittest.TestCase):
             self.assertIs(call.kwargs["stdin"], subprocess.DEVNULL)
             self.assertTrue(call.kwargs["capture_output"])
 
-    def test_provider_stop_exit_zero_without_termination_is_unknown(self):
+    def test_release_requires_platform_verification_not_provider_stop_text(self):
         self.run.return_value = subprocess.CompletedProcess(
             [], 0, "Session 'chosen-existing-session' not found.", ""
         )
-        with self.assertRaisesRegex(dashboard.DashboardError, "not verified"):
+        with self.assertRaisesRegex(dashboard.DashboardError, "unknown"):
             self.backend.release(self.config)
         self.run.assert_called_once()
         self.run.reset_mock()
         self.run.return_value = subprocess.CompletedProcess(
             [], 0, "[colab] Session terminated.", ""
         )
+        with self.assertRaisesRegex(dashboard.DashboardError, "unknown"):
+            self.backend.release(self.config)
+        self.run.return_value = subprocess.CompletedProcess(
+            [], 0, '{"ok":true,"status":"released","verified":false}', ""
+        )
+        with self.assertRaisesRegex(dashboard.DashboardError, "not verified"):
+            self.backend.release(self.config)
+        self.run.return_value = subprocess.CompletedProcess(
+            [], 0, '{"ok":true,"status":"released","verified":true}', ""
+        )
         self.backend.release(self.config)
         self.assertEqual(
-            self.command(),
-            ["colab", "--auth=oauth2", "stop", "-s", self.config.session],
+            self.command()[-3:],
+            ["-s", self.config.session, "release"],
         )
 
     def test_provider_lists_named_sessions_without_retaining_endpoints(self):

@@ -385,12 +385,22 @@ def main(argv=None):
         help="Explicitly download missing pinned files into Drive cache, or directly to VM with --ephemeral",
     )
     parser.add_argument(
+        "--mode",
+        choices=("verify_only", "download_missing"),
+        help="verify_only prepares existing pinned files without network downloads; download_missing also fetches missing files",
+    )
+    parser.add_argument(
         "--progress-file",
         type=Path,
         help="Local runtime progress JSON (default: prepare-progress.json)",
     )
     try:
-        result = run(parser.parse_args(argv))
+        args = parser.parse_args(argv)
+        if args.mode == "verify_only" and args.download_missing:
+            raise cache.DownloadError("verify_only conflicts with --download-missing")
+        args.download_missing = args.download_missing or args.mode == "download_missing"
+        result = run(args)
+        result["mode"] = "download_missing" if args.download_missing else "verify_only"
     except cache.DownloadError as error:
         result = {"ok": False, "error": str(error)}
     except KeyboardInterrupt:

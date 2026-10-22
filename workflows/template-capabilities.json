@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "comfyui_commit": "f1072eb0350638a3390ddb6afbcaa8c6b237c6fd",
+  "templates": [
+    {
+      "mode": "i2v",
+      "workflow": "h3-i2v-api.json",
+      "mapping": "h3-i2v.mapping.json",
+      "node": "MiniMaxH3ImageToVideo",
+      "support": "included",
+      "validation": "Historical browser template validation; new parameter wrapper offline-tested only."
+    },
+    {
+      "mode": "first_last_frame",
+      "workflow": "h3-first-last-api.json",
+      "mapping": "h3-first-last.mapping.json",
+      "node": "MiniMaxH3ImageToVideo",
+      "support": "pinned_node_inputs",
+      "validation": "Offline schema/example validation only; real two-image generation not verified."
+    },
+    {
+      "mode": "r2v",
+      "workflow": null,
+      "mapping": null,
+      "node": "MiniMaxH3ReferenceToVideo",
+      "support": "not_provided",
+      "validation": "Separate node and model requirements; launcher manifest and generation have not been verified for this mode."
+    }
+  ]
+}

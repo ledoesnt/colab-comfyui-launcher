@@ -5,6 +5,7 @@ import fcntl
 import importlib.util
 import io
 import json
+import os
 import signal
 import subprocess
 import tempfile
@@ -44,6 +45,9 @@ class BackgroundBridgeTests(unittest.TestCase):
             )
 
         self.namespace["background_paths"] = paths
+        self.namespace["request_path"] = lambda identifier: (
+            self.state / (identifier + ".json")
+        )
         self.namespace["background_arguments"] = lambda payload: ["python", "runner.py"]
         self.payload = {"action": "download", "max_seconds": 10, "ephemeral": True}
 
@@ -499,13 +503,30 @@ class UndeployedRuntimeTests(unittest.TestCase):
                 mock.patch("sys.stderr", stderr),
             ):
                 self.assertEqual(bridge.main(["-s", "missing", "status"]), 1)
-            self.assertEqual(stdout.getvalue(), "")
+            self.assertFalse(json.loads(stdout.getvalue())["ok"])
             self.assertIn(error, stderr.getvalue())
             self.assertEqual(command.call_args.args[0][:3], ["exec", "-s", "missing"])
         self.assert_no_process_action()
 
 
 class BackgroundArgumentsTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="launcher-request-test-")
+        self.addCleanup(temporary.cleanup)
+        env = mock.patch.dict(os.environ, COLAB_LAUNCHER_STATE_DIR=temporary.name)
+        env.start()
+        self.addCleanup(env.stop)
+        identity = mock.patch.object(
+            bridge,
+            "assignment",
+            return_value={"name": "owned", "assignment_id": "fixture-allocation"},
+        )
+        identity.start()
+        self.addCleanup(identity.stop)
+        manager = mock.patch.object(bridge, "budget_manager")
+        manager.start().return_value.authorize.return_value = None
+        self.addCleanup(manager.stop)
+
     def test_ephemeral_prepare_payload_and_remote_arguments_use_vm_only(self):
         with (
             mock.patch.object(
@@ -642,7 +663,11 @@ class BackgroundArgumentsTests(unittest.TestCase):
             )
         self.assertEqual(code, 0)
         self.assertEqual(
-            execute.call_args.args[1],
+            {
+                key: value
+                for key, value in execute.call_args.args[1].items()
+                if key not in ("request_id", "session", "assignment_id")
+            },
             {
                 "action": "download",
                 "max_seconds": 120.0,
@@ -747,6 +772,7 @@ class ArchiveSelectionTests(unittest.TestCase):
                 "download_models.py",
                 "prepare_models.py",
                 "render_workflow.py",
+                "assets.py",
             ):
                 (root / "scripts" / name).write_text("fixture")
             for name in ("h3.json", "extra.json", "extra-added.json"):

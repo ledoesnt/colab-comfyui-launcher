@@ -104,6 +104,116 @@ class Config:
     download_workers: int = 2
     model_url: str = ""
     model_path: str = ""
+    cu_limit: float | None = None
+    rate_ceiling: float | None = None
+    reserve_cu: float | None = None
+    hold_seconds: float = 600.0
+
+
+def validate_budget_config(config: Config) -> None:
+    """Validate an allocation's explicit plan; never infer a GPU billing rate."""
+    if config.cu_limit is None:
+        if config.rate_ceiling is not None or config.reserve_cu is not None:
+            raise DashboardError(
+                "Set this instance's CU limit before its rate or reserve."
+            )
+        return
+    for name, value in (
+        ("CU limit", config.cu_limit),
+        ("conservative CU/hour rate", config.rate_ceiling),
+    ):
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise DashboardError(
+                f"Set a positive {name} before creating a budget-managed runtime."
+            )
+    if config.reserve_cu is not None and (
+        type(config.reserve_cu) not in (int, float)
+        or not math.isfinite(config.reserve_cu)
+        or not 0 < config.reserve_cu < config.cu_limit
+    ):
+        raise DashboardError(
+            "The download/release reserve must be positive and below the CU limit."
+        )
+
+
+def restore_budget_config(config: Config, status: dict[str, Any]) -> Config:
+    """Restore display settings only. The persistent guard owns accounting."""
+    budget = status.get("budget")
+    if not isinstance(budget, dict):
+        return config
+    if budget.get("managed") is not True:
+        return replace(config, cu_limit=None, rate_ceiling=None, reserve_cu=None)
+    values = {
+        "cu_limit": budget.get("limit_cu"),
+        "rate_ceiling": budget.get("rate_ceiling"),
+        "reserve_cu": budget.get("reserve_cu"),
+    }
+    if all(
+        type(value) in (int, float) and math.isfinite(value) and value > 0
+        for value in values.values()
+    ):
+        return replace(config, **values)
+    return config
+
+
+def budget_lines(config: Config, status: dict[str, Any]) -> list[str]:
+    """Human-readable estimates remain distinct from provider account readings."""
+    budget = status.get("budget") or {}
+    if budget.get("managed") is not True:
+        if config.cu_limit is None:
+            return ["CU guard: not configured · explicit release required"]
+        return [
+            f"CU limit: {config.cu_limit:g} · this new allocation only",
+            f"Conservative rate: {config.rate_ceiling:g} CU/hour"
+            if config.rate_ceiling is not None
+            else "Conservative rate: required before managed startup",
+            f"Download / release reserve: {config.reserve_cu:g} CU"
+            if config.reserve_cu is not None
+            else "Download / release reserve: computed by guard",
+            "Launcher best-effort protection; not a Colab hard quota.",
+        ]
+    guard = budget.get("guard") or {}
+    rows = [
+        f"CU guard: {budget.get('status', 'unknown')} · {'running' if guard.get('running') is True else 'not verified running'}"
+    ]
+    estimate = budget.get("estimate") or {}
+    consumed, limit = estimate.get("consumed_cu"), budget.get("limit_cu")
+    if type(consumed) in (int, float) and type(limit) in (int, float):
+        rows.append(
+            f"Conservative estimate: {consumed:.3f} / {limit:g} CU since allocation"
+        )
+    for label, key in (
+        ("Work protection", "work_deadline"),
+        ("Release deadline", "release_deadline"),
+        ("Hold until", "hold_deadline"),
+    ):
+        value = budget.get(key)
+        if type(value) in (int, float) and math.isfinite(value):
+            rows.append(
+                label
+                + ": "
+                + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(value))
+            )
+    observed = budget.get("observed_account") or {}
+    if type(observed.get("balance")) in (int, float):
+        rows.append(
+            f"Observed account balance: {observed['balance']:.2f} CU"
+            + (" · stale" if observed.get("stale") else "")
+        )
+    rows.append(
+        "Best-effort guard continues after UI exit; controller offline/shutdown can prevent release."
+    )
+    return rows
+
+
+def active_managed_budgets() -> list[dict[str, Any]]:
+    # A local read, before touching the provider's authentication cache. Account
+    # changes otherwise strand a guard that cannot identify the old account.
+    if str(ROOT / "scripts") not in sys.path:
+        sys.path.insert(0, str(ROOT / "scripts"))
+    from budget_guard import BudgetManager
+
+    return BudgetManager().list_active()
 
 
 def require_session(config: Config) -> None:
@@ -139,9 +249,9 @@ class Backend:
     def __init__(self, run: Callable[..., Any] = subprocess.run):
         self.run = run
 
-    def json_command(self, argv: list[str]) -> dict[str, Any]:
+    def json_command(self, argv: list[str], *, timeout: float = 150) -> dict[str, Any]:
         try:
-            completed = self.run(argv, text=True, capture_output=True, timeout=150)
+            completed = self.run(argv, text=True, capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             raise DashboardError(
                 "Command timed out; its remote outcome is unknown. Inspect status before retrying."
@@ -204,6 +314,9 @@ class Backend:
             argv.extend(["--workers", str(config.download_workers)])
             argv.extend(["--models-root", config.storage_root.rstrip("/") + "/models"])
         elif action == "prepare":
+            argv.extend(
+                ["--mode", "download_missing" if download_missing else "verify_only"]
+            )
             argv.extend(["--max-seconds", "1800"])
             argv.extend(["--workers", str(config.download_workers)])
             argv.extend(
@@ -221,6 +334,8 @@ class Backend:
                     "H3 rendering requires a GPU. Use PNG smoke for CPU testing."
                 )
             argv.extend(["--max-seconds", "900"])
+        elif action == "hold":
+            argv.extend(["--seconds", str(config.hold_seconds)])
         return self.json_command(argv)
 
     def ssh(self, config: Config, action: str) -> dict[str, Any]:
@@ -301,6 +416,33 @@ class Backend:
 
     def create(self, config: Config) -> dict[str, str]:
         require_session(config)
+        validate_budget_config(config)
+        if config.cu_limit is not None:
+            argv = [
+                sys.executable,
+                str(ROOT / "scripts/colabctl.py"),
+                "-s",
+                config.session,
+                "new",
+                "--cu-limit",
+                str(config.cu_limit),
+                "--rate-ceiling",
+                str(config.rate_ceiling),
+            ]
+            argv.extend(["--cpu"] if config.cpu else ["--gpu", config.gpu])
+            if config.reserve_cu is not None:
+                argv.extend(["--reserve-cu", str(config.reserve_cu)])
+            result = self.json_command(argv, timeout=360)
+            provider = result.get("provider")
+            if (
+                not isinstance(provider, dict)
+                or provider.get("name") != config.session
+                or not provider.get("hardware")
+            ):
+                raise DashboardError(
+                    "Budget allocation outcome is unknown; inspect this session before retrying."
+                )
+            return provider
         arguments = ["new", "-s", config.session]
         if not config.cpu:
             if config.gpu not in ("T4", "L4", "G4", "H100", "A100"):
@@ -332,6 +474,7 @@ class Backend:
             gpu=provider["hardware"] if provider["hardware"] != "CPU" else config.gpu,
         )
         status = self.bridge(candidate, "status")
+        candidate = restore_budget_config(candidate, status)
         saved = status.get("configuration") or {}
         known = (
             isinstance(saved, dict)
@@ -504,6 +647,10 @@ class Backend:
         removal would immediately start the provider's interactive login.
         Browser login, Google grants, ADC, Drive, SSH and VM state are retained.
         """
+        if active_managed_budgets():
+            raise DashboardError(
+                "Release and verify all budget-managed instances before signing out or switching accounts; their guards require this account."
+            )
         try:
             version = self.run(
                 ["colab", "version"],
@@ -598,8 +745,8 @@ class Backend:
 
     def release(self, config: Config) -> None:
         require_session(config)
-        output = self.official(["stop", "-s", config.session])
-        if "Session terminated." not in output:
+        result = self.bridge(config, "release")
+        if result.get("status") != "released" or result.get("verified") is not True:
             raise DashboardError(
                 "VM release was not verified; inspect the selected session before retrying."
             )
@@ -1279,6 +1426,13 @@ class Worker:
                             validate_model_plan()
                         self.events.put(("stage", "creating and verifying runtime"))
                         provider = self.backend.create(config)
+                        config = replace(
+                            config,
+                            cpu=provider["hardware"] == "CPU",
+                            gpu=provider["hardware"]
+                            if provider["hardware"] != "CPU"
+                            else config.gpu,
+                        )
                         self.events.put(("session", (config, provider)))
                     self._smart_pipeline(config)
                 elif action == "inspect":
@@ -1305,6 +1459,13 @@ class Worker:
                     if not config.cpu:
                         validate_model_plan()
                     provider = self.backend.create(config)
+                    config = replace(
+                        config,
+                        cpu=provider["hardware"] == "CPU",
+                        gpu=provider["hardware"]
+                        if provider["hardware"] != "CPU"
+                        else config.gpu,
+                    )
                     self.events.put(("session", (config, provider)))
                     self._status(config)
                 elif action == "release":
@@ -1974,7 +2135,15 @@ class Dashboard:
                     "Select one named session from the displayed list."
                 )
             candidate = replace(
-                self.config, session=name, cpu=selected["hardware"] == "CPU"
+                self.config,
+                session=name,
+                cpu=selected["hardware"] == "CPU",
+                gpu=selected["hardware"]
+                if selected["hardware"] != "CPU"
+                else self.config.gpu,
+                cu_limit=None,
+                rate_ceiling=None,
+                reserve_cu=None,
             )
             require_session(candidate)
             self.config = candidate
@@ -1983,15 +2152,27 @@ class Dashboard:
             self.message = "Session selected; status will show deployment and services."
 
     def _new(self, cpu: bool) -> None:
+        hardware = "CPU" if cpu else self.config.gpu
         name = (
             "launcher-"
-            + ("cpu-" if cpu else "g4-")
+            + hardware.lower()
+            + "-"
             + time.strftime("%Y%m%d-%H%M%S-")
             + uuid.uuid4().hex[:6]
         )
-        candidate = replace(self.config, session=name, cpu=cpu)
+        candidate = replace(
+            self.config,
+            session=name,
+            cpu=cpu,
+            cu_limit=None if self.config.session else self.config.cu_limit,
+            rate_ceiling=None if self.config.session else self.config.rate_ceiling,
+            reserve_cu=None if self.config.session else self.config.reserve_cu,
+        )
+        validate_budget_config(candidate)
         if self.worker.submit("new", candidate):
-            self.message = f"Creating one {'CPU' if cpu else 'G4'} session; waiting for provider status."
+            self.message = (
+                f"Creating one {hardware} session; waiting for provider status."
+            )
 
     def _mount(self) -> None:
         require_session(self.config)
@@ -2044,6 +2225,7 @@ class Dashboard:
                 return
             if kind == "status":
                 self.status, self.updated = value, time.monotonic()
+                self.config = restore_budget_config(self.config, value)
                 deployment = (value.get("deployment") or {}).get("status")
                 if deployment == "not_deployed":
                     self.message = NOT_DEPLOYED_NOTICE
@@ -2091,6 +2273,9 @@ class Dashboard:
                 if self.config.session == config.session:
                     self.action_input = ""
                     self.config.session = ""
+                    self.config.cu_limit = self.config.rate_ceiling = (
+                        self.config.reserve_cu
+                    ) = None
                     self.status, self.ssh = {}, {}
                     self.updated = 0.0
 
@@ -2292,6 +2477,8 @@ class Dashboard:
                 ),
                 (f"URL       {self._url() or 'not ready'}", "accent"),
             ]
+        if (self.status.get("budget") or {}).get("managed") is True:
+            rows.insert(0, (budget_lines(self.config, self.status)[0], "warn"))
         for offset, (text, role) in enumerate(rows[: rect.height - 2], 1):
             self._write(
                 screen, rect.row + offset, rect.column + 2, text, rect.width - 4, role
@@ -2756,6 +2943,7 @@ class Dashboard:
             f"Session: {self.config.session or '(none)'} | Stage: {self.stage} | Updated: {freshness}",
             f"GPU: {runtime.get('gpu_name', 'unknown')} | Install: {installation.get('status', 'unknown')} | Drive: {(self.status.get('drive') or {}).get('mounted', 'unknown')}",
             f"HTTP: {self.status.get('http_ready', 'unknown')} | SSH: {self.ssh.get('running', 'unknown')} | URL: {self._url() or '(not ready)'}",
+            *budget_lines(self.config, self.status),
             *progress_lines(self.status),
             self.error or self.message,
             " | ".join(f"[{key}] {label}" for key, label in SHORT_MENU),
@@ -2836,6 +3024,21 @@ def main(argv: list[str] | None = None) -> int:
         "--gpu", default="G4", choices=("G4", "H100", "A100", "L4", "T4")
     )
     parser.add_argument(
+        "--cu-limit",
+        type=float,
+        help="CU cap for the next new instance; best-effort launcher protection",
+    )
+    parser.add_argument(
+        "--rate-ceiling",
+        type=float,
+        help="Explicit conservative CU/hour estimate for the next new instance",
+    )
+    parser.add_argument(
+        "--reserve-cu",
+        type=float,
+        help="CU reserved for output download and verified release",
+    )
+    parser.add_argument(
         "--classic", action="store_true", help="Open the advanced action-code dashboard"
     )
     parser.add_argument(
@@ -2864,6 +3067,9 @@ def main(argv: list[str] | None = None) -> int:
         cpu=args.cpu,
         ephemeral=args.ephemeral,
         gpu=args.gpu,
+        cu_limit=args.cu_limit,
+        rate_ceiling=args.rate_ceiling,
+        reserve_cu=args.reserve_cu,
     )
     backend = DemoBackend(args.demo_state) if args.demo else Backend()
     if not args.classic:

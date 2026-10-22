@@ -781,8 +781,8 @@ class MediaValidationTests(unittest.TestCase):
         container.decode.side_effect = lambda stream: iter([frame] if decode else [])
         return container
 
-    def test_no_audio_track_or_undecodable_track_is_a_failure(self):
-        for fields in ({"audio": False}, {"decode": False}):
+    def test_undecodable_track_is_a_failure(self):
+        for fields in ({"decode": False},):
             with self.subTest(fields=fields):
                 av = SimpleNamespace(
                     open=mock.Mock(
@@ -795,16 +795,30 @@ class MediaValidationTests(unittest.TestCase):
                 ):
                     renderer.media_metadata(Path("fixture.mp4"), renderer.Deadline(1))
 
-    def test_expected_workflow_dimensions_and_duration_are_checked(self):
+    def test_requested_geometry_is_separate_from_decoded_output(self):
         expected = {"width": 864, "height": 480, "duration": 124 / 24, "fps": 24}
         av = SimpleNamespace(
             open=mock.Mock(side_effect=lambda path: self.container(dimensions=(64, 64)))
         )
-        with (
-            mock.patch.dict("sys.modules", {"av": av}),
-            self.assertRaisesRegex(renderer.RenderError, "differs"),
-        ):
-            renderer.media_metadata(Path("fixture.mp4"), renderer.Deadline(1), expected)
+        with mock.patch.dict("sys.modules", {"av": av}):
+            result = renderer.media_metadata(
+                Path("fixture.mp4"), renderer.Deadline(1), expected
+            )
+        video = result["video"][0]
+        self.assertEqual((video["width"], video["height"]), (64, 64))
+        self.assertEqual(video["frame_count"], 1)
+        self.assertEqual(video["reported_frames"], 124)
+        self.assertEqual(video["requested"], expected)
+        self.assertFalse(video["matches_requested"])
+
+    def test_audio_is_optional_for_a_valid_video(self):
+        av = SimpleNamespace(
+            open=mock.Mock(side_effect=lambda path: self.container(audio=False))
+        )
+        with mock.patch.dict("sys.modules", {"av": av}):
+            result = renderer.media_metadata(Path("fixture.mp4"), renderer.Deadline(1))
+        self.assertEqual(result["audio"], [])
+        self.assertEqual(result["video"][0]["frame_count"], 1)
 
     def test_first_frame_of_each_track_is_decoded(self):
         av = SimpleNamespace(open=mock.Mock(side_effect=lambda path: self.container()))

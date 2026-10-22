@@ -7,6 +7,7 @@ explicit confirmation, and transient display of provider authentication.
 from __future__ import annotations
 
 import curses
+import math
 import queue
 import select
 import sys
@@ -27,14 +28,17 @@ from dashboard import (
     DashboardError,
     Theme,
     Worker,
+    budget_lines,
     clip_cells,
     human_bytes,
     model_catalog_entries,
     parse_model_url,
     pinned_model_summary,
+    restore_budget_config,
     safe_error,
     services_ready,
     toggle_model_choice,
+    validate_budget_config,
     validate_model_plan,
 )
 
@@ -496,6 +500,11 @@ class Wizard:
                     "Reuse the dedicated key and local port unless they need changing.",
                 ),
                 Choice(
+                    "budget",
+                    "Instance CU budget",
+                    "Set a cap and conservative rate for this new allocation, or inspect the existing instance's persistent guard.",
+                ),
+                Choice(
                     "models",
                     "Manage models",
                     "Choose which pinned files are automatically prepared, or add a public model file. Choices are saved for later runtimes.",
@@ -517,6 +526,38 @@ class Wizard:
                 )
             )
             return choices
+        if self.page == "budget":
+            if self.resume or (self.status.get("budget") or {}).get("managed") is True:
+                return [
+                    Choice(
+                        "back",
+                        "Back",
+                        "Existing allocation budgets are retained across reconnection; this page does not reset them.",
+                    )
+                ]
+            return [
+                Choice(
+                    "cu_limit",
+                    "This instance's CU limit",
+                    "Set a positive cap. All allocation time, including installation, downloads and idle time, counts.",
+                ),
+                Choice(
+                    "rate_ceiling",
+                    "Conservative rate · CU/hour",
+                    "Required for managed startup. Use an explicit upper estimate; the account's current rate is not a GPU quote.",
+                ),
+                Choice(
+                    "reserve_cu",
+                    "Download / release reserve",
+                    "Optional positive reserve below the cap; otherwise the guard computes its default.",
+                ),
+                Choice(
+                    "budget_disable",
+                    "Continue without a CU guard",
+                    "Explicitly clear this new instance's budget configuration.",
+                ),
+                Choice("back", "Back"),
+            ]
         if self.page == "settings":
             choices = [
                 Choice("port", "Local SSH port"),
@@ -558,7 +599,7 @@ class Wizard:
             )
             return choices
         if self.page == "ready":
-            return [
+            choices = [
                 Choice(
                     "open",
                     "Open ComfyUI in browser",
@@ -567,7 +608,7 @@ class Wizard:
                 Choice(
                     "quit",
                     "Exit and keep resources",
-                    "VM, services, local SSH and running tasks remain running.",
+                    "VM, services, local SSH and running tasks remain running; an active budget guard continues independently.",
                 ),
                 Choice(
                     "release",
@@ -585,6 +626,16 @@ class Wizard:
                     "Inspect or manage individual steps when needed.",
                 ),
             ]
+            if (self.status.get("budget") or {}).get("managed") is True:
+                choices.insert(
+                    2,
+                    Choice(
+                        "hold",
+                        "Keep idle until a deadline",
+                        "Choose a finite number of minutes. The guard releases by that deadline or its earlier budget protection point.",
+                    ),
+                )
+            return choices
         if self.page == "release_confirm":
             return [
                 Choice(
@@ -740,6 +791,15 @@ class Wizard:
     def _begin(self) -> None:
         if not self._require_account("begin"):
             return
+        if not self.resume:
+            try:
+                validate_budget_config(self.config)
+            except DashboardError as exc:
+                self.error = str(exc)
+                self.notice = (
+                    "Complete this instance's budget settings before creation."
+                )
+                return
         if not self.config.cpu:
             try:
                 validate_model_plan()
@@ -789,6 +849,20 @@ class Wizard:
     def _confirm_input(self) -> None:
         value = self.input_value.strip()
         field = self.input_field
+        if field == "hold_minutes":
+            try:
+                minutes = float(value)
+                if not math.isfinite(minutes * 60) or minutes <= 0:
+                    raise ValueError
+            except ValueError:
+                self.error = "Enter a positive finite number of minutes."
+                return
+            candidate = replace(self.config, hold_seconds=minutes * 60)
+            if self._submit("hold", candidate):
+                self.config = candidate
+                self._page("ready")
+                self.notice = "Requesting a bounded hold; the existing budget deadline still applies."
+            return
         if field == "model_url":
             try:
                 _, _, source = parse_model_url(value)
@@ -822,6 +896,28 @@ class Wizard:
             )
             return
         candidate = replace(self.config)
+        if field in ("cu_limit", "rate_ceiling", "reserve_cu"):
+            if self.resume or (self.status.get("budget") or {}).get("managed") is True:
+                self.error = (
+                    "An existing allocation's budget cannot be reset from this form."
+                )
+                return
+            if value:
+                try:
+                    number = float(value)
+                    if not math.isfinite(number) or number <= 0:
+                        raise ValueError
+                except ValueError:
+                    self.error = "Enter a positive finite CU value."
+                    return
+                if (
+                    field == "reserve_cu"
+                    and candidate.cu_limit is not None
+                    and number >= candidate.cu_limit
+                ):
+                    self.error = "The reserve must be below this instance's CU limit."
+                    return
+                setattr(candidate, field, number)
         if field == "download_workers":
             if not value.isdecimal() or not 1 <= int(value) <= 4:
                 self.error = "Choose 1 to 4 parallel model downloads."
@@ -886,8 +982,15 @@ class Wizard:
                 )
                 return True
             self.resume = False
+            previous_allocation = bool(self.config.session)
             self.config = replace(
-                self.config, session="", access="local-only", email=""
+                self.config,
+                session="",
+                access="local-only",
+                email="",
+                cu_limit=None if previous_allocation else self.config.cu_limit,
+                rate_ceiling=None if previous_allocation else self.config.rate_ceiling,
+                reserve_cu=None if previous_allocation else self.config.reserve_cu,
             )
             self.status, self.ssh, self.provider = {}, {}, {}
             self.confirmed_steps = {"session"}
@@ -949,6 +1052,9 @@ class Wizard:
                 session=name,
                 cpu=row["hardware"] == "CPU",
                 create_key=False,
+                cu_limit=None,
+                rate_ceiling=None,
+                reserve_cu=None,
             )
             if row["hardware"] in GPU_CHOICES:
                 candidate.gpu = row["hardware"]
@@ -957,6 +1063,21 @@ class Wizard:
             self._begin()
         elif key == "settings":
             self._page("settings")
+        elif key == "budget":
+            self._page("budget")
+        elif self.page == "budget" and key == "budget_disable":
+            self.config = replace(
+                self.config, cu_limit=None, rate_ceiling=None, reserve_cu=None
+            )
+            self.notice = "This new instance has no CU guard. Its resources require explicit release."
+        elif self.page == "budget" and key in (
+            "cu_limit",
+            "rate_ceiling",
+            "reserve_cu",
+        ):
+            self._input(key, "budget")
+        elif key == "hold":
+            self._input("hold_minutes", "ready")
         elif self.page == "settings" and key != "back":
             self._input(key, "settings")
         elif key == "create_key":
@@ -1184,6 +1305,7 @@ class Wizard:
             else ("hardware" if self.config.cpu else "gpu"),
             "summary": "storage",
             "settings": "summary",
+            "budget": "summary",
             "key_confirm": "summary",
             "advanced": self.advanced_return_page,
         }
@@ -1209,7 +1331,14 @@ class Wizard:
                 + self.config.session
                 + " was not stopped. Sign back into its account to inspect it."
             )
-        self.config = replace(self.config, session="", create_key=False)
+        self.config = replace(
+            self.config,
+            session="",
+            create_key=False,
+            cu_limit=None,
+            rate_ceiling=None,
+            reserve_cu=None,
+        )
         self.status, self.ssh, self.provider = {}, {}, {}
         self.sessions = []
         self.confirmed_steps.clear()
@@ -1292,6 +1421,7 @@ class Wizard:
                 continue
             if kind == "status":
                 self.status, self.updated = value, time.monotonic()
+                self.config = restore_budget_config(self.config, value)
                 self._check_model_registration()
             elif kind == "model_registration":
                 self.required_model_categories = set(value)
@@ -1325,6 +1455,7 @@ class Wizard:
                     self.model_registration_notice = ""
                 self.config = replace(value["config"])
                 self.status, self.ssh = value.get("status", {}), value.get("ssh", {})
+                self.config = restore_budget_config(self.config, self.status)
                 self._check_model_registration()
                 self.provider, self.resume = value.get("provider", {}), True
                 self.updated = time.monotonic()
@@ -1450,7 +1581,14 @@ class Wizard:
                         if warning
                         else ""
                     )
-                    self.config = replace(self.config, session="", create_key=False)
+                    self.config = replace(
+                        self.config,
+                        session="",
+                        create_key=False,
+                        cu_limit=None,
+                        rate_ceiling=None,
+                        reserve_cu=None,
+                    )
                     self.status, self.ssh, self.provider = {}, {}, {}
                     self.confirmed_steps.clear()
                     self.required_model_categories = None
@@ -1516,7 +1654,7 @@ class Wizard:
         if (
             (
                 self.page == "ready"
-                or self.page in ("summary", "advanced")
+                or self.page in ("summary", "advanced", "budget")
                 and self.observe_runtime
                 and bool(self.config.session)
             )
@@ -1579,6 +1717,7 @@ class Wizard:
             "ssh_start": "Connecting local SSH",
             "ssh_stop": "Stopping local SSH forwarding",
             "release": "Releasing selected VM",
+            "hold": "Setting the instance's hold deadline",
             "mount": "Checking Google Drive authorization",
             "prepare_refresh": "Preparing updated model lists",
             "model_add": "Reading and pinning model metadata",
@@ -1610,6 +1749,7 @@ class Wizard:
             "ready": "ComfyUI is ready",
             "failure": "An operation needs attention",
             "release_confirm": "Confirm VM release",
+            "budget": "This allocation's CU budget",
             "advanced": "Advanced runtime actions",
             "models": "Saved model download list",
             "model_category": "Choose the model directory category",
@@ -1677,7 +1817,8 @@ class Wizard:
         if self.page == "ready":
             return "startup"
         if (
-            self.page in ("storage", "summary", "settings", "key_confirm", "input")
+            self.page
+            in ("storage", "summary", "settings", "budget", "key_confirm", "input")
             and not self.auth
         ):
             return "storage"
@@ -1935,6 +2076,7 @@ class Wizard:
         if self.page in (
             "summary",
             "settings",
+            "budget",
             "key_confirm",
             "release_confirm",
             "ready",
@@ -1993,7 +2135,24 @@ class Wizard:
                 )
             if self.config.ephemeral:
                 rows.append(("Models and outputs do not survive VM release.", "warn"))
+            rows.extend(
+                (line, "field" if ":" in line else "muted")
+                for line in budget_lines(self.config, self.status)
+            )
             rows.append(("", "normal"))
+        if self.page == "budget":
+            rows.append(
+                (
+                    "Installation, model download, generation and idle time all count from allocation. Reconnecting does not reset the budget.",
+                    "muted",
+                )
+            )
+            rows.append(
+                (
+                    "Account usage is observed separately; the conservative rate is an explicit estimate for protection.",
+                    "muted",
+                )
+            )
         if self.page in ("pipeline", "ready", "inspect", "failure", "advanced"):
             if self.page == "pipeline":
                 rows.append(
@@ -2175,6 +2334,19 @@ class Wizard:
         return clip_cells(value, max(0, width - 3)) + "." * min(3, width)
 
     def _input_default(self) -> str:
+        if self.input_field in ("cu_limit", "rate_ceiling", "reserve_cu"):
+            value = getattr(self.config, self.input_field)
+            return (
+                str(value)
+                if value is not None
+                else (
+                    "Optional; guard computes a reserve"
+                    if self.input_field == "reserve_cu"
+                    else "Enter a positive value"
+                )
+            )
+        if self.input_field == "hold_minutes":
+            return "Enter minutes; capped by the existing budget protection point"
         if self.input_field == "model_url":
             return "https://huggingface.co/OWNER/REPO/blob/main/model.safetensors"
         if self.input_field == "download_workers":

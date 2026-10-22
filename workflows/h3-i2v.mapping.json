@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "workflow_version": "h3-launcher-1",
+  "workflow_sha256": "39d333a74a0ec7c2eca3393a9622cace8883a51e45772ed39b92c40a68f505d7",
+  "mode": "i2v",
+  "parameters": {
+    "image": {
+      "node_id": "114",
+      "class_type": "LoadImage",
+      "input": "image",
+      "type": "string"
+    },
+    "prompt": {
+      "node_id": "105:104",
+      "class_type": "MiniMaxH3ImageToVideo",
+      "input": "prompt",
+      "type": "string"
+    },
+    "seconds": {
+      "node_id": "105:111",
+      "class_type": "PrimitiveFloat",
+      "input": "value",
+      "type": "number",
+      "minimum": 0.1,
+      "maximum": 30
+    },
+    "seed": {
+      "node_id": "105:15",
+      "class_type": "RandomNoise",
+      "input": "noise_seed",
+      "type": "integer",
+      "minimum": 0
+    },
+    "turbo": {
+      "node_id": "105:126",
+      "class_type": "PrimitiveBoolean",
+      "input": "value",
+      "type": "boolean"
+    }
+  }
+}

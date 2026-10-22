@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "workflow_version": "h3-launcher-1",
+  "workflow_sha256": "444f5a871d719e6339f6c32209cb127d14ba01edccd0cfc145bd4968fecca699",
+  "mode": "first_last_frame",
+  "parameters": {
+    "prompt": {
+      "node_id": "105:104",
+      "class_type": "MiniMaxH3ImageToVideo",
+      "input": "prompt",
+      "type": "string"
+    },
+    "seconds": {
+      "node_id": "105:111",
+      "class_type": "PrimitiveFloat",
+      "input": "value",
+      "type": "number",
+      "minimum": 0.1,
+      "maximum": 30
+    },
+    "seed": {
+      "node_id": "105:15",
+      "class_type": "RandomNoise",
+      "input": "noise_seed",
+      "type": "integer",
+      "minimum": 0
+    },
+    "turbo": {
+      "node_id": "105:126",
+      "class_type": "PrimitiveBoolean",
+      "input": "value",
+      "type": "boolean"
+    },
+    "first_frame": {
+      "node_id": "114",
+      "class_type": "LoadImage",
+      "input": "image",
+      "type": "string",
+      "required": true
+    },
+    "last_frame": {
+      "node_id": "127",
+      "class_type": "LoadImage",
+      "input": "image",
+      "type": "string",
+      "required": true
+    }
+  }
+}
