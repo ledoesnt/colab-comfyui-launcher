@@ -2,6 +2,8 @@
 
 `colabctl.py` 默认向 stdout 输出一个 JSON 对象；`--json` 可显式声明同一模式。参数错误和命令错误也输出结构化错误，诊断及升级提醒放 stderr。`--help` 仍输出普通帮助文字。提供方的原始授权输出不会透传到 JSON。
 
+命名账号使用全局 `--account account-b`，例如 `python3 scripts/colabctl.py --account account-b -s "$SESSION" status`。账号需先在 TUI 中添加并登录，命令始终操作明确指定的账号；省略时使用旧的 `default`，不会跟随界面最近选择。实例的所有后续操作须保留同一账号。自动候补只在 dashboard 新建前执行，低层 CLI 不跨账号重试未知分配。见[多账号说明](accounts.md)。
+
 ## 持久请求
 
 写操作在本地和远端保存 `request_id`/`job_id`。CLI 自动生成 ID，也接受调用者提供的稳定 `--request-id`；同一 ID 不得用于不同参数。分配预算另有独立的分配请求与预算 job 记录。

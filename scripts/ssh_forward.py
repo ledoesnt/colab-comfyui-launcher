@@ -26,6 +26,14 @@ import time
 import urllib.request
 from pathlib import Path
 
+from accounts import (
+    account_context,
+    account_id,
+    cli_directory,
+    colab_command,
+    state_root,
+)
+
 
 class ForwardError(Exception):
     """A deliberately nonsecret diagnostic suitable for JSON output."""
@@ -49,6 +57,7 @@ def port(value):
 
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument("--account", type=account_id, default="default")
     cli.add_argument("-s", "--session", required=True)
     cli.add_argument(
         "action", choices=("start", "status", "stop", "cleanup", "discover")
@@ -250,15 +259,17 @@ def existing_session(args, colab):
             "Session is absent from the local CLI store; create it separately"
         )
     result = subprocess.run(
-        [
-            str(colab),
-            "--auth=oauth2",
-            "--config",
-            str(args.config),
-            "status",
-            "-s",
-            args.session,
-        ],
+        colab_command(
+            [
+                "--config",
+                str(args.config),
+                "status",
+                "-s",
+                args.session,
+            ],
+            account=getattr(args, "account", "default"),
+            executable=str(colab),
+        ),
         stdin=None,
         stdout=sys.stderr,
         stderr=sys.stderr,
@@ -374,18 +385,20 @@ def healthy(local_port):
 
 def build_command(args, colab, ssh, snapshot, known_hosts, endpoint_hash):
     proxy = shlex.join(
-        [
-            str(colab),
-            "--auth=oauth2",
-            "--config",
-            str(snapshot),
-            "ssh",
-            "--proxy-mode",
-            "-s",
-            args.session,
-            "-i",
-            str(args.identity),
-        ]
+        colab_command(
+            [
+                "--config",
+                str(snapshot),
+                "ssh",
+                "--proxy-mode",
+                "-s",
+                args.session,
+                "-i",
+                str(args.identity),
+            ],
+            account=getattr(args, "account", "default"),
+            executable=str(colab),
+        )
     )
     quoted_hosts = (
         '"' + str(known_hosts).replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -638,7 +651,18 @@ def execute(args):
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        result = execute(args)
+        with account_context(args.account):
+            if args.account != "default":
+                if args.config == Path.home() / ".config/colab-cli/sessions.json":
+                    args.config = cli_directory() / "sessions.json"
+                if (
+                    args.state_dir
+                    == Path.home() / ".local/state/colab-comfyui-launcher/ssh"
+                ):
+                    args.state_dir = state_root() / "ssh"
+            result = execute(args)
+            if args.account != "default":
+                result["account"] = args.account
     except (Exception, KeyboardInterrupt) as error:  # noqa: BLE001 - sanitized CLI boundary.
         result = {
             "ok": False,

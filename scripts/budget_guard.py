@@ -25,6 +25,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from accounts import account_context, account_id, current_account, state_root
 from colab_provider import ColabProvider, ProviderError, validate_session
 
 
@@ -78,6 +79,8 @@ def _uptime() -> float:
 
 
 def _default_root() -> Path:
+    if current_account() != "default":
+        return state_root() / "budgets"
     override = os.environ.get("COLAB_LAUNCHER_STATE_DIR")
     if override:
         return Path(override).expanduser() / "budgets"
@@ -100,6 +103,7 @@ class BudgetManager:
         poll_seconds: float = 5.0,
     ):
         self.root = Path(state_root) if state_root is not None else _default_root()
+        self.account = current_account()
         self.provider = provider if provider is not None else ColabProvider()
         self.clock, self.uptime, self.boot_identity = clock, uptime, boot_identity
         self.popen = popen
@@ -118,8 +122,7 @@ class BudgetManager:
             raise BudgetError("Budget state directory must be owned by this user.")
         self.root.chmod(0o700)
 
-    @staticmethod
-    def _read(path: Path) -> dict[str, Any] | None:
+    def _read(self, path: Path) -> dict[str, Any] | None:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError:
@@ -142,6 +145,10 @@ class BudgetManager:
                 ) from exc
         if not isinstance(value, dict) or value.get("schema") != 1:
             raise BudgetError("Unsupported budget state; refuse to reset accounting.")
+        if value.get("account", "default") != self.account:
+            raise BudgetError(
+                "Budget belongs to another account; no provider action is allowed."
+            )
         return value
 
     @staticmethod
@@ -367,6 +374,7 @@ class BudgetManager:
         now = self.clock()
         return {
             "schema": 1,
+            "account": self.account,
             "session": _session(session),
             "job_id": uuid.uuid4().hex,
             "request_id": request_id,
@@ -724,6 +732,8 @@ class BudgetManager:
                 "--poll-seconds",
                 str(self.poll_seconds),
             ]
+            if self.account != "default":
+                arguments.extend(["--account", self.account])
             try:
                 process = self.popen(
                     arguments,
@@ -1147,11 +1157,13 @@ def main(argv=None) -> int:
     parser.add_argument("--session", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--poll-seconds", type=float, default=5)
+    parser.add_argument("--account", type=account_id, default="default")
     args = parser.parse_args(argv)
     try:
-        return BudgetManager(args.state_root, poll_seconds=args.poll_seconds).watch(
-            args.session, args.job_id
-        )
+        with account_context(args.account):
+            return BudgetManager(args.state_root, poll_seconds=args.poll_seconds).watch(
+                args.session, args.job_id
+            )
     except (BudgetError, ProviderError, OSError, ValueError):
         return 1
 

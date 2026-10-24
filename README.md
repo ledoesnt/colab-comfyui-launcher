@@ -35,6 +35,8 @@ colab --auth=oauth2 sessions
 
 首次 CLI 登录会引导授权。不要把 OAuth code、token、cookie 或 SSH 私钥发到聊天、Git 或 issue。
 
+支持保存多个 Colab 登录：进入 **Manage Colab account → Saved accounts and fallback** 添加账号并分别登录，之后可保留凭据切换。开启 **Automatic fallback** 并勾选候补后，新建时当前账号余额显示为零会按顺序选择有余额的账号，再创建和部署新 VM。原实例与预算守护仍绑定原账号；查询失败或创建结果未知时不跨账号重试。已有任务不会自动迁移，Drive 共享需要单独处理。配置与限制见[多账号说明](docs/accounts.md)。
+
 ## 终端界面
 
 默认是逐步启动向导，采用 ComfyUI `#F2FF59`、Colab `#E77012` / `#F9AA00` 配色。**↑/↓ 选择，Enter 确认**；移动选中项不会执行操作。可回退页面统一选择 **Back**，Esc 也可返回或取消输入。输入字段为空时显示默认值，开始输入后提示消失，普通输入使用高对比文字。详情可翻页：只有超出可见区域时，底部键盘行才提示 **←/→ details**；输入页提示 **Ctrl+B/F**，左右键仍用于输入。界面不显示 Details 行号计数，也不再额外添加正文 DETAILS 标题。
@@ -45,9 +47,9 @@ colab --auth=oauth2 sessions
 
 首次使用：
 
-首页第一项是 **Create a new runtime**，倒数第二项是 **Manage Colab account**，最后一项是 **Exit and keep resources**。启动先执行只读登录检查；直接选择新建或已有实例时，未登录或未核实会进入账号页，登录验证成功后继续原流程。账号管理页可 **Check login status / Recheck login**、未登录时 **Sign in**、**Switch account**、**Sign out** 或 **Back**。Check / Recheck 只查询会话，不启动授权或创建实例；Sign in 先检查已有登录，仅在需要时引导提供方浏览器授权。网络失败显示未核实，不当作退出登录。首页也能直接打开 **Manage models**，不需要先登录或分配 VM。
+首页第一项是 **Create a new runtime**，倒数第二项是 **Manage Colab account**，最后一项是 **Exit and keep resources**。启动先执行只读登录检查；直接选择新建或已有实例时，未登录或未核实会进入账号页，登录验证成功后继续原流程。账号管理页可 **Check login status / Recheck login**、未登录时 **Sign in**、**Replace login in this account**、**Sign out** 或 **Back**。**Saved accounts and fallback** 可保留多个登录并切换，详见[多账号说明](docs/accounts.md)。Check / Recheck 只查询会话，不启动授权或创建实例；Sign in 先检查已有登录，仅在需要时引导提供方浏览器授权。网络失败显示未核实，不当作退出登录。首页也能直接打开 **Manage models**，不需要先登录或分配 VM。
 
-**Switch account** 和 **Sign out** 都先显示独立确认页，默认选择 **Cancel**。官方 Colab CLI 0.7.4 没有 logout 命令；这里的退出仅清除本机 CLI 专用的 `~/.config/colab-cli/token.json` 缓存，不读取 token、不撤销 Google 授权，也不登出浏览器。CLI 版本不匹配或缓存路径是符号链接等异常情况会拒绝清除。Switch account 在清除后重新进入提供方登录；请在 Google 页面选择要使用的账号，浏览器已有登录可能仍默认原账号。只读会话查询验证 CLI 可用，但不返回邮箱，不能用它证明具体登录了哪个邮箱。
+**Replace login in this account** 和 **Sign out** 都先显示独立确认页，默认选择 **Cancel**。官方 Colab CLI 0.7.4 没有 logout 命令；这里的退出仅清除当前账号的本机 CLI 专用缓存（default 为 `~/.config/colab-cli/token.json`），不读取 token、不撤销 Google 授权，也不登出浏览器。CLI 版本不匹配或缓存路径是符号链接等异常情况会拒绝清除。Replace login in this account 在清除后重新进入提供方登录；请在 Google 页面选择要使用的账号，浏览器已有登录可能仍默认原账号。只读会话查询验证 CLI 可用，但不返回邮箱，不能用它证明具体登录了哪个邮箱。
 
 成功退出后，界面丢弃旧账号的实例列表、已选 VM 和 SSH 就绪信息，需在新账号下重新查询；实际 VM、服务和本机 SSH 不会因此停止，原账号的计算费用仍可能继续。要释放原账号的实例，应在退出前明确结束该实例，或重新登录原账号后查询并处理。
 

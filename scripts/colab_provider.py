@@ -17,6 +17,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from accounts import cli_directory, colab_command, current_account
+
 PROVIDER_ERROR_CODES = frozenset(
     {
         "provider_error",
@@ -177,7 +179,13 @@ def parse_sessions(output: str) -> list[dict[str, str]]:
     return rows
 
 
-def parse_usage(output: str) -> dict[str, Any]:
+def parse_usage(output: str, diagnostics: str = "") -> dict[str, Any]:
+    errors, _ = _lines(diagnostics)
+    if errors:
+        raise ProviderError(
+            "Colab usage returned diagnostics; balance remains unverified.",
+            code="provider_diagnostics",
+        )
     lines, _ = _lines(output)
     patterns = {
         "balance": r"Current balance: ([0-9]+(?:\.[0-9]+)?) compute units",
@@ -237,7 +245,8 @@ class ColabProvider:
         oauth_cache: Path | None = None,
     ):
         self.run = run
-        self.oauth_cache = oauth_cache or Path.home() / ".config/colab-cli/token.json"
+        self.account = current_account()
+        self.oauth_cache = oauth_cache or cli_directory(self.account) / "token.json"
 
     def account_scope(self) -> str:
         """A change detector using file metadata only, never credential bytes.
@@ -267,7 +276,7 @@ class ColabProvider:
     ) -> list[str]:
         try:
             completed = self.run(
-                ["colab", "--auth=oauth2", *arguments],
+                colab_command(arguments, account=self.account),
                 capture_output=True,
                 text=True,
                 stdin=subprocess.DEVNULL,

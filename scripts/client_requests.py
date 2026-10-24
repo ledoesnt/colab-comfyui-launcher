@@ -12,6 +12,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from accounts import current_account, state_root
+
 
 def request_id(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
@@ -46,6 +48,8 @@ def atomic_json(path: Path, value: dict) -> None:
 
 class ClientRequests:
     def __init__(self, session: str, root: Path | None = None):
+        if root is None and current_account() != "default":
+            root = state_root()
         root = root or Path(
             os.environ.get(
                 "COLAB_LAUNCHER_STATE_DIR",

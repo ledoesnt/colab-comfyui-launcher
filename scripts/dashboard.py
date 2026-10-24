@@ -26,17 +26,38 @@ import unicodedata
 import uuid
 import webbrowser
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, ClassVar
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+from accounts import (
+    AccountStore,
+    account_context,
+    account_id,
+    cli_directory,
+    colab_command,
+    current_account,
+    funded_account,
+    launcher_arguments,
+)
+
 DEFAULT_STORAGE = "/content/drive/MyDrive/colab-comfyui-launcher-test"
 DEFAULT_IDENTITY = Path.home() / ".ssh/colab_comfyui_launcher"
 REFRESH_SECONDS = 10.0
 ACCOUNT_ACTIONS = frozenset(
-    ("account_status", "account_login", "account_logout", "account_switch")
+    (
+        "account_status",
+        "account_login",
+        "account_logout",
+        "account_switch",
+        "profile_select",
+        "profile_add",
+    )
 )
 MODEL_SEARCH_CATEGORIES = frozenset(
     (
@@ -108,6 +129,20 @@ class Config:
     rate_ceiling: float | None = None
     reserve_cu: float | None = None
     hold_seconds: float = 600.0
+    account: str = "default"
+    fallback_accounts: tuple[str, ...] = ()
+    profile_name: str = ""
+
+
+def config_account(operation):
+    """Bind direct backend calls as well as calls made by the worker thread."""
+
+    @wraps(operation)
+    def bound(self, config: Config, *args, **kwargs):
+        with account_context(config.account):
+            return operation(self, config, *args, **kwargs)
+
+    return bound
 
 
 def validate_budget_config(config: Config) -> None:
@@ -249,6 +284,10 @@ class Backend:
     def __init__(self, run: Callable[..., Any] = subprocess.run):
         self.run = run
 
+    @staticmethod
+    def account_profiles() -> dict[str, Any]:
+        return AccountStore().read()
+
     def json_command(self, argv: list[str], *, timeout: float = 150) -> dict[str, Any]:
         try:
             completed = self.run(argv, text=True, capture_output=True, timeout=timeout)
@@ -283,6 +322,7 @@ class Backend:
         argv = [
             sys.executable,
             str(ROOT / "scripts/colabctl.py"),
+            *launcher_arguments(config.account),
             "-s",
             config.session,
             action,
@@ -343,6 +383,7 @@ class Backend:
         argv = [
             sys.executable,
             str(ROOT / "scripts/ssh_forward.py"),
+            *launcher_arguments(config.account),
             "-s",
             config.session,
             action,
@@ -358,9 +399,7 @@ class Backend:
     def interactive(self, arguments: list[str]) -> int:
         """No captured authentication text, cookies or tokens."""
         try:
-            return self.run(
-                ["colab", "--auth=oauth2", *arguments], timeout=600
-            ).returncode
+            return self.run(colab_command(arguments), timeout=600).returncode
         except subprocess.TimeoutExpired:
             print(
                 "Timed out. The provider outcome is unknown; inspect before retrying."
@@ -374,7 +413,7 @@ class Backend:
         """Capture ordinary provider commands; authentication alone inherits a TTY."""
         try:
             completed = self.run(
-                ["colab", "--auth=oauth2", *arguments],
+                colab_command(arguments),
                 text=True,
                 capture_output=True,
                 stdin=subprocess.DEVNULL,
@@ -414,6 +453,7 @@ class Backend:
             )
         return rows
 
+    @config_account
     def create(self, config: Config) -> dict[str, str]:
         require_session(config)
         validate_budget_config(config)
@@ -421,6 +461,7 @@ class Backend:
             argv = [
                 sys.executable,
                 str(ROOT / "scripts/colabctl.py"),
+                *launcher_arguments(config.account),
                 "-s",
                 config.session,
                 "new",
@@ -461,6 +502,7 @@ class Backend:
             )
         return selected
 
+    @config_account
     def inspect(self, config: Config) -> dict[str, Any]:
         """Read and restore known configuration, without creating/stopping anything."""
         require_session(config)
@@ -550,7 +592,7 @@ class Backend:
         reads credentials itself, starts a VM, opens a browser, or retains the
         CLI's raw output/authorization link. Network failure is not logout.
         """
-        command = ["colab", "--auth=oauth2", "sessions"]
+        command = colab_command(["sessions"])
         try:
             result = self.run(
                 command,
@@ -599,10 +641,12 @@ class Backend:
 
     def account_usage(self) -> dict[str, Any]:
         """Read the official CLI's account balance without interactive login."""
+        from colab_provider import ProviderError, parse_usage
+
         unavailable = {"ok": False}
         try:
             result = self.run(
-                ["colab", "--auth=oauth2", "usage"],
+                colab_command(["usage"]),
                 text=True,
                 capture_output=True,
                 stdin=subprocess.DEVNULL,
@@ -612,17 +656,15 @@ class Backend:
             return unavailable
         if result.returncode:
             return unavailable
-        output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.stdout or "")
-        balance = re.search(
-            r"(?m)^Current balance: (\d+(?:\.\d+)?) compute units\s*$", output
-        )
-        rate = re.search(r"(?m)^Usage rate: (\d+(?:\.\d+)?)/hr\s*$", output)
-        if not balance or not rate:
+        try:
+            usage = parse_usage(result.stdout or "", result.stderr or "")
+        except ProviderError:
             return unavailable
-        balance_value, rate_value = float(balance[1]), float(rate[1])
-        if not all(math.isfinite(value) for value in (balance_value, rate_value)):
-            return unavailable
-        return {"ok": True, "balance": balance_value, "rate_hourly": rate_value}
+        return {
+            "ok": True,
+            "balance": usage["balance"],
+            "rate_hourly": usage["rate_hourly"],
+        }
 
     @staticmethod
     def account_terminal(
@@ -633,7 +675,7 @@ class Backend:
         # Resolve interactive account login using a read-only operation, before
         # issuing any allocation command whose outcome must never be retried.
         return ProviderTerminal(
-            ["colab", "--auth=oauth2", "sessions"], on_event, timeout=650
+            colab_command(["sessions"], account=_config.account), on_event, timeout=650
         )
 
     def account_logout(
@@ -653,7 +695,7 @@ class Backend:
             )
         try:
             version = self.run(
-                ["colab", "version"],
+                colab_command(["version"], auth=False),
                 text=True,
                 capture_output=True,
                 stdin=subprocess.DEVNULL,
@@ -674,12 +716,16 @@ class Backend:
         if check_cancelled is not None:
             check_cancelled()
         home = Path.home()
-        cache = home / ".config" / "colab-cli" / "token.json"
+        cache = cli_directory() / "token.json"
         removed = False
         try:
             # Refuse unusual layouts instead of following links into another
             # credential store. Missing parents also prove this cache absent.
-            for directory in (home / ".config", cache.parent):
+            for directory in (
+                (home / ".config", cache.parent)
+                if current_account() == "default"
+                else (cache.parent.parent, cache.parent)
+            ):
                 try:
                     metadata = directory.lstat()
                 except FileNotFoundError:
@@ -731,14 +777,15 @@ class Backend:
 
         require_session(config)
         return ProviderTerminal(
-            [
-                "colab",
-                "--auth=oauth2",
-                "drivemount",
-                "-s",
-                config.session,
-                "/content/drive",
-            ],
+            colab_command(
+                [
+                    "drivemount",
+                    "-s",
+                    config.session,
+                    "/content/drive",
+                ],
+                account=config.account,
+            ),
             on_event,
             timeout=650,
         )
@@ -770,6 +817,7 @@ class Worker:
         self.pending_action: str | None = None
         self.auth_terminal: Any = None
         self.account_checked = False
+        self.checked_account = "default"
         self.thread = threading.Thread(
             target=self._loop, daemon=True, name="launcher-dashboard"
         )
@@ -925,6 +973,7 @@ class Worker:
             }
         self._check_cancelled()
         self.account_checked = result["state"] == "authenticated"
+        self.checked_account = current_account()
         self.events.put(("account", result))
         return result
 
@@ -991,7 +1040,11 @@ class Worker:
             )
 
     def _ensure_account(self, config: Config, *, fresh: bool = False) -> None:
-        if self.account_checked and not fresh:
+        if (
+            self.account_checked
+            and self.checked_account == config.account
+            and not fresh
+        ):
             return
         checked = self._check_account()
         if checked["state"] != "authenticated":
@@ -1377,6 +1430,49 @@ class Worker:
             )
         return safe_error(warnings[0]) if warnings else ""
 
+    def _select_funded_account(self, config: Config) -> Config:
+        if not config.fallback_accounts:
+            return config
+        from budget_guard import TERMINAL, BudgetManager
+
+        # A replay of an unresolved allocation must stay with its original
+        # owner even if that owner's balance has since fallen to zero.
+        owners = []
+        for name in AccountStore().read()["profiles"]:
+            with account_context(name):
+                existing = BudgetManager().status(config.session)
+            if existing.get("managed") and existing.get("status") not in TERMINAL:
+                owners.append(name)
+        if len(owners) > 1:
+            raise DashboardError(
+                "This session has unresolved budgets in multiple accounts. Inspect each original allocation; no new VM was created."
+            )
+        if owners:
+            selected = owners[0]
+            if selected != config.account:
+                self.events.put(
+                    ("allocation_account", replace(config, account=selected))
+                )
+            return replace(config, account=selected)
+        self.events.put(("stage", "checking account balances before allocation"))
+        selected = funded_account(
+            [config.account, *config.fallback_accounts],
+            self.backend.account_usage,
+            self._check_cancelled,
+        )
+        self._check_cancelled()
+        if selected != config.account:
+            # Preference changes do not change any already-running guard.
+            AccountStore().update(active=selected)
+            self.events.put(("allocation_account", replace(config, account=selected)))
+            self.events.put(
+                (
+                    "notice",
+                    "Selected a funded fallback account; creating a new VM. Existing instances are retained.",
+                )
+            )
+        return replace(config, account=selected)
+
     def _loop(self) -> None:
         while not self.cancelled.is_set():
             try:
@@ -1390,7 +1486,9 @@ class Worker:
                 self.operation_cancelled.clear()
                 if action in ACCOUNT_ACTIONS and self.account_cancelled.is_set():
                     self.operation_cancelled.set()
+            context = ExitStack()
             try:
+                context.enter_context(account_context(config.account))
                 self._check_cancelled()
                 if action != "usage":
                     self.events.put(("stage", action))
@@ -1406,6 +1504,21 @@ class Worker:
                     )
                     self._check_cancelled()
                 if action == "account_status":
+                    self._check_account()
+                elif action in ("profile_select", "profile_add"):
+                    selected = (
+                        config.profile_name
+                        if action == "profile_add"
+                        else config.account
+                    )
+                    self._check_cancelled()
+                    AccountStore().update(
+                        add=selected if action == "profile_add" else None,
+                        active=selected,
+                    )
+                    context.enter_context(account_context(selected))
+                    self.account_checked = False
+                    self.events.put(("profile_selected", selected))
                     self._check_account()
                 elif action == "usage":
                     # Balance failures must not interrupt startup.
@@ -1424,6 +1537,11 @@ class Worker:
                     if action == "wizard_create":
                         if not config.cpu:
                             validate_model_plan()
+                        config = self._select_funded_account(config)
+                        context.enter_context(account_context(config.account))
+                        with self.lock:
+                            self.active_config = config
+                        self._ensure_account(config)
                         self.events.put(("stage", "creating and verifying runtime"))
                         provider = self.backend.create(config)
                         config = replace(
@@ -1458,6 +1576,11 @@ class Worker:
                 elif action == "new":
                     if not config.cpu:
                         validate_model_plan()
+                    config = self._select_funded_account(config)
+                    context.enter_context(account_context(config.account))
+                    with self.lock:
+                        self.active_config = config
+                    self._ensure_account(config)
                     provider = self.backend.create(config)
                     config = replace(
                         config,
@@ -1505,6 +1628,7 @@ class Worker:
             except Exception as exc:  # noqa: BLE001
                 self.events.put(("error", safe_error(exc)))
             finally:
+                context.close()
                 with self.lock:
                     self.active_action = None
                     self.active_config = None
@@ -2182,7 +2306,8 @@ class Dashboard:
         print(
             "Drive authorization uses the provider terminal/browser. The dashboard resumes afterward."
         )
-        code = self.backend.interactive(["drivemount", "-s", self.config.session])
+        with account_context(self.config.account):
+            code = self.backend.interactive(["drivemount", "-s", self.config.session])
         if code:
             raise DashboardError(
                 "Drive mount did not succeed. Finish provider authorization, then mount again explicitly."
@@ -2223,7 +2348,10 @@ class Dashboard:
                 kind, value = self.worker.events.get_nowait()
             except queue.Empty:
                 return
-            if kind == "status":
+            if kind == "allocation_account":
+                self.config = replace(value)
+                self.status, self.ssh = {}, {}
+            elif kind == "status":
                 self.status, self.updated = value, time.monotonic()
                 self.config = restore_budget_config(self.config, value)
                 deployment = (value.get("deployment") or {}).get("status")
@@ -3000,6 +3128,17 @@ class Dashboard:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--account",
+        type=account_id,
+        help="Saved Colab account; defaults to the last selected account",
+    )
+    parser.add_argument(
+        "--fallback-account",
+        type=account_id,
+        action="append",
+        help="Ordered fallback on verified zero CU, for new runtimes only",
+    )
+    parser.add_argument(
         "--session",
         "-s",
         default="",
@@ -3061,7 +3200,25 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "Run the dashboard in an interactive terminal; Drive authentication needs its TTY."
         )
+    preferences = {"active": "default", "fallbacks": [], "auto_fallback": False}
+    if not args.demo:
+        try:
+            preferences = AccountStore().read()
+            if args.account and args.account not in preferences["profiles"]:
+                parser.error(
+                    "Unknown saved account; add it in Manage Colab account first."
+                )
+        except (OSError, ValueError):
+            parser.error("Account preferences could not be read safely.")
     config = Config(
+        account=args.account or preferences["active"],
+        fallback_accounts=tuple(
+            args.fallback_account
+            if args.fallback_account is not None
+            else preferences["fallbacks"]
+            if preferences["auto_fallback"]
+            else ()
+        ),
         session=args.session or ("demo-g4" if args.demo else ""),
         storage_root=args.storage_root,
         cpu=args.cpu,

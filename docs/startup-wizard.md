@@ -13,10 +13,11 @@ flowchart TD
     CHECK --> AUTH
     ACCOUNT -->|未验证时| LOGIN[Sign in 先检查已有登录<br/>需要时屏内人工授权并再次核实]
     LOGIN --> AUTH
-    ACCOUNT --> CHANGE{Switch account 或 Sign out<br/>独立确认 默认 Cancel}
+    ACCOUNT --> PROFILES[Saved accounts and fallback 保留登录切换]
+    ACCOUNT --> CHANGE{Replace login in this account 或 Sign out<br/>独立确认 默认 Cancel}
     CHANGE -->|Cancel| ACCOUNT
     CHANGE -->|确认| CACHE[清除本机 CLI 专用登录缓存<br/>保留 VM 服务和 SSH]
-    CACHE -->|Switch account| LOGIN
+    CACHE -->|Replace login in this account| LOGIN
     CACHE -->|Sign out| ACCOUNT
     ACCOUNT -->|Back| A
     A --> MODEL[管理模型清单 勾选或添加 保存选择]
@@ -55,9 +56,11 @@ flowchart TD
     J --> Y
 ```
 
-首页第一项是 **Create a new runtime**，倒数第二项是 **Manage Colab account**，最后一项是 **Exit and keep resources**。首页自动执行只读检查；直接选择新建或已有实例时，未登录或未核实会进入账号页，登录验证成功后继续原流程。账号管理页可选择 **Check login status / Recheck login**、未登录时 **Sign in**、**Switch account**、**Sign out** 与 **Back**。Check / Recheck 只查询会话，不发起交互授权或分配实例；Sign in 先检查已有登录，仅在需要时进入浏览器授权。网络错误显示未核实，不表示已退出登录。创建前再次核实登录。**Manage models** 可独立使用，不需要账号或 VM。
+保存多个账号及零余额候补启动见[多账号说明](accounts.md)。切换已保存账号不删除凭据，旧实例守护继续使用原账号；下面的确认/清除说明仅适用于替换当前登录和退出。
 
-切换或退出账号先进入独立确认页，默认选中 **Cancel**。官方 Colab CLI 0.7.4 不提供 logout；本功能只清除本机 CLI 的 `~/.config/colab-cli/token.json` 专用缓存，不读取 token、不撤销 Google 授权，也不退出浏览器登录。版本不匹配或符号链接等异常路径会拒绝操作。Switch account 清除后进入提供方登录，在 Google 页面选择其他账号；浏览器仍可能默认原账号。只读会话请求不提供邮箱，成功只能证明 CLI 登录可用，不能证明已换成某个邮箱。
+首页第一项是 **Create a new runtime**，倒数第二项是 **Manage Colab account**，最后一项是 **Exit and keep resources**。首页自动执行只读检查；直接选择新建或已有实例时，未登录或未核实会进入账号页，登录验证成功后继续原流程。账号管理页可选择 **Check login status / Recheck login**、未登录时 **Sign in**、**Replace login in this account**、**Sign out** 与 **Back**。Check / Recheck 只查询会话，不发起交互授权或分配实例；Sign in 先检查已有登录，仅在需要时进入浏览器授权。网络错误显示未核实，不表示已退出登录。创建前再次核实登录。**Manage models** 可独立使用，不需要账号或 VM。
+
+替换当前配置的登录或退出账号先进入独立确认页，默认选中 **Cancel**。官方 Colab CLI 0.7.4 不提供 logout；本功能只清除当前账号的本机 CLI 专用缓存（default 为 `~/.config/colab-cli/token.json`），不读取 token、不撤销 Google 授权，也不退出浏览器登录。版本不匹配或符号链接等异常路径会拒绝操作。Replace login in this account 清除后进入提供方登录，在 Google 页面选择其他账号；浏览器仍可能默认原账号。只读会话请求不提供邮箱，成功只能证明 CLI 登录可用，不能证明已换成某个邮箱。
 
 缓存清除成功后，TUI 丢弃旧账号的实例列表、选择与就绪证明，再在当前账号下查询；原 VM、远端服务、本机 SSH 仍保留运行。退出账号不等于停止计费。需要结束原账号的实例时，先明确释放再退出，或重新登录原账号后查询和处理。失败不宣称已退出登录，也不会凭旧状态确认新账号的 VM 已就绪。
 

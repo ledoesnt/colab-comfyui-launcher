@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from accounts import AccountStore, account_id
 from dashboard import (
     DEFAULT_IDENTITY,
     MODEL_SEARCH_CATEGORIES,
@@ -49,6 +50,8 @@ ACCOUNT_ACTIONS = (
     "account_login",
     "account_logout",
     "account_switch",
+    "profile_select",
+    "profile_add",
 )
 LOGIN_ACTIONS = ("account_login", "account_switch")
 STEPS = (
@@ -111,6 +114,7 @@ class Wizard:
         self.account_return_page = "home"
         self.account_dismissed = False
         self.account_change_action = ""
+        self.profiles: dict[str, Any] = {}
         self.confirmed_steps: set[str] = set()
         self.runtime_events_allowed = True
         self.detached_runtime_notice = ""
@@ -366,6 +370,14 @@ class Wizard:
                     )
                 )
             if not self.worker.busy:
+                if hasattr(self.backend, "account_profiles"):
+                    choices.append(
+                        Choice(
+                            "profiles",
+                            "Saved accounts and fallback",
+                            "Keep each login separately, switch saved accounts, or configure zero-CU fallback. Running guards retain their original account.",
+                        )
+                    )
                 choices.append(
                     Choice(
                         "account_check",
@@ -387,8 +399,10 @@ class Wizard:
                     [
                         Choice(
                             "account_switch",
-                            "Switch account",
-                            "Sign out of the local Colab CLI, then choose an account on Google's sign-in page. Existing VMs and SSH keep running.",
+                            "Replace login in this account"
+                            if hasattr(self.backend, "account_profiles")
+                            else "Switch account",
+                            "Delete this profile's local login and authorize again. To retain both logins, use Saved accounts and fallback instead. Existing VMs and SSH keep running.",
                         ),
                         Choice(
                             "account_logout",
@@ -412,6 +426,50 @@ class Wizard:
                     "Back",
                     "Return to the previous page. Cancel this login request while retaining existing VM, services and SSH.",
                 )
+            )
+            return choices
+        if self.page == "profiles":
+            if self.worker.busy:
+                return [
+                    Choice("loading", "Loading...", enabled=False),
+                    Choice("back", "Back"),
+                ]
+            choices = [
+                Choice(
+                    "profile_add",
+                    "Add a Colab account",
+                    "Create a separate login cache. Then choose Sign in and select that account on Google's page.",
+                )
+            ]
+            fallbacks = self.profiles.get("fallbacks", [])
+            for name in self.profiles.get("profiles", ["default"]):
+                choices.append(
+                    Choice(
+                        "profile:" + name,
+                        ("* " if name == self.config.account else "Use ") + name,
+                        "Switch without deleting credentials or stopping resources. Account names are local aliases, not verified Google email addresses.",
+                    )
+                )
+                position = fallbacks.index(name) + 1 if name in fallbacks else None
+                choices.append(
+                    Choice(
+                        "fallback:" + name,
+                        (f"[{position}] " if position else "[ ] ")
+                        + name
+                        + " as fallback",
+                        "Toggle this candidate. Candidates are tried in the order enabled, only before a new allocation.",
+                    )
+                )
+            choices.extend(
+                [
+                    Choice(
+                        "profile_auto",
+                        "Automatic fallback: "
+                        + ("ON" if self.profiles.get("auto_fallback") else "OFF"),
+                        "Only a fresh, verified zero-CU balance selects another account. Unknown results stop creation; running jobs are not migrated.",
+                    ),
+                    Choice("back", "Back"),
+                ]
             )
             return choices
         if self.page == "account_confirm":
@@ -849,6 +907,17 @@ class Wizard:
     def _confirm_input(self) -> None:
         value = self.input_value.strip()
         field = self.input_field
+        if field == "profile_name":
+            try:
+                account_id(value)
+            except ValueError as exc:
+                self.error = str(exc)
+                return
+            if self._submit("profile_add", replace(self.config, profile_name=value)):
+                self.account_dismissed = False
+                self._page("account")
+                self._account_checking()
+            return
         if field == "hold_minutes":
             try:
                 minutes = float(value)
@@ -1111,6 +1180,52 @@ class Wizard:
             self.account_dismissed = False
             self._page("account")
             self.notice = str(self.account.get("message", "Colab login is unverified."))
+        elif key == "profiles":
+            if not self.worker.busy:
+                try:
+                    self.profiles = self.backend.account_profiles()
+                    self._page("profiles")
+                    self.notice = (
+                        "Current account: "
+                        + self.config.account
+                        + ". Existing logins and resources are retained."
+                    )
+                except (ValueError, OSError) as exc:
+                    self.error = safe_error(exc)
+        elif key == "profile_add":
+            if not self.worker.busy:
+                self._input("profile_name", "account")
+                self.notice = "Enter a local alias (letters, digits, _ or -), not an email or credential."
+        elif key.startswith("profile:"):
+            if not self.worker.busy:
+                selected = key.removeprefix("profile:")
+                if self._submit(
+                    "profile_select", replace(self.config, account=selected, session="")
+                ):
+                    self.account_dismissed = False
+                    self._page("account")
+                    self._account_checking()
+        elif key.startswith("fallback:") or key == "profile_auto":
+            if not self.worker.busy:
+                try:
+                    self.profiles = AccountStore().update(
+                        toggle=key.removeprefix("fallback:")
+                        if key.startswith("fallback:")
+                        else None,
+                        enabled=not self.profiles.get("auto_fallback")
+                        if key == "profile_auto"
+                        else None,
+                    )
+                    self.config.fallback_accounts = tuple(
+                        self.profiles["fallbacks"]
+                        if self.profiles["auto_fallback"]
+                        else ()
+                    )
+                    self.notice = (
+                        "Fallback preferences saved. They apply to new runtimes only."
+                    )
+                except (ValueError, OSError) as exc:
+                    self.error = safe_error(exc)
         elif key in ("account_check", "account_login"):
             if not self.worker.busy:
                 if self.page != "account":
@@ -1297,6 +1412,7 @@ class Wizard:
             )
             return
         parents = {
+            "profiles": "account",
             "account_confirm": "account",
             "hardware": "home",
             "gpu": "hardware",
@@ -1419,7 +1535,30 @@ class Wizard:
                 "released",
             ):
                 continue
-            if kind == "status":
+            if kind == "profile_selected":
+                self._detach_account_runtime()
+                self.config.account = str(value)
+                self._clear_usage()
+                self.auth.clear()
+                self.account = {
+                    "state": "unknown",
+                    "message": "Saved account selected; checking login.",
+                }
+                self.profiles = self.backend.account_profiles()
+                self.config.fallback_accounts = tuple(
+                    self.profiles["fallbacks"] if self.profiles["auto_fallback"] else ()
+                )
+                if not self.account_dismissed:
+                    self._page("account")
+            elif kind == "allocation_account":
+                self.config = replace(value)
+                self._clear_usage()
+                self.status, self.ssh, self.provider = {}, {}, {}
+                self.account = {
+                    "state": "unknown",
+                    "message": "Checking the selected fallback account.",
+                }
+            elif kind == "status":
                 self.status, self.updated = value, time.monotonic()
                 self.config = restore_budget_config(self.config, value)
                 self._check_model_registration()
@@ -1677,6 +1816,8 @@ class Wizard:
 
     def _header(self) -> str:
         header = "COMFYUI / COLAB"
+        if self.config.account != "default":
+            header += " · " + self.config.account
         if self.demo:
             return header + "  · OFFLINE DEMO"
         if self.account.get("state") != "authenticated":
@@ -1733,6 +1874,7 @@ class Wizard:
         return {
             "home": "Start a ComfyUI session",
             "account": "Manage Colab account",
+            "profiles": "Saved Colab accounts and fallback",
             "account_confirm": "Confirm Colab account change",
             "hardware": "Choose compute",
             "gpu": "Choose GPU model",
@@ -1933,6 +2075,19 @@ class Wizard:
         self, width: int, *, omit: frozenset[str] = frozenset()
     ) -> list[tuple[str, str]]:
         rows: list[tuple[str, str]] = []
+        if self.page in ("account", "profiles", "summary", "ready") and (
+            self.config.account != "default"
+            or hasattr(self.backend, "account_profiles")
+        ):
+            rows.append(("Account: " + self.config.account, "field"))
+            if self.config.fallback_accounts:
+                rows.append(
+                    (
+                        "Zero-CU fallback: "
+                        + " → ".join(self.config.fallback_accounts),
+                        "info",
+                    )
+                )
         if "selected_model" not in omit:
             rows.extend(self._selected_model_details())
         if self.page == "account_confirm":
@@ -2334,6 +2489,8 @@ class Wizard:
         return clip_cells(value, max(0, width - 3)) + "." * min(3, width)
 
     def _input_default(self) -> str:
+        if self.input_field == "profile_name":
+            return "e.g. account-b (1–32 letters, digits, _ or -)"
         if self.input_field in ("cu_limit", "rate_ceiling", "reserve_cu"):
             value = getattr(self.config, self.input_field)
             return (

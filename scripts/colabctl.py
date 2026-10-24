@@ -30,6 +30,7 @@ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 if str(PROJECT_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
+from accounts import account_context, account_id, colab_command, current_account
 from client_requests import ClientRequests, request_id
 
 
@@ -79,7 +80,7 @@ def _run_colab(
         raise BridgeError("Official colab CLI was not found on PATH.")
     try:
         completed = subprocess.run(
-            [executable, "--auth=oauth2", *arguments],
+            colab_command(arguments, executable=executable),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -898,6 +899,12 @@ def positive_seconds(value: str) -> float:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     root.add_argument(
+        "--account",
+        type=account_id,
+        default="default",
+        help="Saved account owning this session (never follows the UI selection)",
+    )
+    root.add_argument(
         "-s", "--session", required=True, help="Existing Colab session name"
     )
     root.add_argument(
@@ -1530,7 +1537,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         return int(exc.code or 0)
     try:
-        result = run_command(arguments, command_payload(arguments))
+        with account_context(arguments.account):
+            result = run_command(arguments, command_payload(arguments))
+            if arguments.account != "default":
+                result["account"] = current_account()
     except Exception as exc:  # noqa: BLE001 - always emit structured errors at the CLI boundary.
         result = dict(getattr(exc, "result", None) or {})
         result.update(ok=False)
