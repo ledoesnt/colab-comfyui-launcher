@@ -6,10 +6,10 @@
 
 运行 `python3 scripts/dashboard.py`，进入 **Manage Colab account → Saved accounts and fallback**。
 
-1. `default` 使用原来的本机 Colab CLI 登录，不迁移、不复制原凭据。如果现有登录就是账号 A，可以直接把它当作 A 使用。
+1. 全新安装选择 **Sign in** 时，先输入第一个账号的本机名称，例如 `account-a`，再进入 Google 授权。第一个账号和后续账号都使用独立的 `accounts/<名称>/cli` 和 `state` 目录。已有旧版 `default` 可按下文迁移并改名。
 2. 选择 **Add a Colab account**，输入本机别名，例如 `account-b`。别名允许 1–32 个英文字母、数字、`_` 或 `-`，不是邮箱，也不用于证明 Google 身份。
 3. 回到账号页选择 **Sign in**，在 Google 页面选中 B，按官方流程完成授权。浏览器可能默认上一个账号，请核对页面中的账号。授权 code 只在 TUI 遮罩输入，不发送到聊天。
-4. 两个登录都保存后，在列表选择 **Use default** / **Use account-b** 即可切换。授权仍有效时不需要再次登录；Google 撤销或刷新失败后需要重新授权。
+4. 两个登录都保存后，在列表选择 **Use account-a** / **Use account-b** 即可切换。授权仍有效时不需要再次登录；Google 撤销或刷新失败后需要重新授权。
 5. 勾选 `account-b as fallback`，将 **Automatic fallback** 改为 **ON**。多个候补按勾选顺序编号；取消再勾选会移到队尾。设置自动保存，初始默认关闭。
 6. 回到首页，选择 **Create a new runtime**，照常确认硬件、存储、访问模式和本次预算。开启候补后先查询当前账号实时 CU 余额；显示为零则查询候补，找到正余额后只向选中的账号提交一次创建。成功后继续该账号下的部署、模型准备和 ComfyUI 启动。
 
@@ -50,7 +50,23 @@ python3 scripts/colabctl.py --account account-b -s "$SESSION" budget
 python3 scripts/colabctl.py --account account-b -s "$SESSION" release
 ```
 
-`new` 等其他命令也支持全局 `--account`。低层 `colabctl.py` 不自动候补；使用原账号、session 和 request ID 恢复原操作。省略 `--account` 始终使用兼容旧版本的 `default`，不会因为在 TUI 中选过 B 而操作 B。
+`new` 等其他命令也支持全局 `--account`。低层 `colabctl.py` 不自动候补；使用原账号、session 和 request ID 恢复原操作。省略 `--account` 使用最初的账号；旧版为 `default`，迁移或首次命名后为列表中的第一个名称。显式 `--account default` 也兼容映射到该账号，不会跟随 TUI 的当前选择。操作其他账号的实例必须明确指定名称。
+
+## 迁移旧版 default 并改名
+
+旧版用户更新代码后，**首次重新启动 dashboard 会自动提示为已有账号取名**。输入尚不存在的名称并按 Enter，即迁移缓存与实例状态；原授权仍有效时继续复用，需要登录时进入 Google 授权。Esc 可暂缓，不移动缓存、不退出登录。迁移完成后不再重复提示。`git pull` 本身不运行程序、不触发登录。
+
+其他 Colab CLI 操作、预算守护或 SSH 转发仍在运行时拒绝迁移，需先明确处理这些本机控制进程；不会自动关闭它们或停止远端 VM/服务。也可以退出 dashboard 后主动运行：
+
+```bash
+python3 scripts/accounts.py migrate-default account-a
+```
+
+该操作把旧 CLI 专用目录整体移动到 `accounts/account-a/cli`，把启动器的 `budgets`、`requests`、`ssh` 移到 `accounts/account-a/state`，并将账号列表中的 `default` 替换为新名称。原选择和候补顺序保留，其他账号不变。预算记录只更新账号名称，原 job/request ID、计时、截止和待释放状态保留，不视为已释放。
+
+不打开、解析或复制任何 CLI 凭据。迁移使用同一文件系统上的目录重命名，并收紧目录/文件权限；冲突、符号链接、非本用户文件和活跃控制进程会阻止操作。普通操作失败会回退已移动目录；外部进程在迁移中重建旧路径时保留两边数据供检查，不覆盖。
+
+旧 `~/.config/colab-cli` 保留为指向新 `cli` 目录的兼容链接，供直接运行官方 `colab` 使用；实际凭据仍只有一份。启动器使用新名称的真实目录，旧位置不再保留独立实例状态。迁移后重启界面。
 
 ## 本机保存与隔离
 

@@ -25,7 +25,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from accounts import account_context, account_id, current_account, state_root
+from accounts import (
+    account_context,
+    account_id,
+    current_account,
+    resolve_account,
+    state_root,
+)
 from colab_provider import ColabProvider, ProviderError, validate_session
 
 
@@ -1160,6 +1166,7 @@ def main(argv=None) -> int:
     parser.add_argument("--account", type=account_id, default="default")
     args = parser.parse_args(argv)
     try:
+        args.account = resolve_account(args.account)
         with account_context(args.account):
             return BudgetManager(args.state_root, poll_seconds=args.poll_seconds).watch(
                 args.session, args.job_id

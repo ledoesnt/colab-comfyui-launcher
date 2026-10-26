@@ -31,6 +31,7 @@ from accounts import (
     account_id,
     cli_directory,
     colab_command,
+    resolve_account,
     state_root,
 )
 
@@ -651,6 +652,7 @@ def execute(args):
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
+        args.account = resolve_account(args.account)
         with account_context(args.account):
             if args.account != "default":
                 if args.config == Path.home() / ".config/colab-cli/sessions.json":

@@ -59,6 +59,10 @@ Busy actions appear at the top and in the first right-hand status block; blue AB
 
 ## CLI: allocate a runtime
 
+Read [docs/accounts.md](../../../docs/accounts.md) for the current account layout. Fresh installations name the first account before Google authorization. After an update, the wizard automatically asks users to name an existing legacy default account and migrate its dedicated CLI cache plus budgets, requests and SSH state. Escape postpones this without changing login. Existing authorization is reused; only a missing/unverified login that actually requires authorization enters the provider flow. Do not force Google reauthorization merely because storage moved.
+
+Explicit CLI migration is `python3 scripts/accounts.py migrate-default account-a`. Close other local launcher/CLI controllers before migration; it refuses live guards and SSH forwards rather than stopping them. The migration renames directories on the same filesystem without opening credential files, retains budget identity/timing, and leaves only a compatibility symlink at the official CLI path. The launcher uses the new account's real directory. Do not perform real account migration as a test without the user's authorization; use isolated fixtures. Omitted CLI account remains bound to the original first account after migration, independently of UI selection.
+
 Example allocation after the user authorizes G4:
 
 ```bash

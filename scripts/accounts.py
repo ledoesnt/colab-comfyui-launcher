@@ -150,7 +150,6 @@ class AccountStore:
             not isinstance(profiles, list)
             or not 1 <= len(profiles) <= 32
             or any(not isinstance(item, str) for item in profiles)
-            or profiles[0] != "default"
             or len(set(profiles)) != len(profiles)
         ):
             raise AccountError("Invalid account list.")
@@ -168,7 +167,36 @@ class AccountStore:
             raise AccountError("Invalid account selection or fallback order.")
         return value
 
-    def update(self, *, add=None, active=None, toggle=None, enabled=None) -> dict:
+    def first_name_required(self) -> bool:
+        """A fresh installation names its first login before authorization."""
+        return (
+            not (self.root / "accounts.json").exists()
+            and not (Path.home() / ".config/colab-cli/token.json").exists()
+            and not any(
+                (launcher_root() / name).exists()
+                for name in ("budgets", "requests", "ssh")
+            )
+        )
+
+    def _save(self, value: dict) -> None:
+        fd, name = tempfile.mkstemp(prefix=".accounts-", dir=self.root)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(value, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, self.root / "accounts.json")
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
+    def legacy_name_required(self) -> bool:
+        """Offer the upgrade once, when an actual legacy login/state exists."""
+        return "default" in self.read()["profiles"] and not self.first_name_required()
+
+    def update(
+        self, *, add=None, active=None, toggle=None, enabled=None, first=False
+    ) -> dict:
         private_directory(self.root)
         fd = os.open(
             self.root / ".lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600
@@ -176,8 +204,18 @@ class AccountStore:
         with os.fdopen(fd, "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             value = self.read()
+            if first:
+                if not self.first_name_required() or add == "default":
+                    raise AccountError("The first login needs a unique local name.")
+                if add is None or active != add:
+                    raise AccountError("Name and select the first account together.")
+                value["profiles"] = []
             if add is not None:
                 account_id(add)
+                if add == "default":
+                    raise AccountError(
+                        "default is reserved for legacy login compatibility."
+                    )
                 if add in value["profiles"] or len(value["profiles"]) >= 32:
                     raise AccountError(
                         "Account already exists or the 32-account limit was reached."
@@ -198,16 +236,7 @@ class AccountStore:
                     value["fallbacks"].append(toggle)
             if enabled is not None:
                 value["auto_fallback"] = bool(enabled)
-            fd, name = tempfile.mkstemp(prefix=".accounts-", dir=self.root)
-            try:
-                with os.fdopen(fd, "w") as stream:
-                    json.dump(value, stream)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(name, self.root / "accounts.json")
-            finally:
-                if os.path.exists(name):
-                    os.unlink(name)
+            self._save(value)
             return value
 
     def directory(self, account: str) -> Path:
@@ -217,6 +246,204 @@ class AccountStore:
         path = self.root / account
         private_directory(path)
         return path
+
+    def migrate_default(self, name: str) -> dict:
+        """Move legacy caches and state; credential files are never opened.
+
+        All launcher/CLI processes must be closed first. A compatibility link
+        keeps standalone `colab` using the same physical credential directory.
+        Budget identity and deadlines survive; only the local account label is
+        changed. Directory renames require the same filesystem.
+        """
+        account_id(name)
+        if name == "default":
+            raise AccountError("Choose a new name for the legacy account.")
+        private_directory(self.root)
+        fd = os.open(
+            self.root / ".lock", os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600
+        )
+        with os.fdopen(fd, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            value = self.read()
+            legacy = Path.home() / ".config/colab-cli"
+            destination = self.root / name
+            sources = [(legacy, destination / "cli")]
+            sources.extend(
+                (launcher_root() / part, destination / "state" / part)
+                for part in ("budgets", "requests", "ssh")
+            )
+            if "default" not in value["profiles"]:
+                if (
+                    value["profiles"][0] == name
+                    and legacy.is_symlink()
+                    and legacy.readlink() == destination / "cli"
+                    and not any(source.exists() for source, _ in sources[1:])
+                ):
+                    return value
+                raise AccountError("No legacy default account is available to migrate.")
+            if (
+                name in value["profiles"]
+                or destination.exists()
+                or destination.is_symlink()
+            ):
+                raise AccountError(
+                    "Migration destination already exists; nothing was replaced."
+                )
+            require_idle_accounts()
+            # Validate every entry before moving anything or tightening modes.
+            trees = []
+            for source, target in sources:
+                if source.is_symlink():
+                    raise AccountError(
+                        "Migration refuses symbolic links in legacy storage."
+                    )
+                for parent in source.parents:
+                    if parent.is_symlink():
+                        raise AccountError(
+                            "Migration refuses redirected legacy storage."
+                        )
+                if not source.exists():
+                    continue
+                if not source.is_dir():
+                    raise AccountError("Migration source must be a directory.")
+                if source.stat().st_dev != self.root.stat().st_dev:
+                    raise AccountError(
+                        "Migration requires storage on the same filesystem."
+                    )
+                entries = [source, *source.rglob("*")]
+                for entry in entries:
+                    info = entry.lstat()
+                    if (
+                        info.st_uid != os.getuid()
+                        or not (
+                            stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+                        )
+                        or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)
+                    ):
+                        raise AccountError(
+                            "Migration refuses unsafe legacy storage metadata."
+                        )
+                trees.append((source, target, entries))
+            originals = []
+            budgets = launcher_root() / "budgets"
+            if budgets.exists():
+                for path in budgets.rglob("*.json"):
+                    with path.open() as stream:
+                        record = json.load(stream)
+                    if (
+                        not isinstance(record, dict)
+                        or record.get("schema") != 1
+                        or record.get("account", "default") != "default"
+                    ):
+                        raise AccountError(
+                            "Legacy budget account could not be verified."
+                        )
+                    originals.append((path.relative_to(budgets), record))
+            moved = []
+            linked = False
+            private_directory(destination)
+            private_directory(destination / "state")
+            try:
+                for source, target, entries in trees:
+                    source.rename(target)
+                    moved.append((source, target))
+                    for entry in entries:
+                        relocated = target / entry.relative_to(source)
+                        relocated.chmod(0o700 if relocated.is_dir() else 0o600)
+                private_directory(destination / "cli")
+                for relative, record in originals:
+                    atomic_state_json(
+                        destination / "state/budgets" / relative,
+                        {**record, "account": name},
+                    )
+                legacy.parent.mkdir(parents=True, exist_ok=True)
+                legacy.symlink_to(destination / "cli", target_is_directory=True)
+                linked = True
+                value["profiles"] = [
+                    name if item == "default" else item for item in value["profiles"]
+                ]
+                value["active"] = (
+                    name if value["active"] == "default" else value["active"]
+                )
+                value["fallbacks"] = [
+                    name if item == "default" else item for item in value["fallbacks"]
+                ]
+                self._save(value)
+            except BaseException:
+                if linked:
+                    legacy.unlink()
+                if any(source == budgets for source, _ in moved):
+                    for relative, record in originals:
+                        atomic_state_json(
+                            destination / "state/budgets" / relative, record
+                        )
+                for source, target in reversed(moved):
+                    if source.exists() or source.is_symlink():
+                        raise AccountError(
+                            "Legacy storage was recreated during migration; both directories were retained for inspection."
+                        ) from None
+                    target.rename(source)
+                for path in (destination / "cli", destination / "state", destination):
+                    if path.is_dir() and not any(path.iterdir()):
+                        path.rmdir()
+                raise
+            return value
+
+
+def atomic_state_json(path: Path, value: dict) -> None:
+    """Write noncredential migration metadata atomically."""
+    fd, temporary = tempfile.mkstemp(prefix=".migration-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def require_idle_accounts() -> None:
+    """Read process metadata only; migration must not strand a live controller."""
+    programs = {
+        "dashboard.py",
+        "colabctl.py",
+        "budget_guard.py",
+        "ssh_forward.py",
+        "account_cli.py",
+        "colab",
+    }
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit() or int(process.name) == os.getpid():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            arguments = (process / "cmdline").read_bytes().split(b"\0")
+            if any(
+                Path(os.fsdecode(argument)).name in programs
+                for argument in arguments
+                if argument
+            ):
+                raise AccountError(
+                    "Close dashboard, CLI, budget guards and SSH forwards before migration; retain remote resources."
+                )
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+
+
+def resolve_account(name: str) -> str:
+    """CLI compatibility: omitted/default refers to the original first account.
+
+    This is independent of the UI's active account, including after migration.
+    Library contexts remain explicit and do not consult UI preferences.
+    """
+    account_id(name)
+    if name == "default":
+        profiles = AccountStore().read()["profiles"]
+        return "default" if "default" in profiles else profiles[0]
+    return name
 
 
 def cli_directory(account: str | None = None) -> Path:
@@ -308,25 +535,35 @@ def funded_account(accounts: list[str], usage, check_cancelled=lambda: None) -> 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("list", "add", "select", "fallback", "auto"))
+    parser.add_argument(
+        "action",
+        choices=("list", "add", "select", "fallback", "auto", "migrate-default"),
+    )
     parser.add_argument("name", nargs="?")
     args = parser.parse_args(argv)
     try:
         store = AccountStore()
         if args.action == "list":
             value = store.read()
+        elif args.action == "migrate-default":
+            value = store.migrate_default(args.name)
         elif args.action == "auto":
             if args.name not in ("on", "off"):
                 raise AccountError("Use auto on or auto off.")
             value = store.update(enabled=args.name == "on")
         else:
             account_id(args.name)
+            first = args.action == "add" and store.first_name_required()
+            changes = {
+                {"add": "add", "select": "active", "fallback": "toggle"}[
+                    args.action
+                ]: args.name
+            }
+            if first:
+                changes["active"] = args.name
             value = store.update(
-                **{
-                    {"add": "add", "select": "active", "fallback": "toggle"}[
-                        args.action
-                    ]: args.name
-                }
+                first=first,
+                **changes,
             )
         print(json.dumps(dict(ok=True, **value)))
         return 0

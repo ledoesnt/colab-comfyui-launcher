@@ -52,8 +52,10 @@ ACCOUNT_ACTIONS = (
     "account_switch",
     "profile_select",
     "profile_add",
+    "profile_login",
+    "profile_migrate",
 )
-LOGIN_ACTIONS = ("account_login", "account_switch")
+LOGIN_ACTIONS = ("account_login", "account_switch", "profile_login", "profile_migrate")
 STEPS = (
     ("account", "Colab login"),
     ("session", "Session"),
@@ -148,6 +150,10 @@ class Wizard:
                 self.page = "failure"
                 self.error = "Offline fixture: model checksum mismatch."
             self.stage = "Offline demonstration; no provider commands"
+        elif getattr(backend, "legacy_account_name_required", lambda: False)():
+            self.account_intent = "inspect" if self.config.session else None
+            self._input("existing_account_name", "home")
+            self.notice = "Name your existing Colab account to update saved account storage. Your login and runtime state will be retained. Esc postpones the update."
         elif self.config.session:
             self.resume = True
             self._require_account("inspect")
@@ -907,13 +913,17 @@ class Wizard:
     def _confirm_input(self) -> None:
         value = self.input_value.strip()
         field = self.input_field
-        if field == "profile_name":
+        if field in ("profile_name", "first_profile_name", "existing_account_name"):
             try:
                 account_id(value)
             except ValueError as exc:
                 self.error = str(exc)
                 return
-            if self._submit("profile_add", replace(self.config, profile_name=value)):
+            action = {
+                "first_profile_name": "profile_login",
+                "existing_account_name": "profile_migrate",
+            }.get(field, "profile_add")
+            if self._submit(action, replace(self.config, profile_name=value)):
                 self.account_dismissed = False
                 self._page("account")
                 self._account_checking()
@@ -1228,6 +1238,20 @@ class Wizard:
                     self.error = safe_error(exc)
         elif key in ("account_check", "account_login"):
             if not self.worker.busy:
+                legacy_name = getattr(
+                    self.backend, "legacy_account_name_required", lambda: False
+                )
+                if key == "account_login" and legacy_name():
+                    self._input("existing_account_name", "account")
+                    self.notice = "Name the existing account to keep its login and runtime state in one place."
+                    return True
+                first_name = getattr(
+                    self.backend, "first_account_name_required", lambda: False
+                )
+                if key == "account_login" and first_name():
+                    self._input("first_profile_name", "account")
+                    self.notice = "Name your first Colab account before Google authorization. Use letters, digits, _ or -."
+                    return True
                 if self.page != "account":
                     self.account_return_page = self.page
                 if self._submit(
@@ -1536,7 +1560,13 @@ class Wizard:
             ):
                 continue
             if kind == "profile_selected":
+                intent = (
+                    self.account_intent
+                    if self.last_operation in ("profile_login", "profile_migrate")
+                    else None
+                )
                 self._detach_account_runtime()
+                self.account_intent = intent
                 self.config.account = str(value)
                 self._clear_usage()
                 self.auth.clear()
@@ -1849,6 +1879,8 @@ class Wizard:
         label = {
             "account_status": "Checking Colab login",
             "account_login": "Signing in to Colab",
+            "profile_login": "Signing in to your named Colab account",
+            "profile_migrate": "Updating saved Colab account storage",
             "account_logout": "Signing out of local Colab login",
             "account_switch": "Switching Colab account",
             "usage": "Checking compute-unit balance",
@@ -2489,7 +2521,11 @@ class Wizard:
         return clip_cells(value, max(0, width - 3)) + "." * min(3, width)
 
     def _input_default(self) -> str:
-        if self.input_field == "profile_name":
+        if self.input_field in (
+            "profile_name",
+            "first_profile_name",
+            "existing_account_name",
+        ):
             return "e.g. account-b (1–32 letters, digits, _ or -)"
         if self.input_field in ("cu_limit", "rate_ceiling", "reserve_cu"):
             value = getattr(self.config, self.input_field)

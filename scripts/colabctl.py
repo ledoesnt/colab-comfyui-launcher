@@ -30,7 +30,13 @@ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 if str(PROJECT_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-from accounts import account_context, account_id, colab_command, current_account
+from accounts import (
+    account_context,
+    account_id,
+    colab_command,
+    current_account,
+    resolve_account,
+)
 from client_requests import ClientRequests, request_id
 
 
@@ -1537,6 +1543,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         return int(exc.code or 0)
     try:
+        arguments.account = resolve_account(arguments.account)
         with account_context(arguments.account):
             result = run_command(arguments, command_payload(arguments))
             if arguments.account != "default":

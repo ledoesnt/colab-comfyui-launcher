@@ -402,6 +402,7 @@ class AccountNavigationTests(unittest.TestCase):
 
     def test_initial_page_checks_account_without_creating_or_querying_a_runtime(self):
         backend = mock.Mock(spec=dashboard.Backend)
+        backend.legacy_account_name_required.return_value = False
         ui = wizard.Wizard(dashboard.Config(), backend, self.worker)
         self.assertEqual(ui.account["state"], "checking")
         self.assertEqual(

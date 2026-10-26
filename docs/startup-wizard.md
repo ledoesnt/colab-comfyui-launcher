@@ -56,7 +56,7 @@ flowchart TD
     J --> Y
 ```
 
-保存多个账号及零余额候补启动见[多账号说明](accounts.md)。切换已保存账号不删除凭据，旧实例守护继续使用原账号；下面的确认/清除说明仅适用于替换当前登录和退出。
+保存多个账号及零余额候补启动见[多账号说明](accounts.md)。全新安装首次 Sign in 先输入本机账号名称；旧版用户更新后首次启动会自动提示为已有账号取名并迁移缓存与实例状态，Esc 可暂缓。旧凭据仍有效时复用，需要授权时再进入 Google 登录。切换已保存账号不删除凭据，旧实例守护继续使用原账号；下面的确认/清除说明仅适用于替换当前登录和退出。
 
 首页第一项是 **Create a new runtime**，倒数第二项是 **Manage Colab account**，最后一项是 **Exit and keep resources**。首页自动执行只读检查；直接选择新建或已有实例时，未登录或未核实会进入账号页，登录验证成功后继续原流程。账号管理页可选择 **Check login status / Recheck login**、未登录时 **Sign in**、**Replace login in this account**、**Sign out** 与 **Back**。Check / Recheck 只查询会话，不发起交互授权或分配实例；Sign in 先检查已有登录，仅在需要时进入浏览器授权。网络错误显示未核实，不表示已退出登录。创建前再次核实登录。**Manage models** 可独立使用，不需要账号或 VM。
 

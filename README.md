@@ -35,7 +35,7 @@ colab --auth=oauth2 sessions
 
 首次 CLI 登录会引导授权。不要把 OAuth code、token、cookie 或 SSH 私钥发到聊天、Git 或 issue。
 
-支持保存多个 Colab 登录：进入 **Manage Colab account → Saved accounts and fallback** 添加账号并分别登录，之后可保留凭据切换。开启 **Automatic fallback** 并勾选候补后，新建时当前账号余额显示为零会按顺序选择有余额的账号，再创建和部署新 VM。原实例与预算守护仍绑定原账号；查询失败或创建结果未知时不跨账号重试。已有任务不会自动迁移，Drive 共享需要单独处理。配置与限制见[多账号说明](docs/accounts.md)。
+支持保存多个 Colab 登录：全新安装首次 **Sign in** 先输入本机账号名称，再完成 Google 授权；所有命名账号使用相同的独立目录。旧版用户更新后首次启动 dashboard，会自动引导为 `default` 取名并整体迁移凭据及实例状态；已有授权可复用，不读取 token 内容、不重置预算。也可退出界面后运行 `python3 scripts/accounts.py migrate-default account-a`。进入 **Manage Colab account → Saved accounts and fallback** 添加其他账号并分别登录，之后可保留凭据切换。开启 **Automatic fallback** 并勾选候补后，新建时当前账号余额显示为零会按顺序选择有余额的账号，再创建和部署新 VM。原实例与预算守护仍绑定原账号；查询失败或创建结果未知时不跨账号重试。已有任务不会自动迁移，Drive 共享需要单独处理。配置与限制见[多账号说明](docs/accounts.md)。
 
 ## 终端界面
 

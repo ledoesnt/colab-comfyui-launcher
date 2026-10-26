@@ -44,6 +44,7 @@ from accounts import (
     current_account,
     funded_account,
     launcher_arguments,
+    resolve_account,
 )
 
 DEFAULT_STORAGE = "/content/drive/MyDrive/colab-comfyui-launcher-test"
@@ -57,6 +58,8 @@ ACCOUNT_ACTIONS = frozenset(
         "account_switch",
         "profile_select",
         "profile_add",
+        "profile_login",
+        "profile_migrate",
     )
 )
 MODEL_SEARCH_CATEGORIES = frozenset(
@@ -287,6 +290,14 @@ class Backend:
     @staticmethod
     def account_profiles() -> dict[str, Any]:
         return AccountStore().read()
+
+    @staticmethod
+    def first_account_name_required() -> bool:
+        return AccountStore().first_name_required()
+
+    @staticmethod
+    def legacy_account_name_required() -> bool:
+        return AccountStore().legacy_name_required()
 
     def json_command(self, argv: list[str], *, timeout: float = 150) -> dict[str, Any]:
         try:
@@ -592,6 +603,12 @@ class Backend:
         reads credentials itself, starts a VM, opens a browser, or retains the
         CLI's raw output/authorization link. Network failure is not logout.
         """
+        if self.first_account_name_required():
+            return {
+                "state": "not_authenticated",
+                "reason": "first_name_required",
+                "message": "Choose Sign in to name your first Colab account, then complete Google authorization.",
+            }
         command = colab_command(["sessions"])
         try:
             result = self.run(
@@ -1505,21 +1522,44 @@ class Worker:
                     self._check_cancelled()
                 if action == "account_status":
                     self._check_account()
-                elif action in ("profile_select", "profile_add"):
+                elif action == "profile_migrate":
+                    preferences = AccountStore().migrate_default(config.profile_name)
+                    selected = (
+                        preferences["profiles"][0]
+                        if config.account == "default"
+                        else config.account
+                    )
+                    migrated = replace(config, account=selected)
+                    context.enter_context(account_context(selected))
+                    self.account_checked = False
+                    self.events.put(("profile_selected", selected))
+                    self.events.put(("config", migrated))
+                    self._authorize_account(migrated)
+                elif action in ("profile_select", "profile_add", "profile_login"):
                     selected = (
                         config.profile_name
-                        if action == "profile_add"
+                        if action in ("profile_add", "profile_login")
                         else config.account
                     )
                     self._check_cancelled()
                     AccountStore().update(
-                        add=selected if action == "profile_add" else None,
+                        add=selected
+                        if action in ("profile_add", "profile_login")
+                        else None,
                         active=selected,
+                        first=action == "profile_login"
+                        or (
+                            action == "profile_add"
+                            and AccountStore().first_name_required()
+                        ),
                     )
                     context.enter_context(account_context(selected))
                     self.account_checked = False
                     self.events.put(("profile_selected", selected))
-                    self._check_account()
+                    if action == "profile_login":
+                        self._authorize_account(replace(config, account=selected))
+                    else:
+                        self._check_account()
                 elif action == "usage":
                     # Balance failures must not interrupt startup.
                     try:
@@ -3204,6 +3244,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.demo:
         try:
             preferences = AccountStore().read()
+            if args.account:
+                args.account = resolve_account(args.account)
             if args.account and args.account not in preferences["profiles"]:
                 parser.error(
                     "Unknown saved account; add it in Manage Colab account first."
