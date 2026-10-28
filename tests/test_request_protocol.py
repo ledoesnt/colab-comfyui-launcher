@@ -7,11 +7,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import budget_guard as budget
 import colabctl as bridge
 from client_requests import ClientRequests
 
@@ -34,6 +36,12 @@ class RequestProtocolTests(unittest.TestCase):
         self.manager = mock.Mock()
         self.manager.authorize.return_value = None
         self.manager.status.return_value = {"ok": True, "managed": False}
+        # Exercise the real admission context with an unmanaged fixture. Only
+        # the budget decision is mocked; locks/deadlines retain their contract.
+        admission = budget.BudgetManager(self.root / "budgets")
+        admission.authorize = self.manager.authorize
+        self.manager.clock.side_effect = time.time
+        self.manager.dispatch_lease.side_effect = admission.dispatch_lease
         patch = mock.patch.object(bridge, "budget_manager", return_value=self.manager)
         patch.start()
         self.addCleanup(patch.stop)
@@ -192,7 +200,9 @@ class RequestProtocolTests(unittest.TestCase):
         remote.assert_called_once()
 
     def test_budget_rejection_is_known_not_submitted(self):
-        self.manager.authorize.side_effect = RuntimeError("Guard has no heartbeat")
+        self.manager.authorize.side_effect = budget.BudgetError(
+            "Guard has no heartbeat"
+        )
         with mock.patch.object(bridge, "execute_remote") as remote:
             code, result, _ = self.cli("--request-id", "blocked", "render")
         self.assertEqual(code, 1)
@@ -279,7 +289,8 @@ class RequestProtocolTests(unittest.TestCase):
         ) as remote:
             self.cli("--request-id", "budgeted", "prepare", "--max-seconds", "120")
             payload = remote.call_args.args[1]
-            self.assertEqual(payload["max_seconds"], 12.5)
+            self.assertLessEqual(payload["max_seconds"], 12.5)
+            self.assertGreater(payload["max_seconds"], 12.0)
             self.assertIn("not_after", payload)
             self.manager.authorize.return_value = 5.0
             code, _, _ = self.cli(

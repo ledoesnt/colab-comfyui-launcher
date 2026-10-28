@@ -20,6 +20,7 @@ spec = importlib.util.spec_from_file_location(
 )
 bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
+import budget_guard as budget
 
 
 class BackgroundBridgeTests(unittest.TestCase):
@@ -523,8 +524,12 @@ class BackgroundArgumentsTests(unittest.TestCase):
         )
         identity.start()
         self.addCleanup(identity.stop)
-        manager = mock.patch.object(bridge, "budget_manager")
-        manager.start().return_value.authorize.return_value = None
+        manager = mock.patch.object(
+            bridge,
+            "budget_manager",
+            return_value=budget.BudgetManager(Path(temporary.name) / "budgets"),
+        )
+        manager.start()
         self.addCleanup(manager.stop)
 
     def test_ephemeral_prepare_payload_and_remote_arguments_use_vm_only(self):
@@ -549,7 +554,9 @@ class BackgroundArgumentsTests(unittest.TestCase):
                 0,
             )
         payload = execute.call_args.args[1]
-        self.assertEqual(payload["max_seconds"], 120)
+        self.assertLessEqual(payload["max_seconds"], 120)
+        self.assertGreater(payload["max_seconds"], 119)
+        self.assertIn("not_after", payload)
         self.assertTrue(payload["ephemeral"])
         self.assertIsNone(payload["cache_root"])
         namespace = {}
@@ -662,15 +669,27 @@ class BackgroundArgumentsTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(code, 0)
+        payload = execute.call_args.args[1]
+        self.assertLessEqual(payload["max_seconds"], 120)
+        self.assertGreater(payload["max_seconds"], 119)
+        self.assertEqual(payload["work_seconds_remaining"], payload["max_seconds"])
+        self.assertIsInstance(payload["not_after"], float)
         self.assertEqual(
             {
                 key: value
-                for key, value in execute.call_args.args[1].items()
-                if key not in ("request_id", "session", "assignment_id")
+                for key, value in payload.items()
+                if key
+                not in (
+                    "request_id",
+                    "session",
+                    "assignment_id",
+                    "max_seconds",
+                    "not_after",
+                    "work_seconds_remaining",
+                )
             },
             {
                 "action": "download",
-                "max_seconds": 120.0,
                 "workers": 2,
                 "models_root": "/content/dedicated/models",
                 "ephemeral": True,

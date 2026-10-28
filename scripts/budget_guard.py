@@ -10,7 +10,6 @@ verify release. State contains identifiers and accounting only, never tokens.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import math
@@ -25,6 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import operation_deadline as submission
 from accounts import (
     account_context,
     account_id,
@@ -94,6 +94,51 @@ def _default_root() -> Path:
         Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
         / "colab-comfyui-launcher/budgets"
     )
+
+
+def new_work_state_barrier(record, action):
+    """Pure early rejection only; fresh authorization/identity checks still follow."""
+    if not record.get("managed") or action in READ_ACTIONS:
+        return
+    allowed = (
+        {"active", "holding", "collect_only"}
+        if action in COLLECT_ACTIONS
+        else {"active", "holding"}
+    )
+    if (
+        record.get("release_requested")
+        or record.get("status") not in allowed
+        or record.get("query_error")
+    ):
+        raise BudgetError(
+            "New work blocked by budget/release state; inspect the recorded allocation, do not dispatch."
+        )
+
+
+def query_failure_diagnostic(error):
+    """Only classified fields; never raw stderr, exception text, URL, or tokens."""
+    allowed = {
+        "timeout",
+        "unavailable",
+        "command_failed",
+        "invalid_response",
+        "provider_diagnostics",
+        "scope_changed",
+        "provider_error",
+        "assignment_absent",
+        "identity_mismatch",
+    }
+    code = getattr(error, "code", "provider_error")
+    code = code if code in allowed else "unclassified"
+    rc = getattr(error, "returncode", None)
+    return {
+        "phase": "allocation_reconciliation",
+        "error_type": "ProviderError",
+        "provider_code": code,
+        "returncode": rc if isinstance(rc, int) else None,
+        "outcome_unknown": bool(getattr(error, "outcome_unknown", False)),
+        "raw_provider_output_saved": False,
+    }
 
 
 class BudgetManager:
@@ -186,13 +231,13 @@ class BudgetManager:
         try:
             if os.fstat(fd).st_uid != os.getuid():
                 raise BudgetError("Budget lock must be owned by this user.")
-            fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
+            submission.flock(fd, nonblocking=nonblocking)
             yield
         finally:
             os.close(fd)
 
     def _mutate(self, session: str, job_id: str | None, callback) -> dict[str, Any]:
-        with self._lock(session):
+        with self._lock(session, ".dispatch.lock"), self._lock(session):
             record = self._read(self._path(session))
             if record is None or (job_id is not None and record["job_id"] != job_id):
                 raise BudgetError(
@@ -202,6 +247,134 @@ class BudgetManager:
             record["updated_at"] = self.clock()
             self._write(self._path(session), record)
             return record
+
+    def wait_for_work_state(self, session, action):
+        until = time.monotonic() + 10
+        record = self.status(session)
+        while (
+            record.get("status") == "query_failed"
+            and not record.get("release_requested")
+            and self.clock() < record.get("query_retry_until", 0)
+            and time.monotonic() < until
+        ):
+            submission.pause(0.25)
+            record = self.status(session)
+        new_work_state_barrier(record, action)
+        return record
+
+    @contextmanager
+    def dispatch_lease(self, session, action, seconds=None, *, work_not_after=None):
+        """One immutable work cutoff and short atomic submission admission.
+
+        Receipt locks MUST be acquired before this lease. All local waits and
+        provider subprocesses inside it share the same monotonic deadline.
+        """
+        original = self._read(self._path(session))
+        now = self.clock()
+        fixed_work = work_not_after
+        if seconds is not None:
+            fixed_work = (
+                min(fixed_work, now + seconds)
+                if fixed_work is not None
+                else now + seconds
+            )
+        send_seconds = 45
+        if original is not None:
+            deadline = (
+                original["release_deadline"]
+                if action in COLLECT_ACTIONS
+                else original["work_deadline"]
+            )
+            if original.get("hold_deadline") is not None:
+                deadline = min(deadline, original["hold_deadline"])
+            fixed_work = (
+                min(fixed_work, deadline) if fixed_work is not None else deadline
+            )
+            send_seconds = min(
+                send_seconds, fixed_work - now, original["release_deadline"] - now - 30
+            )
+        if send_seconds <= 0:
+            raise BudgetError("Original dispatch deadline reached; nothing submitted.")
+        with submission.bounded(time.monotonic() + send_seconds):
+            self.wait_for_work_state(session, action)
+            allowed = self.authorize(session, action, seconds)
+            if original is None:
+                if allowed is not None:
+                    allowance_end = now + allowed
+                    fixed_work = (
+                        min(fixed_work, allowance_end)
+                        if fixed_work is not None
+                        else allowance_end
+                    )
+                yield {
+                    "allowed_seconds": allowed,
+                    "submission_timeout": submission.timeout(45),
+                    "submission_deadline": submission.current(),
+                    "work_not_after": fixed_work,
+                    "account_scope": None,
+                }
+                return
+            # A successful fresh observation may update the credential-file
+            # metadata fingerprint while proving the same platform allocation.
+            # Preserve the account/profile and allocation identity, then pin the
+            # freshly verified fingerprint for the actual dispatch boundary.
+            verified = self._read(self._path(session))
+            identity_fields = ("job_id", "assignment_id", "account")
+            if tuple(verified.get(k) for k in identity_fields) != tuple(
+                original.get(k) for k in identity_fields
+            ):
+                raise BudgetError(
+                    "Allocation changed during authorization; nothing submitted."
+                )
+            identity = tuple(
+                verified.get(k) for k in (*identity_fields, "account_scope")
+            )
+            with self._lock(session, ".dispatch.lock"):
+                record = self._read(self._path(session))
+                self._advance(record)
+                if (
+                    tuple(record.get(k) for k in (*identity_fields, "account_scope"))
+                    != identity
+                ):
+                    raise BudgetError(
+                        "Allocation changed before dispatch; nothing submitted."
+                    )
+                new_work_state_barrier(dict(record, managed=True), action)
+                if not self._guard_alive(record):
+                    raise BudgetError(
+                        "Guard unavailable before dispatch; nothing submitted."
+                    )
+                latest = (
+                    record["release_deadline"]
+                    if action in COLLECT_ACTIONS
+                    else record["work_deadline"]
+                )
+                fixed_work = min(fixed_work, latest)
+                if record.get("hold_deadline") is not None:
+                    fixed_work = min(fixed_work, record["hold_deadline"])
+                remaining = fixed_work - self.clock()
+                if remaining < 1:
+                    raise BudgetError("Dispatch deadline reached; nothing submitted.")
+                granted = min(allowed, remaining) if allowed is not None else remaining
+                submit_timeout = submission.timeout(
+                    min(45, granted, record["release_deadline"] - self.clock() - 30)
+                )
+                yield {
+                    "allowed_seconds": granted,
+                    "work_not_after": fixed_work,
+                    "submission_timeout": submit_timeout,
+                    "submission_deadline": submission.current(),
+                    "account_scope": record.get("account_scope"),
+                    "allocation": {
+                        "name": session,
+                        "assignment_id": record["assignment_id"],
+                        "hardware": record.get(
+                            "actual_hardware", record.get("hardware")
+                        ),
+                        "account_scope": record.get("account_scope"),
+                        "query_generation": record.get("query_generation"),
+                    },
+                }
 
     def _guard_alive(self, record: dict[str, Any]) -> bool:
         guard = record.get("guard") or {}
@@ -271,6 +444,13 @@ class BudgetManager:
                 record["hold_until_elapsed"],
                 (record["limit_cu"] - record["reserve_cu"]) * 3600 / rate,
             )
+        if (
+            record.get("query_error")
+            and record.get("query_retry_until") is not None
+            and now >= record["query_retry_until"]
+        ):
+            record["release_requested"] = True
+            record["reason"] = "provider_query_retry_deadline"
         if cost >= record["limit_cu"] - record["release_reserve_cu"]:
             record["release_requested"] = True
             record["reason"] = "budget_release_point"
@@ -764,7 +944,7 @@ class BudgetManager:
                     return self._public(current)
                 if process.poll() is not None:
                     break
-                time.sleep(0.05)
+                submission.pause(0.05)
             raise BudgetError(
                 "Independent budget guard did not confirm readiness; no new work is allowed."
             )
@@ -792,8 +972,39 @@ class BudgetManager:
             seconds = _positive(seconds, "Task duration")
         self.ensure_guard(session)
         query_generation = record.get("query_generation", 0)
+        expected_identity = (
+            record.get("job_id"),
+            record.get("assignment_id"),
+            record.get("account"),
+        )
         self.tick(session, record["job_id"], force=True)
         record = self._read(self._path(session))
+        # Another guard may own the reconciliation lock. Wait for that exact
+        # fresh query result; never authorize using the preceding generation.
+        reconcile_wait_until = time.monotonic() + 10
+        while (
+            record.get("query_generation", 0) <= query_generation
+            and time.monotonic() < reconcile_wait_until
+        ):
+            submission.pause(0.25)
+            record = self._read(self._path(session))
+        recovery_wait_until = time.monotonic() + 10
+        while (
+            record.get("status") == "query_failed"
+            and not record.get("release_requested")
+            and self.clock() < record.get("query_retry_until", 0)
+            and time.monotonic() < recovery_wait_until
+        ):
+            submission.pause(0.25)
+            record = self._read(self._path(session))
+        if (
+            record.get("job_id"),
+            record.get("assignment_id"),
+            record.get("account"),
+        ) != expected_identity:
+            raise BudgetError(
+                "Allocation identity changed during reconciliation; new work remains blocked."
+            )
         if not self._guard_alive(record):
             raise BudgetError("Budget guard is unavailable; new work is blocked.")
         allowed = (
@@ -899,6 +1110,8 @@ class BudgetManager:
             record.update(
                 last_query_at=now,
                 query_error=None,
+                query_failure_since=None,
+                query_retry_until=None,
                 query_generation=record.get("query_generation", 0) + 1,
             )
             if not record.get("assignment_id"):
@@ -1000,7 +1213,14 @@ class BudgetManager:
         if (
             not force
             and not record.get("release_requested")
+            and not record.get("query_error")
             and self.clock() - record.get("last_query_at", 0) < 30
+        ):
+            return self._public(record)
+        if (
+            record.get("query_error")
+            and not force
+            and self.clock() - record.get("last_query_attempt", 0) < 2
         ):
             return self._public(record)
         try:
@@ -1008,12 +1228,34 @@ class BudgetManager:
             rows = self.provider.sessions()
             scope_after = self.provider.account_scope()
             if scope_before == "unknown" or scope_before != scope_after:
-                raise ProviderError("Authentication state changed during query.")
+                raise ProviderError(
+                    "Authentication state changed during query.", code="scope_changed"
+                )
             record = self._observe(session, job_id, rows, scope_after)
-        except ProviderError:
+        except ProviderError as query_error:
+            diagnostic = dict(query_failure_diagnostic(query_error), at=self.clock())
 
             def failure(value):
                 self._advance(value)
+                value["last_query_failure"] = diagnostic
+                value["query_failure_history"] = (
+                    value.get("query_failure_history", []) + [diagnostic]
+                )[-16:]
+                value["query_generation"] = value.get("query_generation", 0) + 1
+                if value.get("query_failure_since") is None:
+                    value["query_failure_since"] = self.clock()
+                    value["query_retry_until"] = min(
+                        self.clock() + 10,
+                        value["work_deadline"],
+                        value["release_deadline"],
+                    )
+                # File metadata can also change during a legitimate refresh.
+                # Require a stable, fresh listing of the original allocation;
+                # never infer account ownership from the changed metadata alone.
+                if diagnostic["provider_code"] == "identity_mismatch":
+                    value["query_retry_until"] = self.clock()
+                    value["release_requested"] = True
+                    value["reason"] = "query_scope_mismatch"
                 value.update(
                     query_error="Provider allocation query failed; accounting continues conservatively.",
                     last_query_attempt=self.clock(),

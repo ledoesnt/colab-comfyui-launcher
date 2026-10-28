@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import json
 import subprocess
 import sys
 import threading
@@ -75,6 +76,31 @@ class BackendTests(unittest.TestCase):
 
     def command(self):
         return self.run.call_args.args[0]
+
+    def test_admission_errors_are_displayed_without_repeating_start(self):
+        for status in (
+            "receipt_wait_expired",
+            "query_unknown",
+            "not_submitted",
+            "submission_unknown",
+        ):
+            with self.subTest(status=status):
+                result = {
+                    "ok": False,
+                    "status": status,
+                    "terminal": False,
+                    "resubmit_allowed": False,
+                    "error": "Inspect the original request before retrying.",
+                }
+                self.run.reset_mock()
+                self.run.return_value = subprocess.CompletedProcess(
+                    [], 1, json.dumps(result), result["error"]
+                )
+                with self.assertRaisesRegex(
+                    dashboard.DashboardError, "original request"
+                ):
+                    self.backend.bridge(self.config, "start")
+                self.assertEqual(self.run.call_count, 1)
 
     def test_start_access_and_storage_are_explicit_argv(self):
         self.backend.bridge(self.config, "start")
