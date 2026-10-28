@@ -76,6 +76,12 @@ print("[colab] No active sessions found on server.")
 
 
 class LocalAccountBackend(dashboard.Backend):
+    @staticmethod
+    def first_account_name_required():
+        # Sign-out/replacement fixtures already have a named account. Do not
+        # consult the real user's or a clean CI runner's first-run state.
+        return False
+
     def __init__(self, directory):
         self.directory = directory
         self.timeout = 3

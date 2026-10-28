@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -12,6 +11,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+import operation_deadline as submission
 from accounts import current_account, state_root
 
 
@@ -65,11 +65,16 @@ class ClientRequests:
         return self.directory / (request_id(identifier) + ".json")
 
     @contextmanager
-    def lock(self, identifier: str):
+    def lock(self, identifier: str, *, deadline: float | None = None):
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         with self.path(identifier).with_suffix(".lock").open("a") as stream:
             os.chmod(stream.name, 0o600)
-            fcntl.flock(stream, fcntl.LOCK_EX)
+            # Receipt wait precedes the dispatch lease. Even standalone query
+            # callers have a bounded wait; nested submission keeps its cutoff.
+            cutoff = deadline if deadline is not None else time.monotonic() + 30
+            with submission.bounded(cutoff):
+                submission.flock(stream)
+            # Acquired: retain the caller's context, not a new 30s timer.
             yield
 
     def read(self, identifier: str) -> dict:

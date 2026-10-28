@@ -22,6 +22,10 @@ python3 scripts/colabctl.py -s "$SESSION" status
 
 `started`/`starting` 只表示已接受；需查询最终状态。进程退出、断网或收到无法解释的响应时使用 `submission_unknown` 等状态。**相同 ID 的重试只查询原请求，不重新执行写操作。** 即使查询暂时查不到，也不能把它当成 POST 未执行。重新发一个 ID 是明确的新任务，应先核清原任务。第一次响应丢失且调用者未保存自动 ID 时，用 `jobs` 找回本地记录。
 
+提交时先取得请求回执锁，再进入提交与释放共用的短互斥区。等待回执不会阻塞释放；释放意图已提交后，不再发送新的工作。锁等待、归属核验、部署上传和 CLI 传输共用同一个单调时钟截止，最多为全局 `--timeout` 与 45 秒中较小值，并受预算保护点裁剪。远端工作的 `not_after` 在等待前固定，发送时重新计算剩余量，等待不会延长任务期限。长期推理不持有提交互斥区。
+
+`receipt_wait_expired` 表示本调用没有发送，但其他调用可能已持有该回执并提交；`query_unknown` 表示原请求仍无法查清。这两种状态均不是终态，返回 `this_call_dispatched: false`、`resubmit_allowed: false`，应保留原 ID 查询。`not_submitted` 表示本调用在发送前被拒绝。不能仅凭退出 1、等待超时或本调用未发送，推断原请求从未执行。
+
 渲染 POST 前会先持久化图摘要、预生成 prompt ID 和提交意图，附带请求元数据。恢复会查询 ComfyUI queue/history；客户端预设 prompt ID 本身并不被假定具有服务端去重能力。`job` 对已失去 runner 的渲染可主动执行只读 reconciliation，始终不 POST。历史被清除、服务重启导致无法确认时仍保留未知状态。已完成且本地保存的结果可在实例释放后查询；尚未取回的 VM 文件在释放后不能靠记录恢复。
 
 任务提交失败保留结构化 `server_error`/`node_errors` 信息，诊断中的常见凭证形式会脱敏。服务端节点 schema 是最终权威；泛型 `COMFY_MATCHTYPE_V3`/Switch 不会被本地不完整的类型知识改写成固定分支。当前主线原本已有泛型放行行为，本轮增加了针对真实官方 schema 的回归覆盖。
