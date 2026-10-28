@@ -76,6 +76,12 @@ print("[colab] No active sessions found on server.")
 
 
 class LocalCLIBackend(dashboard.Backend):
+    @staticmethod
+    def first_account_name_required():
+        # This fixture models an already named account, independently of the
+        # developer/CI machine's actual first-run account setup.
+        return False
+
     def __init__(self, directory, timeout=3):
         self.directory = directory
         self.timeout = timeout
@@ -108,6 +114,13 @@ class LocalCLIBackend(dashboard.Backend):
 
 
 class AccountStatusTests(unittest.TestCase):
+    def setUp(self):
+        named_account = mock.patch.object(
+            dashboard.Backend, "first_account_name_required", return_value=False
+        )
+        named_account.start()
+        self.addCleanup(named_account.stop)
+
     def check(self, stdout="", stderr="", returncode=0):
         run = mock.Mock(
             return_value=subprocess.CompletedProcess(
