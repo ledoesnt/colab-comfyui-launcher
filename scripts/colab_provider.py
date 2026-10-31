@@ -17,6 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import operation_deadline as submission
 from accounts import cli_directory, colab_command, current_account
 
 PROVIDER_ERROR_CODES = frozenset(
@@ -259,6 +260,8 @@ class ColabProvider:
             metadata = self.oauth_cache.lstat()
         except FileNotFoundError:
             return "absent"
+        except submission.DeadlineExceeded:
+            raise
         except OSError:
             return "unknown"
         if not stat.S_ISREG(metadata.st_mode):
@@ -280,7 +283,7 @@ class ColabProvider:
                 capture_output=True,
                 text=True,
                 stdin=subprocess.DEVNULL,
-                timeout=timeout,
+                timeout=submission.timeout(timeout),
                 check=False,
             )
         except subprocess.TimeoutExpired:

@@ -30,6 +30,7 @@ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 if str(PROJECT_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
+import operation_deadline as submission
 from accounts import (
     account_context,
     account_id,
@@ -90,7 +91,7 @@ def _run_colab(
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=submission.timeout(timeout),
             check=False,
         )
         if "[colab] A new version of Colab CLI is available:" in completed.stdout:
@@ -100,6 +101,8 @@ def _run_colab(
         raise BridgeError(
             "Local Colab command timed out. Check status before repeating an operation."
         ) from exc
+    except submission.DeadlineExceeded:
+        raise
     except OSError as exc:
         raise BridgeError(
             f"Could not run the Colab CLI ({type(exc).__name__})."
@@ -1252,8 +1255,10 @@ def query_job(
 ) -> dict:
     receipts = ClientRequests(session)
     if not locked:
-        with receipts.lock(identifier):
-            return query_job(session, identifier, timeout, locked=True)
+        with submission.bounded(time.monotonic() + timeout), receipts.lock(identifier):
+            return query_job(
+                session, identifier, submission.timeout(timeout), locked=True
+            )
     local = receipts.read(identifier)
     cached = local.get("result") or {}
     if local.get("action") == "release" and cached:
@@ -1281,79 +1286,181 @@ def query_job(
         },
         timeout,
     )
+    result = dict(
+        result,
+        request_id=identifier,
+        job_id=identifier,
+        session=session,
+        assignment_id=current["assignment_id"],
+    )
     if local:
         receipts.finish(identifier, safe_structure(result))
     return result
 
 
 def submit_command(arguments, payload: dict) -> dict:
+    from budget_guard import COLLECT_ACTIONS, BudgetError
+
+    manager = budget_manager()
     identifier = arguments.request_id or uuid.uuid4().hex
-    current = assignment(arguments.session)
+    receipts = ClientRequests(arguments.session)
+    seconds = payload.get("max_seconds", payload.get("install_timeout"))
+    # Anchor BEFORE receipt contention, reconciliation, or archive construction.
+    now = manager.clock()
+    snapshot = manager.status(arguments.session)
+    work_not_after = now + seconds if seconds is not None else None
+    send_seconds = min(arguments.timeout, 45)
+    if snapshot.get("managed"):
+        work = (
+            snapshot["release_deadline"]
+            if payload["action"] in COLLECT_ACTIONS
+            else snapshot["work_deadline"]
+        )
+        if snapshot.get("hold_deadline") is not None:
+            work = min(work, snapshot["hold_deadline"])
+        work_not_after = (
+            min(work_not_after, work) if work_not_after is not None else work
+        )
+        send_seconds = min(
+            send_seconds, work_not_after - now, snapshot["release_deadline"] - now - 30
+        )
+    receipt_acquired = False
+    existing_request = False
+    try:
+        # Never hold the dispatch/release mutex while waiting for a receipt.
+        with (
+            submission.bounded(time.monotonic() + send_seconds),
+            receipts.lock(identifier),
+        ):
+            receipt_acquired = True
+            old = receipts.read(identifier)
+            if old:
+                existing_request = True
+                # Existing unknown intent is QUERY ONLY, even after release.
+                # Fingerprint against its original allocation, never a new one.
+                receipts.begin(
+                    identifier,
+                    dict(
+                        payload,
+                        request_id=identifier,
+                        session=arguments.session,
+                        assignment_id=old.get("assignment_id"),
+                    ),
+                )
+                return query_job(
+                    arguments.session,
+                    identifier,
+                    submission.timeout(arguments.timeout),
+                    locked=True,
+                )
+            with manager.dispatch_lease(
+                arguments.session,
+                payload["action"],
+                seconds,
+                work_not_after=work_not_after,
+            ) as lease:
+                return _submit_command_under_lease(
+                    arguments, payload, lease, identifier, receipts
+                )
+    except (BudgetError, submission.DeadlineExceeded) as error:
+        # A busy receipt may represent another live/uncertain original request.
+        # This caller sent nothing; never rewrite that request as terminal.
+        raise BridgeError(
+            str(error),
+            result={
+                "ok": False,
+                "status": ("query_unknown" if existing_request else "not_submitted")
+                if receipt_acquired
+                else "receipt_wait_expired",
+                "terminal": receipt_acquired and not existing_request,
+                "job_may_still_be_running": existing_request or not receipt_acquired,
+                "this_call_dispatched": False,
+                "resubmit_allowed": False,
+                "request_id": identifier,
+                "reason": "fixed_submission_deadline_or_budget_gate",
+            },
+        ) from error
+
+
+def _submit_command_under_lease(
+    arguments, payload: dict, lease: dict, identifier: str, receipts: ClientRequests
+) -> dict:
+    from budget_guard import new_work_state_barrier
+
+    new_work_state_barrier(
+        budget_manager().status(arguments.session), payload["action"]
+    )
+    current = lease.get("allocation") or assignment(arguments.session)
+    if lease.get("account_scope") is not None and (
+        current["account_scope"] != lease["account_scope"]
+        or provider().account_scope() != lease["account_scope"]
+    ):
+        raise BridgeError(
+            "Authentication scope changed before dispatch; nothing submitted."
+        )
     payload = dict(
         payload,
         request_id=identifier,
         session=arguments.session,
         assignment_id=current["assignment_id"],
     )
-    receipts = ClientRequests(arguments.session)
-    with receipts.lock(identifier):
-        _, fresh = receipts.begin(identifier, payload)
-        dispatched = not fresh
-        try:
-            if not fresh:
-                result = query_job(
-                    arguments.session, identifier, arguments.timeout, locked=True
+    _, fresh = receipts.begin(identifier, payload)
+    if not fresh:
+        raise BridgeError("Receipt changed while locked; refusing resubmission.")
+    dispatched = False
+    try:
+        effective = dict(payload)
+        not_after = lease.get("work_not_after")
+        if not_after is not None:
+            # Recompute at the real send boundary. Never now + stale allowance.
+            remaining = not_after - budget_manager().clock()
+            if remaining <= 0:
+                raise submission.DeadlineExceeded(
+                    "Original work deadline reached before dispatch."
                 )
-            else:
-                effective = dict(payload)
-                action = payload["action"]
-                seconds = payload.get("max_seconds", payload.get("install_timeout"))
-                allowed = budget_manager().authorize(arguments.session, action, seconds)
-                if allowed is not None:
-                    effective["work_seconds_remaining"] = allowed
-                    effective["not_after"] = time.time() + allowed
-                    if "max_seconds" in effective:
-                        effective["max_seconds"] = min(
-                            effective["max_seconds"], allowed
-                        )
-                    if "install_timeout" in effective:
-                        effective["install_timeout"] = min(
-                            effective["install_timeout"], allowed
-                        )
-                dispatched = True
-                result = (
-                    deploy(arguments.session, arguments.timeout, effective)
-                    if action == "deploy"
-                    else execute_remote(arguments.session, effective, arguments.timeout)
-                )
-            result = dict(
-                result,
-                request_id=identifier,
-                job_id=identifier,
-                session=arguments.session,
-                assignment_id=current["assignment_id"],
+            effective["not_after"] = not_after
+            effective["work_seconds_remaining"] = remaining
+            for field in ("max_seconds", "install_timeout"):
+                if field in effective:
+                    effective[field] = min(effective[field], remaining)
+        timeout = submission.timeout(
+            min(arguments.timeout, lease["submission_timeout"])
+        )
+        dispatched = True
+        result = (
+            deploy(arguments.session, timeout, effective)
+            if payload["action"] == "deploy"
+            else execute_remote(arguments.session, effective, timeout)
+        )
+        result = dict(
+            result,
+            request_id=identifier,
+            job_id=identifier,
+            session=arguments.session,
+            assignment_id=current["assignment_id"],
+        )
+        receipts.finish(identifier, safe_structure(result))
+        return result
+    except Exception as exc:
+        result = dict(
+            getattr(exc, "result", None) or {},
+            ok=False,
+            request_id=identifier,
+            job_id=identifier,
+            session=arguments.session,
+            assignment_id=current["assignment_id"],
+        )
+        result.setdefault("status", "submission_unknown")
+        if result["status"] == "submission_unknown":
+            result.setdefault("terminal", False)
+            result.setdefault("job_may_still_be_running", True)
+        if not dispatched:
+            result.update(
+                status="not_submitted", terminal=True, job_may_still_be_running=False
             )
-            receipts.finish(identifier, safe_structure(result))
-            return result
-        except Exception as exc:
-            result = dict(
-                getattr(exc, "result", None) or {},
-                ok=False,
-                request_id=identifier,
-                job_id=identifier,
-                session=arguments.session,
-                assignment_id=current["assignment_id"],
-            )
-            result.setdefault("status", "submission_unknown")
-            if not dispatched:
-                result.update(
-                    status="not_submitted",
-                    terminal=True,
-                    job_may_still_be_running=False,
-                )
-            result.setdefault("error", sanitize_failure(str(exc)))
-            receipts.finish(identifier, safe_structure(result))
-            raise BridgeError(result["error"], result=result) from exc
+        result.setdefault("error", sanitize_failure(str(exc)))
+        receipts.finish(identifier, safe_structure(result))
+        raise BridgeError(result["error"], result=result) from exc
 
 
 def release_unmanaged(arguments) -> dict:
