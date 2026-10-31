@@ -6,6 +6,22 @@
 python3 scripts/dashboard.py
 ```
 
+## 启动前更新与运行版本
+
+需要每次启动前跟随当前上游分支更新时，在**这个仓库**显式启用：
+
+```bash
+git config --local launcher.updateBeforeStart true
+git config --local launcher.updateBranch main
+python3 scripts/dashboard.py
+```
+
+这只影响该 launcher 的实时界面启动；离线 demo/help 不更新，不影响其他仓库。未启用时保留原有启动行为。更新在创建任何实例前执行 `git pull --ff-only`：未跟踪或已跟踪修改、分支不符、无上游、更新失败、本地领先/分叉都明确停止，不静默使用旧版，不自动 stash、reset 或强推。TUI生成的 `models/extra-added-*.json` 是明确忽略的本机运行配置，原样保留且不进入快照或提交；其他未知模型文件、手工源码改动仍须先保留并明确处理。
+
+界面及持续预算守护持有运行版本读锁，另一个启动不能在原任务仍使用该版本时更新它；退出界面而保留实例不解除守护持有的锁。更新后的入口会重新执行，避免继续使用更新前已导入的模块。
+
+复制到工程内的 launcher 不会随源仓库 pull 自动更新。调用 `startup_update.prepare_launch` 时可传 `snapshot`、工程控制器的 `run_lock` 和旧快照的明确文件哈希清单。同步只取指定 Git commit 的跟踪文件，逐文件验证 Git blob 和 SHA256，写入来源 commit/哈希清单；当前快照有未知文件或哈希漂移就停止。更换采用暂存目录、原子切换和保留旧目录备份，失败恢复原目录；活动工程锁或版本读锁阻止替换。凭据、运行账本及视频素材不应存入代码快照，也不会从未跟踪文件复制进新快照。
+
 默认通过 `local-only` 服务与 SSH 转发，在本机 `http://127.0.0.1:8188` 访问。也可以显式选择 `--public` Cloudflare 临时公开网址，或 `--allowed-email` 邮箱登录；不会自动公开服务。SSH 模式需要专用密钥，创建密钥必须由你明确选择。
 
 新建摘要可选配本次实例的 **CU 上限与保守费率**。预算绑定一次分配，独立本机守护在退出 TUI 后继续计时与核验释放；重连不会清零。它是启动器的尽力保护，控制端断网或关机仍可能无法释放，不能当作 Colab 硬配额。使用方法与边界见 [单实例预算](docs/instance-budget.md)。

@@ -3329,4 +3329,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from startup_update import UpdateError, guard_entry
+
+    try:
+        _startup_lease = guard_entry(ROOT, sys.argv[1:])
+    except UpdateError as update_error:
+        raise SystemExit(str(update_error)) from None
     raise SystemExit(main())

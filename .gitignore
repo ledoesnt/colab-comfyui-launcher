@@ -32,3 +32,6 @@ scripts/probe.py
 **/forward.json
 models/.catalog.lock
 models/.catalog-*
+
+# Per-machine model catalog entries saved by the terminal interface.
+models/extra-added-*.json

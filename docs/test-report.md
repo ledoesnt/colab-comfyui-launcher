@@ -1,5 +1,24 @@
 # 实测记录
 
+## 2026-10-31 启动前更新与可恢复代码快照（离线／本机验证）
+
+在指定仓库用本地 Git 配置显式启用 `launcher.updateBeforeStart` 后，实时 dashboard 启动先检查工作树、分支和上游，再执行 `git pull --ff-only`。更新失败、未知文件、源码修改、本地领先／分叉或版本正在使用均停止，不自动 stash、reset、切账号或继续旧代码。demo/help 不触发更新。TUI生成的 `models/extra-added-*.json` 作为本机运行配置原样保留并明确忽略；未知模型文件和源码仍触发 dirty 拦截。
+
+界面和持续预算守护持有版本读锁，更新需要独占锁。工程快照另核运行锁及已知文件哈希；按指定 Git commit 打包，逐文件核对 Git blob 与SHA256，保留旧快照目录，暂存替换失败可恢复。此机制不复制未跟踪文件、账号缓存、项目账本或视频；工程须显式接入，不以主仓库 pull 冒充旧副本已更新。
+
+本机完整测试实际结果：
+
+```text
+python3 -m unittest discover -s tests -v
+Ran 913 tests in 64.032s
+OK (skipped=2)
+```
+
+新增16项使用本机临时Git仓库和本机bare remote验证快进、dirty停止、分叉及更新失败、源码／快照版本锁、工程活动锁、Git blob／SHA核验、快照漂移拒绝、旧版备份、目录重叠拒绝和仅本仓库opt-in。其余测试包括真实本机进程、锁及localhost HTTP fixtures；默认沙箱阻止socket的首次运行未记为通过，正式权限环境复测后以上结果才通过。两个跳过项是既有可选PyAV媒体集成。Ruff0.16.0 check/format、bootstrap shell语法通过。
+
+本轮未调用Colab、未读取真实凭据、未申请GPU，也不据这些fixtures宣称云端端到端生成通过。仓库更新授权不等于PR review approval，本轮未提交审查批准。
+
+
 ## 2026-10-28 提交准入、回执锁与固定截止（离线及本机验证）
 
 提交先取得请求回执，再进入与释放共用的短互斥区；锁等待、核验和 CLI 传输使用同一截止。短暂列表查询失败可在固定窗口内恢复，不延长预算；仅官方重新确认原 profile 下的同一 assignment/session 后，才接受凭据文件元数据刷新。账号切换后的空列表、替代实例和 session 改绑仍不能重新建立原归属。

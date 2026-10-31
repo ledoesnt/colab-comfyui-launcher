@@ -1348,7 +1348,12 @@ class BudgetManager:
 
     def watch(self, session: str, job_id: str) -> int:
         try:
-            with self._lock(session, ".guard.lock", nonblocking=True):
+            from startup_update import read_version_lease
+
+            with (
+                read_version_lease(Path(__file__).resolve().parents[1]),
+                self._lock(session, ".guard.lock", nonblocking=True),
+            ):
                 pid, stamp = os.getpid(), process_stamp(os.getpid())
                 if stamp is None:
                     return 2
