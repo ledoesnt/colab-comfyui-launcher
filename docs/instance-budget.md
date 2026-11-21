@@ -18,7 +18,7 @@ CPU 使用 `--cpu` 替代 `--gpu`，仍需明确预算和费率上界。不要�
 
 预算守护在分配请求前作为独立本机进程启动，确认 PID 启动标识、独占锁和心跳后才允许分配。分配请求意图先落盘；请求超时后只核查原会话，绝不自动再次 `new`。不能确认属于本工具的 orphan 分配不会被猜测接管或释放。
 
-`new` 返回 `allocation_pending` 或 `allocation_unknown`、`ok: false` 和退出码 1 时，**仍是非终态，分配可能继续进行**，不能据此断言失败或重复 `new`。例如守护正在核查并持有协调锁时，客户端可能先返回 pending，平台稍后才显示实例。保存原响应的 `request_id` 和预算 `job_id`，在同一 session 上只读轮询：
+`new` 返回 `allocation_pending` 或 `allocation_unknown`、`ok: false` 和退出码 1 时，**仍是非终态，分配可能继续进行**，不能据此断言失败或重复 `new`。`new` 在分配后最多等待 30 秒让守护正在进行的协调结束；协调仍未完成时客户端可能先返回 pending，平台稍后才显示实例。保存原响应的 `request_id` 和预算 `job_id`，在同一 session 上只读轮询：
 
 ```bash
 python3 scripts/colabctl.py -s "$SESSION" budget
@@ -28,7 +28,13 @@ python3 scripts/colabctl.py -s "$SESSION" budget
 
 若守护失活，`budget --refresh` 是显式恢复与核查操作，**不是只读轮询**；它可能继续已到期的释放流程。pending/unknown 持续到预算保护点或测试观察窗口结束时，应核查官方实例列表并按已有授权处理清理；没有实例 ID 时不得猜测停止对象。客户端观察超时既不证明分配失败，也不证明远端已经释放。
 
-失败记录保留固定安全分类 `allocation_error_code` 和可用的 CLI 进程退出码 `allocation_error_returncode`（未知为 `null`）；`allocation_error` 仍为通用安全说明。不保存提供方原始 stdout/stderr。`command_failed` 或进程退出码不是 HTTP 状态，不能据此推断上游返回了某个具体错误。
+**创建回复丢失。** 命名账号的 `new` 用由预算 `job_id` 派生的分配键作为官方 notebook hash，并在发送前记录 `create_requests: 1`。服务器已接受创建但回复丢失时，守护在创建进程返回后按同一个键只读查找（拒绝发送任何创建请求），找到后核对平台列表中的同一 `assignment_id` 再绑定，带 `allocation_recovered_by: allocation_key_lookup`；`request_id` 与 `job_id` 保持原值，预算从原请求前的时间起算。查不到时 `allocation_lookup.result: absent`，记录仍为待确认的 `allocation_unknown`，不会转为失败或重新创建；之后分配出现仍按原键绑定。公开结果不显示分配键。
+
+**超过运行时寿命。** Colab 运行时最长约 24 小时。从未绑定分配、且请求已超过 48 小时的记录进入终态 `allocation_lapsed`；已绑定、超过 48 小时且平台列表中已不存在的分配记为 `released`，`release_verified_by: runtime_lifetime`，即使认证范围在此期间变化（此前这种记录永久停在 `release_unknown` 或 `release_pending`，守护一直轮询，界面也一直把它们当作活动实例）。所有预算结果都带 `terminal`。
+
+失败记录保留固定安全分类 `allocation_error_code`、可用的 CLI 进程退出码 `allocation_error_returncode`（未知为 `null`）和白名单字段 `allocation_diagnostic`（阶段、HTTP 状态、`outcome`、`retryable`）；`allocation_error` 由启动器按分类生成，例如 G4 无容量时说明 HTTP 503、没有创建实例、可稍后重试或换硬件。不保存提供方原始 stdout/stderr。没有分类证据时仍是 `command_failed`，进程退出码不是 HTTP 状态。
+
+分类证明分配请求被明确拒绝（503 无容量、412 会话或用量限制、400 无该 GPU 资格等），并且随后平台列表确认既没有新的同名分配，也没有新的未命名分配时，记录进入终态 **`allocation_failed`**：`ok: false`、`terminal: true`，附 `error`、`next`、`retryable`，守护随即退出。之后可以用新的 request ID 重新 `new`；同一 request ID 只回放这条失败记录。拒绝无法证明、列表查询失败，或出现无法解释的新未命名分配时，仍保持 `allocation_unknown`。各分类见[自动化接口](automation-api.md#provider-失败分类)。
 
 官方 CLI 0.7.4 提供服务器分配列表与**账号总余额、账号总每小时消耗率**，没有每实例累计 CU 或可靠的原始分配时间。创建流程从分配请求发出前的时间作保守起点，包含可能的分配等待；成功分配后安装、下载、生成和空闲全部连续累计。明确接管已有实例时，调用者必须提供原始分配时间或更早的保守时间，不能填当前重连时间：
 
@@ -69,7 +75,7 @@ python3 scripts/colabctl.py -s "$SESSION" release
 
 查询失败时显式记录 `query_failed`/`release_unknown`，估算继续累计，禁止新的受管工作。账号用量暂不可查询时保留旧快照并标 stale，已有明确保守费率继续有效。守护保留释放意图并重复核查；恢复网络后先确认原分配，再决定是否重试释放。
 
-短暂的实例列表查询失败允许最多 10 秒恢复，且不超过原工作或释放截止；连续失败不会刷新这段窗口。期间禁止提交新工作，正常守护可提前重查同一实例。失败记录只保留错误类别、退出码等脱敏字段，不保存提供方原始输出。窗口耗尽后进入释放流程，释放仍须核验原实例身份。
+短暂的实例列表查询失败允许最多 10 秒恢复，且不超过原工作或释放截止；连续失败不会刷新这段窗口。窗口按重查开始时间判断：在窗口内开始并成功的列表查询即视为恢复，即使经本机代理的调用在窗口结束后才返回（实测单次列表 4–10 秒；此前这种情况会把刚核实存在的健康实例释放）。窗口结束后才开始的检查仍进入释放流程。期间禁止提交新工作，正常守护可提前重查同一实例。失败记录只保留错误类别、退出码等脱敏字段，不保存提供方原始输出。窗口耗尽后进入释放流程，释放仍须核验原实例身份。
 
 ## 释放证明与边界
 

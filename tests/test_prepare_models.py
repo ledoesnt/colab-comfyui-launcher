@@ -105,6 +105,49 @@ class PrepareModelsTests(unittest.TestCase):
         )
         return extra, item
 
+    def test_only_prepares_named_files_and_start_guard_follows_selection(self):
+        extra, item = self.write_extra_manifest()
+        additional = self.source_root / item["path"]
+        additional.parent.mkdir()
+        additional.write_bytes(DATA)
+        self.args.extra_manifest = [extra]
+        self.args.only = ["extra.safetensors"]
+        result = self.run_prepare()
+        self.assertEqual(result["models_selection"], [item["path"]])
+        self.assertEqual([entry["path"] for entry in result["files"]], [item["path"]])
+        self.assertEqual(result["total_size_bytes"], len(DATA))
+        self.assertFalse(self.final.exists())
+        # The start guard follows the recorded selection, not the full manifest.
+        self.assertTrue(
+            preparer.local_cache_ready(self.local_root, self.manifest, [extra])
+        )
+        self.assertFalse(
+            preparer.local_cache_ready(
+                self.local_root, self.manifest, [extra], selection=None
+            )
+        )
+        # A full prepare clears the selection again.
+        self.args.only = []
+        self.assertIsNone(self.run_prepare()["models_selection"])
+        self.assertFalse((self.local_root / preparer.SELECTION_NAME).exists())
+        self.assertTrue(
+            preparer.local_cache_ready(
+                self.local_root, self.manifest, [extra], selection=None
+            )
+        )
+
+    def test_only_rejects_unknown_names_before_any_transfer(self):
+        self.args.only = ["missing.safetensors"]
+        with (
+            mock.patch.object(preparer, "copy_file", side_effect=AssertionError),
+            self.assertRaisesRegex(cache.DownloadError, "matches 0"),
+        ):
+            self.run_prepare()
+        self.assertFalse(self.local_root.exists())
+        (self.local_root).mkdir(parents=True)
+        (self.local_root / preparer.SELECTION_NAME).write_text("{broken")
+        self.assertFalse(preparer.local_cache_ready(self.local_root, self.manifest))
+
     def test_added_drive_model_preserves_core_receipts_and_merged_readiness(self):
         self.run_prepare()
         extra, item = self.write_extra_manifest()
@@ -794,10 +837,12 @@ class EphemeralModelsTests(unittest.TestCase):
 
     def test_ephemeral_deadline_bounds_blocked_download_and_keeps_partial(self):
         self.response()
-        self.args.max_seconds = 0.02
+        # The deadline must expire inside the blocked read, after the partial
+        # file exists; 20 ms raced the setup's fsync'd progress writes.
+        self.args.max_seconds = 0.3
 
         def blocked_read(*args, **kwargs):
-            time.sleep(0.1)
+            time.sleep(1.0)
             return DATA
 
         self.http.return_value.read = blocked_read

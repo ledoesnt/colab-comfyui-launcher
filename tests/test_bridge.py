@@ -67,12 +67,21 @@ class BackgroundBridgeTests(unittest.TestCase):
         self.assertEqual(len(spawn.call_args.kwargs["pass_fds"]), 1)
 
     def test_live_controller_lock_prevents_duplicate_start(self):
+        (self.state / "model-download-process.json").write_text(
+            json.dumps({"pid": 1, "stamp": "x", "request_id": "first-request"})
+        )
         with (self.state / "model-download-launch.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with mock.patch.object(self.namespace["subprocess"], "Popen") as spawn:
                 result = self.namespace["run_background"](self.payload)
         self.assertTrue(result["already_running"])
         spawn.assert_not_called()
+        # The new request was not started and must not adopt the running task.
+        self.assertIs(result["ok"], False)
+        self.assertEqual(result["status"], "not_started")
+        self.assertEqual(result["running_request_id"], "first-request")
+        self.assertIs(result["terminal"], True)
+        self.assertIn("first-request", result["error"])
 
     def supervisor_body(self, name="BACKGROUND_SUPERVISOR"):
         program = ast.parse(bridge.remote_program(self.payload))
@@ -816,6 +825,50 @@ class ArchiveSelectionTests(unittest.TestCase):
                 )
                 self.assertNotIn("models/extra-added.json", bundle.namelist())
             self.assertEqual(selection, {"version": 1, "files": ["extra.json"]})
+
+
+class PrepareSelectionTests(unittest.TestCase):
+    def test_only_reaches_the_remote_prepare_command(self):
+        arguments = bridge.parser().parse_args(
+            [
+                "-s",
+                "fixture",
+                "prepare",
+                "--ephemeral",
+                "--mode",
+                "download_missing",
+                "--only",
+                "a.safetensors",
+                "--only",
+                "vae/b.safetensors",
+                "--only",
+                "a.safetensors",
+            ]
+        )
+        payload = dict(bridge.command_payload(arguments), request_id="r1")
+        self.assertEqual(payload["only"], ["a.safetensors", "vae/b.safetensors"])
+        with tempfile.TemporaryDirectory() as root:
+            scripts = Path(root, "launcher", "scripts")
+            scripts.mkdir(parents=True)
+            (scripts / "prepare_models.py").write_text("")
+            namespace = {}
+            exec(  # noqa: S102 - trusted local remote-program fixture.
+                bridge.REMOTE_HELPERS.replace(
+                    "/content/colab-comfyui-runtime", str(Path(root, "runtime"))
+                ).replace(
+                    "/content/colab-comfyui-launcher", str(Path(root, "launcher"))
+                ),
+                namespace,
+            )
+            command = namespace["background_arguments"](payload)
+        self.assertEqual(
+            command[-4:], ["--only", "a.safetensors", "--only", "vae/b.safetensors"]
+        )
+        for bad in ("../x", "/abs/x", "a b"):
+            with self.assertRaises(ValueError):
+                bridge.command_payload(
+                    bridge.parser().parse_args(["-s", "f", "prepare", "--only", bad])
+                )
 
 
 if __name__ == "__main__":

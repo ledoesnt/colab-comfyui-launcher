@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import operation_deadline as submission
+import provider_errors
 from accounts import cli_directory, colab_command, current_account
 
 PROVIDER_ERROR_CODES = frozenset(
@@ -34,6 +35,7 @@ PROVIDER_ERROR_CODES = frozenset(
         "scope_changed",
         "assignment_absent",
         "identity_mismatch",
+        *provider_errors.CODES,
     }
 )
 
@@ -48,6 +50,7 @@ class ProviderError(RuntimeError):
         code: str = "provider_error",
         outcome_unknown: bool = False,
         returncode: int | None = None,
+        diagnostic: dict[str, Any] | None = None,
     ):
         super().__init__(message)
         self.code = (
@@ -58,6 +61,25 @@ class ProviderError(RuntimeError):
         self.outcome_unknown = outcome_unknown
         # Preserve only process status, never captured provider response bytes.
         self.returncode = returncode if type(returncode) is int else None
+        # Whitelisted classification fields only (provider_errors.validate).
+        self.diagnostic = (
+            provider_errors.validate(diagnostic) if diagnostic is not None else None
+        )
+
+
+def classified_error(
+    diagnostic: dict[str, Any], *, mutation: bool, returncode: int | None
+) -> ProviderError:
+    """A ProviderError whose message is launcher-written from the diagnostic."""
+    code = diagnostic["code"]
+    return ProviderError(
+        provider_errors.describe(diagnostic),
+        code=code if code in PROVIDER_ERROR_CODES else "command_failed",
+        outcome_unknown=mutation
+        and diagnostic["outcome"] not in ("not_created", "not_dispatched", "none"),
+        returncode=returncode,
+        diagnostic=diagnostic,
+    )
 
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -274,37 +296,71 @@ class ColabProvider:
         )
         return "stat:" + hashlib.sha256(repr(fields).encode("ascii")).hexdigest()
 
+    @property
+    def supports_allocation_lookup(self) -> bool:
+        """Only the hardened shim of a named account can bind allocation keys."""
+        return self.account != "default"
+
     def _command(
-        self, arguments: list[str], *, timeout: float, mutation: bool = False
+        self,
+        arguments: list[str],
+        *,
+        timeout: float,
+        mutation: bool = False,
+        **launcher: Any,
     ) -> list[str]:
+        seconds = submission.timeout(timeout)
+        details = {"command": arguments[0] if arguments else None}
+        if "-s" in arguments[:-1]:
+            details["session"] = arguments[arguments.index("-s") + 1]
+        if arguments[:1] == ["new"]:
+            gpu = arguments.index("--gpu") + 1 if "--gpu" in arguments[:-1] else None
+            details["hardware"] = arguments[gpu] if gpu else "CPU"
         try:
             completed = self.run(
-                colab_command(arguments, account=self.account),
+                colab_command(
+                    arguments, account=self.account, deadline=seconds, **launcher
+                ),
                 capture_output=True,
                 text=True,
                 stdin=subprocess.DEVNULL,
-                timeout=submission.timeout(timeout),
+                timeout=seconds,
                 check=False,
             )
         except subprocess.TimeoutExpired:
+            diagnostic = dict(
+                provider_errors.classify(details),
+                code="local_timeout",
+                outcome="unknown" if mutation else "none",
+                retryable=False,
+            )
             raise ProviderError(
-                "Colab command timed out; query the existing allocation before retrying.",
+                provider_errors.describe(diagnostic, seconds=round(seconds)),
                 code="timeout",
                 outcome_unknown=mutation,
+                diagnostic=diagnostic,
             ) from None
         except OSError:
             raise ProviderError(
                 "Official Colab CLI could not be started.", code="unavailable"
             ) from None
+        diagnostic, stderr = provider_errors.parse(completed.stderr or "")
         if completed.returncode != 0:
-            raise ProviderError(
-                "Colab command failed; use the official interactive login when authentication is required.",
-                code="command_failed",
-                outcome_unknown=mutation,
-                returncode=completed.returncode,
+            if diagnostic is None:
+                text = completed.stdout if isinstance(completed.stdout, str) else ""
+                diagnostic = provider_errors.fallback(
+                    details["command"],
+                    text,
+                    stderr,
+                    completed.returncode,
+                    session=details.get("session"),
+                    hardware=details.get("hardware"),
+                )
+            raise classified_error(
+                diagnostic, mutation=mutation, returncode=completed.returncode
             )
         lines, stdout_notice = _lines(completed.stdout, mutation=mutation)
-        errors, stderr_notice = _lines(completed.stderr or "", mutation=mutation)
+        errors, stderr_notice = _lines(stderr, mutation=mutation)
         if stdout_notice or stderr_notice:
             print("Colab CLI reported an available upgrade.", file=sys.stderr)
         # sync_sessions in CLI 0.7.4 can turn a failed credential lookup into an
@@ -325,14 +381,22 @@ class ColabProvider:
     def usage(self) -> dict[str, Any]:
         return parse_usage("\n".join(self._command(["usage"], timeout=15)))
 
-    def create(self, session: str, gpu: str | None = None) -> None:
+    @staticmethod
+    def _new_arguments(session: str, gpu: str | None) -> list[str]:
         validate_session(session)
         arguments = ["new", "-s", session]
         if gpu is not None:
             if gpu not in ("T4", "L4", "G4", "H100", "A100"):
                 raise ProviderError("Unsupported GPU selection.", code="invalid_gpu")
             arguments.extend(["--gpu", gpu])
-        lines = self._command(arguments, timeout=300, mutation=True)
+        return arguments
+
+    def create(
+        self, session: str, gpu: str | None = None, *, allocation_key: str | None = None
+    ) -> None:
+        arguments = self._new_arguments(session, gpu)
+        launcher = {} if allocation_key is None else {"allocation_key": allocation_key}
+        lines = self._command(arguments, timeout=300, mutation=True, **launcher)
         if lines != [
             f"[colab] Creating session '{session}'...",
             "[colab] Session READY.",
@@ -342,6 +406,39 @@ class ColabProvider:
                 code="invalid_response",
                 outcome_unknown=True,
             )
+
+    def lookup_allocation(
+        self, session: str, gpu: str | None, allocation_key: str
+    ) -> bool:
+        """Find the allocation created under ``allocation_key``; never create one.
+
+        True means Colab returned the existing assignment for the key and the
+        CLI saved ``session`` for it; a listing then shows it by name. False
+        means no assignment exists for the key right now, which does not prove
+        the original request failed. Any other failure raises.
+        """
+        arguments = self._new_arguments(session, gpu)
+        try:
+            lines = self._command(
+                arguments,
+                timeout=60,
+                allocation_key=allocation_key,
+                lookup_only=True,
+            )
+        except ProviderError as error:
+            if (error.diagnostic or {}).get("code") == "allocation_lookup_empty":
+                return False
+            raise
+        if lines != [
+            f"[colab] Creating session '{session}'...",
+            "[colab] Session READY.",
+        ]:
+            raise ProviderError(
+                "Allocation lookup returned an unexpected response; the original "
+                "request remains unverified.",
+                code="invalid_response",
+            )
+        return True
 
     def stop(self, session: str, assignment_id: str) -> None:
         validate_session(session)

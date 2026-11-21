@@ -26,6 +26,8 @@ python3 scripts/dashboard.py
 
 新建摘要可选配本次实例的 **CU 上限与保守费率**。预算绑定一次分配，独立本机守护在退出 TUI 后继续计时与核验释放；重连不会清零。它是启动器的尽力保护，控制端断网或关机仍可能无法释放，不能当作 Colab 硬配额。使用方法与边界见 [单实例预算](docs/instance-budget.md)。
 
+官方 CLI 的失败现在有明确分类：每个失败结果带 `provider_error`（如 `capacity_unavailable`、`auth_required`、`kernel_busy`、`execution_timeout`）、`outcome`（未创建 / 未发送 / 结果未知）和建议的下一步；`status` 额外给出 `summary`，安装或启动失败时包含失败阶段与脱敏日志尾部。启动器代码的远端执行使用复制自官方并加了截止、内核忙碌检查与“是否已发送”记录的 exec 路径，只有确认未发送时才自动重试。响应在远端接受后丢失时：分配按预算任务的分配键查回同一实例，不再次创建，查不到就保持待确认；渲染用原 request ID 查询并取回原成品，`execution_evidence` 给出 ComfyUI 中带该 ID 的任务数。详见[自动化接口](docs/automation-api.md#provider-失败分类)与 [2026-11-19 测试记录](docs/test-report.md)。
+
 CLI 增加持久请求查询、经 SHA 校验的实例素材上传/输出收集，以及完整自定义 API JSON 和可选命名参数映射。JSON stdout 与诊断 stderr 分离；未知提交先核查，不自动重发。视频报告实际解码帧数及可选首尾帧。详见 [自动化接口](docs/automation-api.md)。新增能力已做离线/本机故障测试；真实 T4 上的 64 KiB 文件上传、收集与 SHA 校验，以及客户端退出后的预算守护自动释放和平台独立核验均已通过。本次使用仅传输 fixture，不运行 ComfyUI；H3 渲染、大文件、Drive 和浏览器集成不在这轮验收范围，详见 [测试报告](docs/test-report.md)。
 
 这是独立的基础设施工具，不依赖 `video-render-lab` 的 Render API。2026-10-07 新增屏内模型勾选与添加、Colab 登录前置检查、默认两路文件下载和小窗口进度布局；2026-10-08 统一登录入口、Back 导航和两种布局的步骤状态，移除重复信息块。这两轮验证范围是本机终端、公开模型元数据和本机 HTTP 传输，没有重新分配 GPU 或操作已有用户实例。详见 [最新测试范围](docs/test-report.md)。

@@ -416,13 +416,46 @@ class BudgetTests(unittest.TestCase):
         result = self.tick()
         self.assertEqual(result["status"], "query_failed")
         self.assertEqual(result["estimate"]["consumed_cu"], 2)
-        with self.assertRaises(budget.BudgetError):
+        with (
+            mock.patch.object(budget, "RECONCILE_WAIT_SECONDS", 0.5),
+            self.assertRaises(budget.BudgetError),
+        ):
             self.manager.authorize("session-test", "render", 900)
         self.clock.advance(6400)
         self.assertEqual(self.tick()["status"], "release_unknown")
         self.assertEqual(self.provider.released, [])
         self.provider.query_failure = False
         self.assertEqual(self.tick()["status"], "released")
+
+    def test_listing_that_recovers_during_its_own_call_keeps_the_instance(self):
+        # Live 2026-11-19: one listing blip, then a listing that began inside
+        # the 10 s retry window but returned after it, released a healthy VM.
+        self.create()
+        self.provider.query_failure = True
+        self.assertEqual(self.tick()["status"], "query_failed")
+        self.provider.query_failure = False
+        self.clock.advance(5)
+        original = self.provider.sessions
+
+        def slow_listing():
+            self.clock.advance(6)
+            return original()
+
+        with mock.patch.object(self.provider, "sessions", side_effect=slow_listing):
+            result = self.tick()
+        self.assertEqual(result["status"], "active")
+        self.assertFalse(result["release_requested"])
+        self.assertEqual(self.provider.released, [])
+        # A tick that only starts after the window closed still fails closed.
+        self.provider.query_failure = True
+        self.tick()
+        self.provider.query_failure = False
+        self.clock.advance(11)
+        result = self.tick()
+        self.assertEqual(
+            (result["status"], result["reason"]),
+            ("released", "provider_query_retry_deadline"),
+        )
 
     def test_usage_failure_uses_known_explicit_ceiling_and_marks_stale(self):
         self.create()
@@ -645,10 +678,34 @@ class BudgetTests(unittest.TestCase):
     def test_reconcile_in_progress_blocks_new_submission(self):
         self.create()
         with (
+            mock.patch.object(budget, "RECONCILE_WAIT_SECONDS", 0.5),
             self.manager._lock("session-test", ".reconcile.lock"),
             self.assertRaises(budget.BudgetError),
         ):
             self.manager.authorize("session-test", "render", 30)
+
+    def test_admission_queries_itself_once_the_guard_frees_the_lock(self):
+        # Live 2026-11-20: the guard held the lock for its usage call (its
+        # listing had already counted), so no newer result ever arrived and an
+        # upload was refused after waiting the whole window.
+        self.create()
+        locked, release = threading.Event(), threading.Event()
+
+        def guard_usage_phase():
+            with self.manager._lock("session-test", ".reconcile.lock"):
+                locked.set()
+                release.wait(timeout=5)
+
+        holder = threading.Thread(target=guard_usage_phase)
+        holder.start()
+        locked.wait(timeout=5)
+        threading.Timer(0.5, release.set).start()
+        with mock.patch.object(budget, "RECONCILE_WAIT_SECONDS", 5.0):
+            started = time.monotonic()
+            allowed = self.manager.authorize("session-test", "render", 30)
+        holder.join(timeout=5)
+        self.assertEqual(allowed, 30)
+        self.assertLess(time.monotonic() - started, 4)
 
     def test_concurrent_creates_submit_only_once(self):
         barrier = threading.Barrier(2)

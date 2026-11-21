@@ -26,6 +26,7 @@ import colabctl as ctl
 import operation_deadline as deadline
 from client_requests import ClientRequests
 from test_atomic_admission import API, initial
+from test_atomic_admission import manager as fixture_manager
 
 CTX = mp.get_context("fork")
 
@@ -614,6 +615,169 @@ class SubmissionChain(unittest.TestCase):
             self.assertTrue(ctl.deploy("episode", 45, {"action": "deploy"})["ok"])
         self.assertEqual(len(captured), 2)
         self.assertLess(captured[1], captured[0] - 0.05)
+
+
+class StartSubmissionWindow(unittest.TestCase):
+    """Advance fixture time instead of waiting minutes or contacting Colab."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="launcher-start-window-")
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = self.tmp.name
+        self.m, self.clock, self.api = fixture_manager(Path(self.folder) / "budgets")
+        self.original = initial(self.m)
+        contexts = contextlib.ExitStack()
+        self.addCleanup(contexts.close)
+        contexts.enter_context(patch.object(time, "monotonic", self.clock))
+        contexts.enter_context(call_context(self.folder, self.m, self.api))
+
+    def args(self, timeout=180, identifier="start-window"):
+        return types.SimpleNamespace(
+            session="episode", request_id=identifier, timeout=timeout
+        )
+
+    def test_only_first_contact_actions_get_120_second_submission_window(self):
+        for action in (
+            "start",
+            "install",
+            "prepare",
+            "render",
+            "smoke",
+            "stop",
+            "deploy",
+        ):
+            with self.subTest(action=action):
+                with (
+                    patch.object(
+                        ctl, "execute_remote", return_value={"ok": True}
+                    ) as send,
+                    patch.object(ctl, "deploy", return_value={"ok": True}) as deploy,
+                ):
+                    ctl.submit_command(self.args(identifier=action), {"action": action})
+                expected = 120 if action in ("start", "deploy") else 90
+                call = deploy.call_args if action == "deploy" else send.call_args
+                self.assertEqual(call.args[1 if action == "deploy" else 2], expected)
+
+    def test_start_cli_acknowledgement_after_45_seconds_succeeds(self):
+        def run(argv, **kwargs):
+            self.assertEqual(kwargs["timeout"], 120)
+            self.assertEqual(argv[-2:], ["--timeout", "60"])
+            self.clock.t += 60
+            self.assertEqual(deadline.timeout(120), 60)
+            return subprocess.CompletedProcess(
+                argv, 0, 'LAUNCHER_RESULT={"ok":true,"status":"starting"}\n', ""
+            )
+
+        with (
+            patch.object(ctl.shutil, "which", return_value="/fixture/colab"),
+            patch.object(ctl, "colab_command", side_effect=lambda argv, **kw: argv),
+            patch.object(ctl.subprocess, "run", side_effect=run) as transport,
+        ):
+            result = ctl.submit_command(self.args(), {"action": "start"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "starting")
+        self.assertEqual(transport.call_count, 1)
+        record = self.m._read(self.m._path("episode"))
+        for field in ("work_deadline", "release_deadline", "assignment_id", "job_id"):
+            self.assertEqual(record[field], self.original[field])
+
+    def test_start_window_respects_shorter_caller_and_budget_deadlines(self):
+        cases = (
+            ({}, 20, 20, self.original["work_deadline"]),
+            ({"work_deadline": 1070}, 180, 70, 1070),
+            ({"hold_deadline": 1050, "hold_until_elapsed": 50}, 180, 50, 1050),
+            ({"release_deadline": 1070}, 180, 40, self.original["work_deadline"]),
+        )
+        for index, (changes, timeout, expected, not_after) in enumerate(cases):
+            with self.subTest(changes=changes, timeout=timeout):
+                self.m._write(self.m._path("episode"), dict(self.original, **changes))
+                with patch.object(
+                    ctl, "execute_remote", return_value={"ok": True}
+                ) as send:
+                    ctl.submit_command(
+                        self.args(timeout, f"bounded-{index}"), {"action": "start"}
+                    )
+                self.assertEqual(send.call_args.args[2], expected)
+                self.assertEqual(send.call_args.args[1]["not_after"], not_after)
+
+    def test_receipt_delay_does_not_restart_120_second_window(self):
+        original_lock = ClientRequests.lock
+
+        @contextlib.contextmanager
+        def delayed_lock(receipts, identifier):
+            with original_lock(receipts, identifier):
+                self.clock.t += 70
+                yield
+
+        def send(session, payload, timeout):
+            self.assertEqual(timeout, 50)
+            self.assertEqual(deadline.current(), 1120)
+            self.assertEqual(payload["not_after"], self.original["work_deadline"])
+            return {"ok": True}
+
+        with (
+            patch.object(ClientRequests, "lock", delayed_lock),
+            patch.object(ctl, "execute_remote", side_effect=send) as transport,
+        ):
+            ctl.submit_command(self.args(), {"action": "start"})
+        self.assertEqual(transport.call_count, 1)
+
+    def test_final_scope_delay_cannot_dispatch_after_start_window(self):
+        calls = 0
+
+        def scope():
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                self.clock.t += 121
+            return "fixed"
+
+        self.api.account_scope = scope
+        with (
+            patch.object(ctl, "execute_remote") as send,
+            self.assertRaises(ctl.BridgeError) as raised,
+        ):
+            ctl.submit_command(self.args(), {"action": "start"})
+        send.assert_not_called()
+        self.assertEqual(raised.exception.result["status"], "not_submitted")
+        self.assertTrue(raised.exception.result["terminal"])
+
+    def test_start_timeout_remains_unknown_and_repeat_only_queries(self):
+        def run(argv, **kwargs):
+            self.assertEqual(kwargs["timeout"], 120)
+            self.clock.t += kwargs["timeout"]
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        with (
+            patch.object(ctl.shutil, "which", return_value="/fixture/colab"),
+            patch.object(ctl, "colab_command", side_effect=lambda argv, **kw: argv),
+            patch.object(ctl.subprocess, "run", side_effect=run) as transport,
+            self.assertRaises(ctl.BridgeError) as raised,
+        ):
+            ctl.submit_command(self.args(), {"action": "start"})
+        self.assertEqual(transport.call_count, 1)
+        self.assertEqual(raised.exception.result["status"], "submission_unknown")
+        self.assertFalse(raised.exception.result["terminal"])
+        self.assertTrue(raised.exception.result["job_may_still_be_running"])
+        with patch.object(
+            ctl, "execute_remote", return_value={"ok": False, "status": "not_found"}
+        ) as query:
+            result = ctl.submit_command(self.args(), {"action": "start"})
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(query.call_count, 1)
+        self.assertEqual(query.call_args.args[1]["action"], "job")
+        self.assertEqual(query.call_args.args[1]["request_id"], "start-window")
+        self.assertEqual(query.call_args.args[1]["assignment_id"], "owned")
+
+    def test_unmanaged_lease_uses_same_action_caps(self):
+        for action, expected in (("start", 120), ("prepare", 90)):
+            with (
+                self.subTest(action=action),
+                patch.object(self.m, "authorize", return_value=None),
+                self.m.dispatch_lease("unmanaged", action) as lease,
+            ):
+                self.assertEqual(lease["submission_timeout"], expected)
+                self.assertEqual(lease["submission_deadline"], 1000 + expected)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import operation_deadline as submission
+import provider_errors
 from accounts import (
     account_context,
     account_id,
@@ -39,7 +40,46 @@ class BudgetError(RuntimeError):
     """The requested action cannot be safely covered by the stored budget."""
 
 
-TERMINAL = frozenset({"released", "allocation_cancelled"})
+class AllocationNotSubmitted(BudgetError):
+    """Preflight stopped `new` before any budget record or creation request."""
+
+    def __init__(self, message, *, retryable=True, diagnostic=None):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+        self.result = {
+            "status": "not_submitted",
+            "terminal": True,
+            "allocation_submitted": False,
+            "create_requests": 0,
+            "resubmit_allowed": retryable,
+            "next": "Nothing was created or recorded; retrying with the same "
+            "request_id is safe."
+            if retryable
+            else "Nothing was created; resolve the cause before trying again.",
+        }
+
+
+# allocation_failed: the provider definitively refused the allocation AND a
+# later listing showed no new assignment, named or orphaned.
+# allocation_lapsed: never bound to an assignment, and older than any Colab
+# runtime can live, so no instance from this request can still exist.
+TERMINAL = frozenset(
+    {"released", "allocation_cancelled", "allocation_failed", "allocation_lapsed"}
+)
+# Colab ends every runtime within 24 h; twice that leaves no doubt that an
+# older allocation is gone, whatever a later listing's account scope is.
+RUNTIME_LIFETIME_BOUND = 48 * 3600
+CREATE_SETTLE_SECONDS = 30.0
+# A lost allocation response is looked up by the budget job's own key. Never
+# while the creating CLI may still be in flight (its own limit is 300 s), and
+# at most this often per allocation.
+CREATE_LOOKUP_AFTER = 330.0
+LOOKUP_INTERVAL = 15.0
+# Admission waits for a reconcile already in flight. Through a slow proxy one
+# listing takes 4-10 s (plus a periodic usage query); 10 s refused healthy work.
+# The caller's submission deadline still bounds the wait.
+RECONCILE_WAIT_SECONDS = 30.0
+ALLOCATION_KEY_NAMESPACE = uuid.UUID("5d0f2a1e-7c3b-4e59-9a4d-1b6c8e2f7a30")
 READ_ACTIONS = frozenset({"status", "job", "jobs", "inspect", "release"})
 COLLECT_ACTIONS = frozenset({"collect", "download-output", "asset-download"})
 ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
@@ -115,6 +155,11 @@ def new_work_state_barrier(record, action):
         )
 
 
+def allocation_key(job_id: str) -> str:
+    """The notebook hash sent with this job's single allocation request."""
+    return uuid.uuid5(ALLOCATION_KEY_NAMESPACE, job_id).hex
+
+
 def query_failure_diagnostic(error):
     """Only classified fields; never raw stderr, exception text, URL, or tokens."""
     allowed = {
@@ -127,6 +172,7 @@ def query_failure_diagnostic(error):
         "provider_error",
         "assignment_absent",
         "identity_mismatch",
+        *provider_errors.CODES,
     }
     code = getattr(error, "code", "provider_error")
     code = code if code in allowed else "unclassified"
@@ -139,6 +185,29 @@ def query_failure_diagnostic(error):
         "outcome_unknown": bool(getattr(error, "outcome_unknown", False)),
         "raw_provider_output_saved": False,
     }
+
+
+def allocation_diagnostic(error, hardware) -> dict[str, Any]:
+    """Whitelisted classification of an allocation failure; never error text."""
+    diagnostic = getattr(error, "diagnostic", None)
+    if diagnostic is None:
+        code = getattr(error, "code", "provider_error")
+        diagnostic = dict(
+            provider_errors.classify({"command": "new", "hardware": hardware}),
+            code=code if code in provider_errors.CODES else "command_failed",
+        )
+        diagnostic["retryable"] = provider_errors.CODES[diagnostic["code"]][1]
+    diagnostic = dict(diagnostic)
+    diagnostic["outcome"] = (
+        "unknown"
+        if getattr(error, "outcome_unknown", True)
+        else diagnostic.get("outcome", "not_created")
+    )
+    if diagnostic.get("hardware") is None and isinstance(hardware, str):
+        diagnostic = dict(
+            provider_errors.validate(dict(diagnostic, hardware=hardware)) or diagnostic
+        )
+    return diagnostic
 
 
 class BudgetManager:
@@ -278,7 +347,8 @@ class BudgetManager:
                 if fixed_work is not None
                 else now + seconds
             )
-        send_seconds = 45
+        send_limit = submission.submission_window(action)
+        send_seconds = send_limit
         if original is not None:
             deadline = (
                 original["release_deadline"]
@@ -308,7 +378,7 @@ class BudgetManager:
                     )
                 yield {
                     "allowed_seconds": allowed,
-                    "submission_timeout": submission.timeout(45),
+                    "submission_timeout": submission.timeout(send_limit),
                     "submission_deadline": submission.current(),
                     "work_not_after": fixed_work,
                     "account_scope": None,
@@ -357,7 +427,11 @@ class BudgetManager:
                     raise BudgetError("Dispatch deadline reached; nothing submitted.")
                 granted = min(allowed, remaining) if allowed is not None else remaining
                 submit_timeout = submission.timeout(
-                    min(45, granted, record["release_deadline"] - self.clock() - 30)
+                    min(
+                        send_limit,
+                        granted,
+                        record["release_deadline"] - self.clock() - 30,
+                    )
                 )
                 yield {
                     "allowed_seconds": granted,
@@ -499,11 +573,48 @@ class BudgetManager:
         for key in (
             "baseline_assignments",
             "account_scope",
+            "allocation_key",
             "clock_boot_id",
             "clock_uptime",
             "clock_wall",
         ):
             result.pop(key, None)
+        diagnostic = result.get("allocation_diagnostic")
+        if result["status"] == "allocation_failed" and diagnostic:
+            result.update(
+                error=provider_errors.describe(diagnostic),
+                next=provider_errors.next_step(diagnostic),
+                retryable=diagnostic.get("retryable", False),
+                terminal=True,
+                new_allowed=True,
+            )
+        elif result["status"] == "allocation_lapsed":
+            result.update(terminal=True, new_allowed=True)
+        elif result["status"] == "allocation_pending":
+            result.update(
+                next="Allocation was submitted; poll 'budget' for this session "
+                "until it is active. Do not repeat 'new'.",
+                terminal=False,
+            )
+        elif result["status"] == "allocation_unknown":
+            cause = provider_errors.describe(diagnostic) + " " if diagnostic else ""
+            lookup = result.get("allocation_lookup") or {}
+            result.update(
+                error=cause
+                + "The allocation outcome is not yet verified; poll 'budget' for "
+                "this session and do not repeat 'new'.",
+                next=(
+                    "Pending confirmation: the guard looks the original request up "
+                    "by its allocation key and binds it when found. Poll 'budget' "
+                    "and compare request_id and job_id; never repeat 'new'."
+                    if lookup.get("supported")
+                    else "Pending confirmation: poll 'budget' and inspect sessions; "
+                    "never repeat 'new'."
+                ),
+                terminal=False,
+            )
+        # Every state says whether it can still change; callers never infer it.
+        result.setdefault("terminal", result["status"] in TERMINAL)
         return result
 
     def status(self, session: str, refresh: bool = False) -> dict[str, Any]:
@@ -702,22 +813,37 @@ class BudgetManager:
         previous = self._existing_create_record(session, request_id)
         if previous:
             return replay(previous)
-        scope = self.provider.account_scope()
-        rows = self.provider.sessions()
-        if scope == "unknown" or scope != self.provider.account_scope():
-            raise BudgetError(
+        for _ in range(2):
+            try:
+                scope = self.provider.account_scope()
+                rows = self.provider.sessions()
+                stable = scope != "unknown" and scope == self.provider.account_scope()
+            except ProviderError as error:
+                raise AllocationNotSubmitted(
+                    "Allocation preflight could not list this account's sessions; "
+                    "nothing was created or recorded. " + str(error),
+                    diagnostic=getattr(error, "diagnostic", None),
+                ) from error
+            # The listing itself may refresh the OAuth token and so change the
+            # credential file's metadata; one fresh re-check settles it.
+            if stable or scope == "unknown":
+                break
+        if scope == "unknown":
+            raise AllocationNotSubmitted(
+                "Authentication scope cannot be tracked; allocation was not submitted.",
+                retryable=False,
+            )
+        if not stable:
+            raise AllocationNotSubmitted(
                 "Authentication scope changed during preflight; allocation was not submitted."
             )
         if any(row["name"] == session for row in rows):
-            raise BudgetError(
-                "Session already exists. Explicitly adopt its allocation; creation was not submitted."
+            raise AllocationNotSubmitted(
+                "Session already exists. Explicitly adopt its allocation; creation was not submitted.",
+                retryable=False,
             )
         record["baseline_assignments"] = [row["assignment_id"] for row in rows]
         record["account_scope"] = scope
-        if record["account_scope"] == "unknown":
-            raise BudgetError(
-                "Authentication scope cannot be tracked; allocation was not submitted."
-            )
         installed = self._install_record(record)
         if installed["job_id"] != record["job_id"]:
             return replay(installed)
@@ -768,24 +894,49 @@ class BudgetManager:
                 status="allocation_pending",
                 clock_wall=now,
                 clock_uptime=self.uptime(),
+                # Durable before the request: the only creation for this job.
+                create_requests=1,
+                allocation_lookup={"supported": lookup},
             )
+            if lookup:
+                value["allocation_key"] = allocation_key(value["job_id"])
 
-        self._mutate(session, record["job_id"], submitting)
+        lookup = getattr(self.provider, "supports_allocation_lookup", False) is True
+        submitted = self._mutate(session, record["job_id"], submitting)
         try:
-            self.provider.create(session, gpu)
+            if lookup:
+                self.provider.create(
+                    session, gpu, allocation_key=submitted["allocation_key"]
+                )
+            else:
+                self.provider.create(session, gpu)
         except ProviderError as error:
 
-            def unknown(value, code=error.code, returncode=error.returncode):
-                value["allocation_error"] = (
-                    "Allocation request outcome is unknown; query this request, do not repeat new."
-                )
-                value["allocation_error_code"] = code
-                value["allocation_error_returncode"] = returncode
+            def unknown(value, error=error):
+                diagnostic = allocation_diagnostic(error, value["hardware"])
+                value["allocation_error_code"] = error.code
+                value["allocation_error_returncode"] = error.returncode
+                value["allocation_diagnostic"] = diagnostic
+                # Launcher-written text derived from the classified code only.
+                value["allocation_error"] = provider_errors.describe(diagnostic)
+                value["allocation_rejected"] = not error.outcome_unknown
+                value["create_returned_at"] = self.clock()
                 if not value.get("assignment_id") and value["status"] not in TERMINAL:
                     value["status"] = "allocation_unknown"
 
             self._mutate(session, record["job_id"], unknown)
-        self.tick(session, record["job_id"], force=True)
+        else:
+            self._mutate(
+                session,
+                record["job_id"],
+                lambda value: value.update(
+                    create_returned_at=self.clock(), create_succeeded=True
+                ),
+            )
+        # The guard may be mid-reconcile; returning allocation_pending (exit 1)
+        # for a successful allocation misleads callers into treating it as a
+        # failure, so wait for the lock (bounded) and reconcile once more.
+        self.tick(session, record["job_id"], force=True, wait=CREATE_SETTLE_SECONDS)
         return self.status(session)
 
     def adopt(
@@ -979,20 +1130,27 @@ class BudgetManager:
         )
         self.tick(session, record["job_id"], force=True)
         record = self._read(self._path(session))
-        # Another guard may own the reconciliation lock. Wait for that exact
-        # fresh query result; never authorize using the preceding generation.
-        reconcile_wait_until = time.monotonic() + 10
+        # Another guard may own the reconciliation lock. Wait for a fresh query
+        # result; never authorize using the preceding generation. The holder
+        # may already be past its listing (e.g. in the usage call), so once the
+        # lock frees, run the fresh query here instead of waiting for its next one.
+        reconcile_wait_until = time.monotonic() + RECONCILE_WAIT_SECONDS
         while (
             record.get("query_generation", 0) <= query_generation
             and time.monotonic() < reconcile_wait_until
         ):
             submission.pause(0.25)
             record = self._read(self._path(session))
-        recovery_wait_until = time.monotonic() + 10
+            if record.get("query_generation", 0) <= query_generation:
+                self.tick(session, record["job_id"], force=True)
+                record = self._read(self._path(session))
+        # A re-query that began inside the guard's retry window may finish
+        # after it (slow proxy); wait for it unless release was requested.
+        recovery_wait_until = time.monotonic() + RECONCILE_WAIT_SECONDS
         while (
             record.get("status") == "query_failed"
             and not record.get("release_requested")
-            and self.clock() < record.get("query_retry_until", 0)
+            and self._guard_alive(record)
             and time.monotonic() < recovery_wait_until
         ):
             submission.pause(0.25)
@@ -1103,6 +1261,13 @@ class BudgetManager:
 
     def _observe(self, session, job_id, rows, scope):
         def update(record):
+            if record["status"] not in TERMINAL:
+                # This listing succeeded, so the outage is over. Had the retry
+                # window already closed when this tick began, the tick's first
+                # _advance requested release and that request stands; a window
+                # that only closed while this call was in flight must not
+                # release the instance the call just verified.
+                record.update(query_error=None, query_retry_until=None)
             self._advance(record)
             if record["status"] in TERMINAL:
                 return
@@ -1117,18 +1282,74 @@ class BudgetManager:
             if not record.get("assignment_id"):
                 if record.get("submitted_at") is None:
                     return
+                baseline = record.get("baseline_assignments", [])
                 matches = [
                     row
                     for row in rows
-                    if row["name"] == session
-                    and row["assignment_id"]
-                    not in record.get("baseline_assignments", [])
+                    if row["name"] == session and row["assignment_id"] not in baseline
                 ]
+                orphans = [
+                    row
+                    for row in rows
+                    if row["name"] == "?" and row["assignment_id"] not in baseline
+                ]
+                if (
+                    record.get("allocation_rejected")
+                    and not matches
+                    and not orphans
+                    and scope != "unknown"
+                    and scope == record.get("account_scope")
+                ):
+                    record.update(
+                        status="allocation_failed",
+                        reason="The provider refused the allocation and the "
+                        "verified listing shows no new assignment.",
+                        allocation_failed_at=now,
+                    )
+                    return
+                if now - record["submitted_at"] > RUNTIME_LIFETIME_BOUND:
+                    record.update(
+                        status="allocation_lapsed",
+                        reason="No assignment was ever bound to this request and it "
+                        "is older than any Colab runtime can live; nothing from it "
+                        "can still be running.",
+                        allocation_lapsed_at=now,
+                    )
+                    return
+                lookup = record.get("allocation_lookup") or {}
+                if lookup.get("result") == "found" and lookup.get("assignment_id"):
+                    # Bind exactly the assignment Colab returned for this key.
+                    matches = [
+                        row
+                        for row in matches
+                        if row["assignment_id"] == lookup["assignment_id"]
+                    ]
                 if len(matches) != 1:
+                    in_flight = (
+                        record.get("create_returned_at") is None
+                        and now - record["submitted_at"] < CREATE_LOOKUP_AFTER
+                    )
+                    if in_flight:
+                        # Not unknown yet: the creating CLI has not reported.
+                        record["status"] = "allocation_pending"
+                        record["reason"] = "Creation request still in flight."
+                        return
                     record["status"] = "allocation_unknown"
                     record["reason"] = (
                         "Allocation not yet bound; creation is never automatically repeated."
                     )
+                    if lookup.get("result") == "absent":
+                        record["reason"] = (
+                            "Lookup by this request's allocation key found no runtime "
+                            "yet; the request may still be in progress. Creation is "
+                            "never automatically repeated."
+                        )
+                    if orphans:
+                        record["reason"] = (
+                            "An unnamed new assignment appeared; it may belong to "
+                            "this request. Inspect sessions; creation is never "
+                            "automatically repeated."
+                        )
                     return
                 selected = matches[0]
                 if scope == "unknown" or scope != record.get("account_scope"):
@@ -1141,7 +1362,19 @@ class BudgetManager:
                     assignment_id=selected["assignment_id"],
                     allocation_verified_at=now,
                     actual_hardware=selected["hardware"],
+                    reason=None,
                 )
+                if lookup.get("result") == "found":
+                    record.update(
+                        allocation_recovered_by="allocation_key_lookup",
+                        reason=(
+                            "The creation reply was lost"
+                            if record.get("allocation_error_code")
+                            else "The creating process never reported back"
+                        )
+                        + "; this request's runtime was found by its allocation "
+                        "key. No second creation was sent.",
+                    )
                 if selected["hardware"] != record["hardware"]:
                     record.update(
                         release_requested=True,
@@ -1156,6 +1389,17 @@ class BudgetManager:
                 None,
             )
             if matching is None:
+                if now - record["allocated_at"] > RUNTIME_LIFETIME_BOUND:
+                    record.update(
+                        status="released",
+                        released_at=now,
+                        release_verified_at=now,
+                        release_verified_by="runtime_lifetime",
+                        query_error=None,
+                        reason="Absent from the listing and older than any Colab "
+                        "runtime can live.",
+                    )
+                    return
                 if scope == "unknown" or scope != record.get("account_scope"):
                     record.update(
                         status="release_unknown",
@@ -1192,18 +1436,29 @@ class BudgetManager:
         return self._mutate(session, job_id, update)
 
     def tick(
-        self, session: str, job_id: str | None = None, *, force: bool = False
+        self,
+        session: str,
+        job_id: str | None = None,
+        *,
+        force: bool = False,
+        wait: float = 0.0,
     ) -> dict[str, Any]:
         """One bounded reconciliation. A separate I/O lock prevents double stop.
 
         The accounting lock is never held across provider calls, so readers and
         task admission can still observe the elapsed budget during an outage.
+        ``wait`` lets a caller outlast the guard's own in-flight reconcile
+        instead of reporting its stale pre-reconcile state.
         """
-        try:
-            with self._lock(session, ".reconcile.lock", nonblocking=True):
-                return self._tick_locked(session, job_id, force=force)
-        except BlockingIOError:
-            return self.status(session)
+        until = time.monotonic() + wait
+        while True:
+            try:
+                with self._lock(session, ".reconcile.lock", nonblocking=True):
+                    return self._tick_locked(session, job_id, force=force)
+            except BlockingIOError:
+                if time.monotonic() >= until:
+                    return self.status(session)
+                time.sleep(0.25)
 
     def _tick_locked(self, session, job_id, *, force):
         record = self._mutate(session, job_id, self._advance)
@@ -1223,6 +1478,8 @@ class BudgetManager:
             and self.clock() - record.get("last_query_attempt", 0) < 2
         ):
             return self._public(record)
+        if self._lookup_due(record, force):
+            record = self._lookup_allocation(session, job_id, record)
         try:
             scope_before = self.provider.account_scope()
             rows = self.provider.sessions()
@@ -1345,6 +1602,67 @@ class BudgetManager:
                     ),
                 )
         return self._public(record)
+
+    def _lookup_due(self, record, force) -> bool:
+        lookup = record.get("allocation_lookup") or {}
+        returned = record.get("create_returned_at") is not None
+        return (
+            record["status"] == "allocation_unknown"
+            and not record.get("assignment_id")
+            and not record.get("allocation_rejected")
+            # A creation that reported success needs no lookup: the CLI saved
+            # its session name, and the listing binds it.
+            and not record.get("create_succeeded")
+            and lookup.get("supported") is True
+            and bool(record.get("allocation_key"))
+            and getattr(self.provider, "supports_allocation_lookup", False) is True
+            and (
+                returned or self.clock() - record["submitted_at"] >= CREATE_LOOKUP_AFTER
+            )
+            and self.clock() - (lookup.get("at") or 0)
+            >= (2.0 if force else LOOKUP_INTERVAL)
+        )
+
+    def _lookup_allocation(self, session, job_id, record):
+        """Ask Colab for the assignment created under this job's key.
+
+        A lookup cannot create anything. "absent" keeps the record pending:
+        a slow allocation can still appear, so it is never a failure.
+        """
+        hardware = record["hardware"]
+        found_id = error_code = None
+        try:
+            found = self.provider.lookup_allocation(
+                session,
+                None if hardware == "CPU" else hardware,
+                record["allocation_key"],
+            )
+            result = "found" if found else "absent"
+            if found:
+                # The CLI now names the key's assignment; read its identity.
+                named = [
+                    row for row in self.provider.sessions() if row["name"] == session
+                ]
+                found_id = named[0]["assignment_id"] if len(named) == 1 else None
+                if found_id is None:
+                    result = "failed"
+                    error_code = "lookup_unbound"
+        except ProviderError as error:
+            result = "failed"
+            error_code = (error.diagnostic or {}).get("code") or error.code
+
+        def update(value):
+            lookup = value.setdefault("allocation_lookup", {"supported": True})
+            lookup.update(
+                attempts=lookup.get("attempts", 0) + 1,
+                result=result,
+                at=self.clock(),
+                error_code=error_code,
+            )
+            if found_id:
+                lookup["assignment_id"] = found_id
+
+        return self._mutate(session, job_id, update)
 
     def watch(self, session: str, job_id: str) -> int:
         try:

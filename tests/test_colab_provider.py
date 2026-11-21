@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import json
 import subprocess
 import tempfile
 import unittest
@@ -228,6 +229,7 @@ class ProviderCommandTests(unittest.TestCase):
                 ):
                     self.api.create("selected", "T4")
                 error = caught.exception
+                diagnostic = vars(error).pop("diagnostic")
                 self.assertEqual(
                     vars(error),
                     {
@@ -236,6 +238,11 @@ class ProviderCommandTests(unittest.TestCase):
                         "returncode": returncode,
                     },
                 )
+                # Unclassified output stays an unknown allocation outcome.
+                self.assertEqual(diagnostic["code"], "command_failed")
+                self.assertEqual(diagnostic["outcome"], "unknown")
+                self.assertEqual(diagnostic["hardware"], "T4")
+                self.assertNotIn("fixture", json.dumps(diagnostic))
                 self.assertNotIn("fixture-private", str(error))
                 self.assertNotIn("fixture-secret", str(error))
                 self.assertEqual(stdout.getvalue(), "")

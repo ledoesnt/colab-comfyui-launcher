@@ -28,6 +28,12 @@ CONTENT_ROOT = Path("/content")
 DRIVE_MOUNT = CONTENT_ROOT / "drive"
 CHUNK_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_ASSETS = 1000
+# Bundled uploads: the inputs' bytes back to back, cut into whole-file parts.
+# Each part is one complete PUT, so resending a failed part is idempotent.
+BUNDLE_PART_BYTES = 8 * 1024 * 1024
+PART_ATTEMPTS = 3
+MAX_BUNDLE_FILES = 200
+MAX_BUNDLE_BYTES = 2 * 1024**3
 
 
 class AssetsError(RuntimeError):
@@ -261,6 +267,98 @@ def _storage(base: Path, content_root: Path, drive_mount: Path) -> Path:
     return root
 
 
+def _input_filename(original: Any) -> str:
+    if (
+        not isinstance(original, str)
+        or len(original) > 255
+        or len(_relative(original).parts) != 1
+    ):
+        raise AssetsError("Input filename must be one plain filename.")
+    return original
+
+
+def _input_name(assignment_id: str, checksum: str, original: str) -> str:
+    # The readable suffix keeps the source recognisable; the complete SHA
+    # prevents different files with the same original name from colliding.
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", original)[-80:]
+    # Keep inputs at the input-directory root: older native LoadImage menus
+    # enumerate only that level. Both full hashes still scope every name.
+    return f"launcher-{instance_namespace(assignment_id)}-{checksum}-{safe}"
+
+
+def _input_target(root: Path, assignment_id: str, record: dict[str, Any]) -> Path:
+    relative = _relative(record.get("relative_path"))
+    if len(relative.parts) != 1 or not str(relative).startswith(
+        f"launcher-{instance_namespace(assignment_id)}-"
+    ):
+        raise AssetsError("Upload staging has an invalid destination.")
+    return _plain_path(root / "input" / str(relative))
+
+
+def _new_stage(base: Path) -> tuple[str, Path]:
+    staging = _directory(base / "asset-staging")
+    stage_id = uuid.uuid4().hex
+    stage = staging / stage_id
+    stage.mkdir(mode=0o700)
+    return stage_id, stage
+
+
+def _stage(base, payload, session, assignment_id) -> tuple[Path, dict[str, Any]]:
+    stage_id = payload.get("stage_id")
+    if not isinstance(stage_id, str) or not re.fullmatch(r"[0-9a-f]{32}", stage_id):
+        raise AssetsError("Invalid upload staging ID.")
+    stage = _plain_path(base / "asset-staging" / stage_id)
+    record = _json(stage / "record.json")
+    if record.get("session") != session or record.get("assignment_id") != assignment_id:
+        raise AssetsError("Upload staging belongs to a different instance.")
+    return stage, record
+
+
+class _Parts:
+    """Read uploaded bundle parts in order as one byte stream."""
+
+    def __init__(self, paths: list[Path], deadline: Deadline):
+        self.paths, self.deadline = list(paths), deadline
+        self.current = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        if self.current is not None:
+            self.current.close()
+
+    def _read(self, size: int) -> bytes:
+        while True:
+            if self.current is None:
+                if not self.paths:
+                    return b""
+                path = self.paths.pop(0)
+                if not path.exists():
+                    raise AssetsError("A bundle part is missing; upload it again.")
+                self.current = _open_regular(path)
+            chunk = self.current.read(size)
+            if chunk:
+                return chunk
+            self.current.close()
+            self.current = None
+
+    def copy(self, size: int, output) -> tuple[str, int]:
+        digest, done = hashlib.sha256(), 0
+        while done < size:
+            self.deadline.remaining()
+            chunk = self._read(min(CHUNK_BYTES, size - done))
+            if not chunk:
+                break
+            digest.update(chunk)
+            output.write(chunk)
+            done += len(chunk)
+        return digest.hexdigest(), done
+
+    def leftover(self) -> bool:
+        return bool(self._read(1))
+
+
 def remote_action(
     payload: dict[str, Any],
     *,
@@ -289,50 +387,121 @@ def remote_action(
     common = {"ok": True, "session": session, "assignment_id": assignment_id}
     if action == "asset-stage":
         checksum, size = _checksum(payload)
-        original = payload.get("original_filename")
-        if (
-            not isinstance(original, str)
-            or len(original) > 255
-            or len(_relative(original).parts) != 1
-        ):
-            raise AssetsError("Input filename must be one plain filename.")
-        # The readable suffix keeps the source recognisable; the complete SHA
-        # prevents different files with the same original name from colliding.
-        safe = re.sub(r"[^A-Za-z0-9._-]", "_", original)[-80:]
-        # Keep inputs at the input-directory root: older native LoadImage menus
-        # enumerate only that level. Both full hashes still scope every name.
-        relative = f"launcher-{instance_namespace(assignment_id)}-{checksum}-{safe}"
-        staging = _directory(base / "asset-staging")
-        stage_id = uuid.uuid4().hex
-        stage = staging / stage_id
-        stage.mkdir(mode=0o700)
+        original = _input_filename(payload.get("original_filename"))
+        stage_id, stage = _new_stage(base)
         record = {
             **common,
             "stage_id": stage_id,
             "original_filename": original,
-            "relative_path": relative,
+            "relative_path": _input_name(assignment_id, checksum, original),
             "sha256": checksum,
             "bytes": size,
         }
         _write_json(stage / "record.json", record)
         return {**record, "status": "staged", "upload_path": str(stage / "payload")}
+    if action == "asset-stage-bundle":
+        entries, parts = payload.get("entries"), payload.get("parts")
+        if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_BUNDLE_FILES:
+            raise AssetsError("A bundle needs 1 to 200 input files.")
+        staged = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise AssetsError("Bundle entries must be objects.")
+            checksum, size = _checksum(entry)
+            original = _input_filename(entry.get("original_filename"))
+            staged.append(
+                {
+                    "original_filename": original,
+                    "relative_path": _input_name(assignment_id, checksum, original),
+                    "sha256": checksum,
+                    "bytes": size,
+                }
+            )
+        total = sum(entry["bytes"] for entry in staged)
+        if total > MAX_BUNDLE_BYTES or type(parts) is not int:
+            raise AssetsError("Bundle size or part count is invalid.")
+        if parts != max(1, math.ceil(total / BUNDLE_PART_BYTES)):
+            raise AssetsError("Bundle part count does not match its size.")
+        stage_id, stage = _new_stage(base)
+        record = {
+            **common,
+            "stage_id": stage_id,
+            "entries": staged,
+            "parts": parts,
+            "bytes": total,
+        }
+        _write_json(stage / "record.json", record)
+        return {**record, "status": "staged", "upload_dir": str(stage)}
+    if action == "asset-commit-bundle":
+        stage, record = _stage(base, payload, session, assignment_id)
+        entries, parts = record.get("entries"), record.get("parts")
+        if not isinstance(entries, list) or type(parts) is not int or parts < 1:
+            raise AssetsError("Upload staging is not a bundle.")
+        names = [stage / f"part-{index:04d}" for index in range(parts)]
+        targets = [_input_target(root, assignment_id, entry) for entry in entries]
+        _directory(root / "input")
+        published = []
+        with _lock(base / "asset-commit.lock", deadline):
+            temporaries = []
+            try:
+                with _Parts(names, deadline) as stream:
+                    # Verify every file before publishing any of them.
+                    for entry, target in zip(entries, targets, strict=True):
+                        temporary = target.with_name(
+                            ".asset-" + uuid.uuid4().hex + ".partial"
+                        )
+                        temporaries.append(temporary)
+                        with temporary.open("xb") as output:
+                            os.chmod(temporary, 0o600)
+                            result = stream.copy(entry["bytes"], output)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        if result != _checksum(entry):
+                            raise AssetsError(
+                                "A bundled input's size or SHA256 did not match; "
+                                "nothing from this bundle was published."
+                            )
+                    if stream.leftover():
+                        raise AssetsError(
+                            "Uploaded bundle is longer than its manifest; nothing "
+                            "from this bundle was published."
+                        )
+                for entry, target, temporary in zip(
+                    entries, targets, temporaries, strict=True
+                ):
+                    reused = target.exists()
+                    if reused:
+                        _checked(target, entry, deadline)
+                    else:
+                        os.replace(temporary, target)
+                    published.append((entry, target, reused))
+            finally:
+                for temporary in temporaries:
+                    temporary.unlink(missing_ok=True)
+        for name in names:
+            name.unlink(missing_ok=True)
+        return {
+            **common,
+            "stage_id": record["stage_id"],
+            "status": "verified",
+            "assets": [
+                {
+                    **common,
+                    **entry,
+                    "status": "verified",
+                    "filename": target.name,
+                    "comfyui_name": entry["relative_path"],
+                    "path": str(target),
+                    "type": "input",
+                    "verification": "sha256",
+                    "reused": reused,
+                }
+                for entry, target, reused in published
+            ],
+        }
     if action == "asset-commit":
-        stage_id = payload.get("stage_id")
-        if not isinstance(stage_id, str) or not re.fullmatch(r"[0-9a-f]{32}", stage_id):
-            raise AssetsError("Invalid upload staging ID.")
-        stage = _plain_path(base / "asset-staging" / stage_id)
-        record = _json(stage / "record.json")
-        if (
-            record.get("session") != session
-            or record.get("assignment_id") != assignment_id
-        ):
-            raise AssetsError("Upload staging belongs to a different instance.")
-        relative = _relative(record.get("relative_path"))
-        if len(relative.parts) != 1 or not str(relative).startswith(
-            f"launcher-{instance_namespace(assignment_id)}-"
-        ):
-            raise AssetsError("Upload staging has an invalid destination.")
-        target = _plain_path(root / "input" / str(relative))
+        stage, record = _stage(base, payload, session, assignment_id)
+        target = _input_target(root, assignment_id, record)
         _directory(target.parent)
         with _lock(base / "asset-commit.lock", deadline):
             if target.exists():
@@ -360,7 +529,7 @@ def remote_action(
             **record,
             "status": "verified",
             "filename": target.name,
-            "comfyui_name": str(relative),
+            "comfyui_name": target.name,
             "path": str(target),
             "type": "input",
             "verification": "sha256",
@@ -448,8 +617,16 @@ class AssetsClient:
             [action, "-s", self.session, source, destination], deadline.remaining()
         )
         if result.returncode != 0:
+            # Local-only import: this module is also deployed to the runtime.
+            import provider_errors
+
+            diagnostic, stderr = provider_errors.parse(result.stderr or "")
+            diagnostic = diagnostic or provider_errors.fallback(
+                action, result.stdout or "", stderr, result.returncode
+            )
             raise AssetsError(
-                "Official CLI asset transfer failed; completion is unverified."
+                "Official CLI asset transfer failed; completion is unverified. "
+                + provider_errors.describe(diagnostic)
             )
         self._check_identity()
 
@@ -483,6 +660,86 @@ class AssetsClient:
                     "Uploaded result checksum differs from the local snapshot."
                 )
             return result
+
+    def upload_many(self, sources: list[Path]) -> dict[str, Any]:
+        """Several inputs in one staging and one commit, sent as resendable parts.
+
+        A per-file upload costs two remote programs and several identity
+        queries; through a slow proxy that was ~1.5 minutes per small file.
+        """
+        deadline = Deadline(self.timeout)
+        sources = [Path(source) for source in sources]
+        with tempfile.TemporaryDirectory(prefix="launcher-asset-bundle-") as temporary:
+            bundle = Path(temporary) / "bundle"
+            entries = []
+            with bundle.open("xb") as stream:
+                os.chmod(bundle, 0o600)
+                for source in sources:
+                    sha256, size = _digest(source, deadline, stream)
+                    entries.append(
+                        {
+                            "original_filename": source.name,
+                            "sha256": sha256,
+                            "bytes": size,
+                        }
+                    )
+            total = sum(entry["bytes"] for entry in entries)
+            parts = max(1, math.ceil(total / BUNDLE_PART_BYTES))
+            stage = self._remote(
+                "asset-stage-bundle", deadline, entries=entries, parts=parts
+            )
+            directory = stage.get("upload_dir")
+            if not isinstance(directory, str) or not directory.startswith("/"):
+                raise AssetsError("Remote upload staging path is invalid.")
+            _relative(directory[1:])
+            attempts = []
+            with bundle.open("rb") as stream:
+                for index in range(parts):
+                    part = Path(temporary) / f"part-{index:04d}"
+                    part.write_bytes(stream.read(BUNDLE_PART_BYTES))
+                    attempts.append(
+                        self._send_part(
+                            part, f"{directory[1:]}/part-{index:04d}", deadline
+                        )
+                    )
+                    part.unlink()
+            result = self._remote(
+                "asset-commit-bundle", deadline, stage_id=stage.get("stage_id")
+            )
+            assets = result.get("assets")
+            if not isinstance(assets, list) or [
+                _checksum(asset) for asset in assets
+            ] != [(entry["sha256"], entry["bytes"]) for entry in entries]:
+                raise AssetsError(
+                    "Uploaded bundle results differ from the local snapshots."
+                )
+            return {**result, "parts": parts, "part_attempts": attempts}
+
+    def _send_part(self, part: Path, destination: str, deadline: Deadline) -> int:
+        """Whole-file PUT of one part; a failed part is resent, never appended.
+
+        Identity is checked around the whole bundle by stage and commit; the
+        commit verifies every file's SHA before anything is published.
+        """
+        for attempt in range(1, PART_ATTEMPTS + 1):
+            result = self.run_colab(
+                ["upload", "-s", self.session, str(part), destination],
+                deadline.remaining(),
+            )
+            if result.returncode == 0:
+                return attempt
+            if attempt == PART_ATTEMPTS or deadline.remaining() < 5:
+                import provider_errors
+
+                diagnostic, stderr = provider_errors.parse(result.stderr or "")
+                diagnostic = diagnostic or provider_errors.fallback(
+                    "upload", result.stdout or "", stderr, result.returncode
+                )
+                raise AssetsError(
+                    f"Bundle part upload failed {attempt} times; nothing from this "
+                    "bundle was published. " + provider_errors.describe(diagnostic)
+                )
+        raise AssertionError("unreachable")
 
     def collect(
         self,

@@ -13,17 +13,28 @@ mkdir -p "$RUNTIME_ROOT"/{bin,logs}
 exec 9>"$RUNTIME_ROOT/install.lock"
 flock -n 9 || { echo 'An installation is already running' >&2; exit 1; }
 
+CURRENT_PHASE=start
 write_status() {
-  python3 - "$RUNTIME_ROOT/install.json" "$1" "${2:-$1}" <<'PY'
+  local phase=${2:-$1}
+  if [[ $1 == installing ]]; then CURRENT_PHASE=$phase; fi
+  python3 - "$RUNTIME_ROOT/install.json" "$1" "$phase" "${3:-}" "${4:-}" <<'PY'
 import json, os, sys, time
 from pathlib import Path
 p=Path(sys.argv[1]); tmp=p.with_suffix('.tmp')
-tmp.write_text(json.dumps({'status':sys.argv[2], 'phase':sys.argv[3], 'updated_at':time.time()}))
+value={'status':sys.argv[2], 'phase':sys.argv[3], 'updated_at':time.time()}
+if sys.argv[4]:
+    value['exit_code']=int(sys.argv[4])
+if sys.argv[5]:
+    value['line']=int(sys.argv[5])
+if sys.argv[2] in ('failed', 'interrupted'):
+    value['log']='/content/colab-comfyui-runtime/logs/install.log'
+tmp.write_text(json.dumps(value))
 os.replace(tmp,p)
 PY
 }
-trap 'write_status failed' ERR
-trap 'write_status interrupted; exit 143' TERM INT
+# Keep the phase that failed; agents read it from status without log access.
+trap 'write_status failed "$CURRENT_PHASE" "$?" "$LINENO"' ERR
+trap 'write_status interrupted "$CURRENT_PHASE"; exit 143' TERM INT
 write_status installing source
 
 if [[ ! -d "$RUNTIME_ROOT/ComfyUI/.git" ]]; then

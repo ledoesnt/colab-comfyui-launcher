@@ -473,10 +473,22 @@ def colab_command(
     account: str | None = None,
     executable: str = "colab",
     auth: bool = True,
+    deadline: float | None = None,
+    allocation_key: str | None = None,
+    lookup_only: bool = False,
 ) -> list[str]:
+    """Build the official CLI argv for one account.
+
+    Named accounts run through ``account_cli.py``, which also classifies
+    failures; ``deadline`` (seconds) lets it report before the caller's kill.
+    ``allocation_key`` binds ``new`` to a durable key; with ``lookup_only`` the
+    shim only looks that allocation up and never sends a creation request.
+    """
     account = account_id(account or current_account())
     arguments = (["--auth=oauth2"] if auth else []) + arguments
     if account == "default":
+        if allocation_key is not None or lookup_only:
+            raise AccountError("Allocation lookup requires a saved named account.")
         return [str(executable), *arguments]
     directory = cli_directory(account)
     check_cli_directory(directory)
@@ -502,6 +514,14 @@ def colab_command(
         raise AccountError(
             "Named accounts require the official Python Colab CLI entrypoint."
         )
+    launcher = []
+    if deadline is not None:
+        launcher.append(f"--launcher-deadline={max(1.0, float(deadline)):.3f}")
+    if allocation_key is not None:
+        launcher.append(f"--launcher-allocation={allocation_key}")
+    if lookup_only:
+        launcher.append("--launcher-lookup-only")
+    arguments = [*launcher, *arguments]
     return [
         str(interpreter),
         str(Path(__file__).with_name("account_cli.py")),
