@@ -134,6 +134,83 @@ class AssetsTests(unittest.TestCase):
             Path(self.transfers[0][3]).exists(), "temporary snapshot is removed"
         )
 
+    def test_bundle_publishes_every_file_after_one_stage_and_one_commit(self):
+        files = [
+            self.source(b"a" * 10, "sheet_a.png"),
+            self.source(b"b" * 25, "sheet_b.png"),
+            self.source(b"c" * 7, "ref.mp4"),
+        ]
+        with mock.patch.object(assets, "BUNDLE_PART_BYTES", 16):
+            result = self.client.upload_many(files)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["parts"], 3)
+        self.assertEqual(
+            [p["action"] for p in self.operations],
+            ["asset-stage-bundle", "asset-commit-bundle"],
+        )
+        self.assertEqual(len(self.transfers), 3)
+        for source, asset in zip(files, result["assets"], strict=True):
+            published = self.storage / "input" / asset["comfyui_name"]
+            self.assertEqual(published.read_bytes(), source.read_bytes())
+            self.assertEqual(
+                asset["sha256"], hashlib.sha256(source.read_bytes()).hexdigest()
+            )
+            self.assertEqual(asset["original_filename"], source.name)
+        self.assertEqual(list((self.base / "asset-staging").glob("*/part-*")), [])
+
+    def test_failed_bundle_part_is_resent_not_appended(self):
+        files = [self.source(b"x" * 20, "one.png"), self.source(b"y" * 5, "two.png")]
+        failures = {"left": 1}
+
+        def flaky(action, source, target):
+            if failures["left"]:
+                failures["left"] -= 1
+                shutil.copyfile(source, "/" + target)  # bytes landed, reply lost
+                return subprocess.CompletedProcess([], 1, "", "Connection was lost")
+            shutil.copyfile(source, "/" + target)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        self.transfer_fault = flaky
+        with mock.patch.object(assets, "BUNDLE_PART_BYTES", 16):
+            result = self.client.upload_many(files)
+        self.assertEqual(result["part_attempts"], [2, 1])
+        self.assertEqual(
+            (self.storage / "input" / result["assets"][1]["comfyui_name"]).read_bytes(),
+            b"y" * 5,
+        )
+
+    def test_corrupt_or_missing_bundle_part_publishes_nothing(self):
+        files = [self.source(b"x" * 20, "one.png"), self.source(b"y" * 5, "two.png")]
+
+        def corrupt(action, source, target):
+            data = Path(source).read_bytes()
+            Path("/" + target).write_bytes(data[:-1] + b"!")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        def dropped(action, source, target):
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        for fault, message in ((corrupt, "did not match"), (dropped, "missing")):
+            self.transfer_fault = fault
+            with (
+                mock.patch.object(assets, "BUNDLE_PART_BYTES", 16),
+                self.assertRaisesRegex(assets.AssetsError, message),
+            ):
+                self.client.upload_many(files)
+            self.assertEqual(list((self.storage / "input").iterdir()), [])
+        with self.assertRaisesRegex(assets.AssetsError, "part count"):
+            self.dispatch(
+                {
+                    "action": "asset-stage-bundle",
+                    "session": self.session,
+                    "assignment_id": self.assignment,
+                    "entries": [
+                        {"original_filename": "a.png", "sha256": "0" * 64, "bytes": 5}
+                    ],
+                    "parts": 2,
+                }
+            )
+
     def test_same_name_with_changed_bytes_does_not_overwrite_prior_input(self):
         first = self.client.upload(self.source(b"first"))
         second = self.client.upload(self.source(b"second"))

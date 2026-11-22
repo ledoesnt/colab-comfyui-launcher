@@ -1026,6 +1026,46 @@ def _request_match(job, record):
     )
 
 
+def execution_evidence(record, deadline):
+    """Retained ComfyUI jobs carrying this request ID, whatever their fingerprint.
+
+    Exactly one, equal to the recorded prompt_id, is the server-side evidence
+    that this request ran once. History can be evicted or lost when ComfyUI
+    restarts, so zero proves nothing; failures report "unavailable".
+    """
+
+    def tagged(job):
+        return (
+            isinstance(job, (list, tuple))
+            and len(job) >= 4
+            and isinstance(job[3], dict)
+            and job[3].get("launcher_request_id") == record.get("request_id")
+            and isinstance(job[1], str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", job[1]) is not None
+        )
+
+    found = set()
+    try:
+        queue = http_json("/queue", deadline)
+        for key in ("queue_running", "queue_pending"):
+            entries = queue.get(key, [])
+            if isinstance(entries, list):
+                found.update(job[1] for job in entries if tagged(job))
+        for item in http_json("/history", deadline).values():
+            if isinstance(item, dict) and tagged(item.get("prompt")):
+                found.add(item["prompt"][1])
+    except RenderError:
+        return {"state": "unavailable"}
+    found = sorted(found)
+    return {
+        "state": "observed",
+        "scope": "retained_comfyui_queue_and_history",
+        "comfyui_jobs": len(found),
+        "prompt_ids": found,
+        "single_execution": found == [record.get("prompt_id")],
+    }
+
+
 def reconcile_submission(record, deadline):
     """Absence is inconclusive: server queues/history can be lost or evicted."""
     matches = set()
@@ -1343,7 +1383,10 @@ def query_job(request_id, job_dir, max_seconds=20, *, result_file=None):
         }
 
     if old.get("terminal") or old.get("submission_attempted") is not True:
-        return envelope(old)
+        if old.get("submission_attempted") is not True:
+            return envelope(old)
+        with time_budget(min(max_seconds, 15)) as deadline:
+            return envelope(old, execution_evidence=execution_evidence(old, deadline))
     try:
         journal.__enter__()
     except RenderError as error:
@@ -1384,7 +1427,10 @@ def query_job(request_id, job_dir, max_seconds=20, *, result_file=None):
                         status="failed", terminal=True, job_may_still_be_running=False
                     )
                     record_failure(report, error)
-                    return envelope(report.value)
+                    return envelope(
+                        report.value,
+                        execution_evidence=execution_evidence(report.value, deadline),
+                    )
                 status = history.get("status", {})
                 if (
                     status.get("completed") is True
@@ -1396,12 +1442,18 @@ def query_job(request_id, job_dir, max_seconds=20, *, result_file=None):
                     collect_result(
                         args, report, history, owned_storage(state), deadline
                     )
-                    return envelope(report.value)
+                    return envelope(
+                        report.value,
+                        execution_evidence=execution_evidence(report.value, deadline),
+                    )
             phase, position = queue_phase(http_json("/queue", deadline), prompt_id)
             report.update(
                 status=phase, queue_position=position, job_may_still_be_running=True
             )
-            return envelope(report.value)
+            return envelope(
+                report.value,
+                execution_evidence=execution_evidence(report.value, deadline),
+            )
     except (Exception, KeyboardInterrupt) as error:  # noqa: BLE001 - query CLI boundary
         message = (
             str(error)

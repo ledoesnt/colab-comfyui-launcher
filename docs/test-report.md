@@ -1,5 +1,141 @@
 # 实测记录
 
+## 2026-11-20 返工两批成片：准入等待协调时不会自己重查（离线 + 真实 Colab）
+
+同一外部项目返工两批成片（H3 R2V 1344×768 / 20 步），命名账号上一台 G4。
+
+- **发现**：G4 第一次就分到（09:34:53），deploy → install → `prepare --only`（4 个文件）→ start 共 4 分 51 秒 HTTP 就绪。随后第一次打包上传 33 秒后被拒：`not_submitted`、`reason: budget_admission`、“Allocation reconciliation is still in progress”。原因：守护持有协调锁在做用量查询，它的列表此前已经计入代数；准入只被动等待更新的代数，锁释放后也不自己查询，于是等满 30 秒后拒绝。本次调用什么都没发送。
+- **修复**：等待期间每次先重读记录；仍是旧代数时尝试自己做一次强制协调（锁被占就继续等）。守护刚发布的结果直接使用，不重复查询平台。新回归模拟守护在用量阶段持锁 0.5 秒后释放，准入应在窗口内放行；去掉修复后该回归失败。“整个窗口都被占锁仍然拒绝”和“跨进程复用同一结果、不额外调用平台”两项原有回归保持通过。
+- **真实运行**：修复后重试打包上传，7 个文件（28.2 MB）134 秒成功。两批渲染分别为 243 帧 2,593 秒、124 帧 738 秒；下载核验约 5 分钟和 3 分钟，前一批与下一批渲染并行。期间任务查询一次 `connection failed`，按“可能仍在运行”继续查询，没有重发。10:45 `release` 平台核实 `released, verified: true`，官方列表无会话。G4 共 71 分钟，账号余额 2,477.63 → 2,465.96（约 11.7 CU，账号级观测）。
+
+离线：完整 `python3 -m unittest discover -s tests` 974 项通过（2 项可选集成跳过），Ruff 与 `git diff --check` 通过。
+
+## 2026-11-19/20 用真实项目跑 agent 流程：H3 R2V 成片补完中发现的问题（离线 + 真实 Colab）
+
+用一个外部项目（Uptown Funk 换角色，H3 R2V 1344×768 / 20 步）在命名账号上补完剩余两批成片，把途中遇到的不利于 agent 操作的问题逐个记录、修复并回归。
+
+### 发现与修复
+
+| 问题 | 实测证据 | 修复 |
+| --- | --- | --- |
+| 跳过用不到的模型只能临时改动受 Git 跟踪的 `models/h3.json` 再还原 | 外部项目 README 要求开机前手改、释放后 `git checkout`；忘记还原会让仓库变脏并阻止启动前更新 | `prepare --only FILE`（可重复），记录选择，`start` 与 `models_ready` 按选择检查，`status.models_selection` 显示；不认识的名字在任何传输前失败 |
+| `new` 预检失败只报 `failed` | 第一次 `new` 的会话列表经代理 `network_error`，结果看不出是否已分配；外部 README 也记录“查实例列表为 0 后换 ID 重试” | 预检失败一律 `not_submitted`、`allocation_submitted: false`、`create_requests: 0`，说明同一 ID 可否重试；认证范围在预检中变化时自动重查一次 |
+| 一个月前的分配记录永远停在 `release_pending` / `identity_mismatch` | 某账号 5 条 10-24 的 G4 记录（503 被旧版记成 `command_failed`）从未绑定；另一账号 11-01 记录卡在 `identity_mismatch`→刷新后 `release_unknown` 并让守护一直轮询 | 从未绑定且超过 48 小时→终态 `allocation_lapsed`；已绑定、超过 48 小时且列表中不存在→`released`、`release_verified_by: runtime_lifetime`（Colab 运行时最长约 24 小时）。所有预算结果都带 `terminal`。6 条历史记录用 `budget --refresh` 实际收尾，无任何停止请求 |
+| 创建进行中守护把记录标成 `allocation_unknown`，随后做了不必要的查找并声称“回复丢失” | G4 第 8 次分配：创建正常返回，守护在 POST 期间列表，之后按键查找仍找到同一实例（POST 仍只有 1 次），但 `reason` 写成回复丢失 | 创建进程未返回且未超过 330 秒时保持 `allocation_pending`；创建成功后不再查找；只有确有错误时才说“回复丢失” |
+| 每个文件上传约 1.5 分钟 | 同一 G4 上 6 个文件（22 MB）逐个上传 616 秒：每个文件两次远端程序、一次传输和多次实例身份查询 | `upload` 多文件打包：一次暂存、一次提交，≤8 MiB 分片各为完整写入可单独重发，全部 SHA 一致才发布。CPU 实测同 6 个文件 87 秒（3 片均一次成功） |
+| 同账号另一台实例让小预算传输窗口只剩 19 秒，错误只说本地 CLI 超时 | CPU 测试实例按账号总费率（含正在渲染的 G4，10.13 CU/h）计费，1 CU 预算在上传中途到达工作截止 | 传输窗口被预算裁剪时错误写明并附 `budget_limited_seconds`；属于设计上的保守计费，测试改用足够预算 |
+| 一次列表失败让上传被拒并报 `failed` | 00:03:15 单次 `network_error`，准入只在守护 10 秒重试窗口内等待恢复，代理下一次列表要更久 | 准入最多等 30 秒等待在途恢复（守护存活且未请求释放）；素材传输中途被预算拒绝报告 `not_published` / `not_completed`、可安全重试 |
+
+### 真实 Colab
+
+- G4 容量：22:49–23:20 连续 7 次 `new` 均为 HTTP 503，分类为 `capacity_unavailable` / `allocation_failed`，平台核实无新分配；其中一次 503 后列表网络失败，记录先为 `query_failed`，守护随后自行核实为 `allocation_failed`。23:25 第 8 次得到 G4。
+- 启动：deploy 26 秒；install 33 秒提交、约 1 分钟就绪；`prepare --only`（4 个文件约 40 GB）约 2.5 分钟 `models_ready: true` 且选择正确；start 32 秒提交、约 30 秒 HTTP 就绪。分配到开始渲染共约 22 分钟，其中上传 10 分钟。
+- 渲染：两批成片 243 帧 2,601 秒、209 帧 2,102 秒，均下载并逐帧核验；第二批输入在第一批渲染期间上传。每批 collect 约 8–10 分钟（约 8 MB 视频加首尾帧），与同一实例上的任务轮询共用内核。
+- 释放：01:15 `release` 平台核实 `released, verified: true`，官方列表无会话。G4 运行 1 小时 50 分钟；账号余额 2,496.00 → 2,477.63（约 18.4 CU，含两台 CPU 测试实例；账号级观测）。
+- CPU 打包上传验证：两台临时 CPU 实例，均平台核实释放。第一台因按账号总费率计费、1 CU 预算在上传中途用尽而失败（触发上表的错误说明修复），第二台 4 CU 预算下 6 个文件 87 秒成功。
+
+离线：完整 `python3 -m unittest discover -s tests` 通过（2 项 PyAV 可选集成跳过），Ruff、`bash -n` 与 `git diff --check` 通过。新增回归覆盖上表每一项；外部项目自身 20 项测试另行通过。
+
+## 2026-11-19 远端已接受、回复丢失：分配与渲染（离线 + 真实 Colab）
+
+### 问题与证据
+
+- **分配回复丢失后永远无法认领。** 官方 `new` 每次用随机 notebook hash 请求 `/tun/m/assign`。回复丢失时本机 CLI 不保存会话名，平台只显示无名 `?` 分配，预算记录停在 `allocation_unknown`，无法绑定、受预算保护或释放。
+- **发送后被杀的 exec 被误报为“未发送”。** CLI 进程被杀、崩溃，或旧 `default` 账号没有 shim 时，没有分类行，`fallback()` 把 `exec` 判为 `not_dispatched`。调用者因此得到 `not_submitted`、`resubmit_allowed: true`，可能重复执行。
+- **单次列表失败会释放健康实例**（实测发现）。守护在 21:58:08 列表一次 `network_error`；21:58:13 开始的重查在 21:58:18 成功，但 `_observe` 先用旧失败状态判断 10 秒窗口已过，于是请求释放并释放了刚核实存在的实例。
+- **45 秒提交窗口不足**（实测发现）。经本机代理，身份列表约 9 秒、websocket 5–20 秒，程序输出在发送后 10–21 秒才到本机；一次已被远端接受的 `install` 因此变成 `submission_unknown`（随后同 ID 查询确认远端只接收一次，状态 `started`）。
+- **`collect` 遇到守护正在协调时报 `failed`**（实测发现）。准入只等 10 秒，代理下一次列表加用量查询会超过这个时间；本调用其实什么都没发送。
+- **输出把已校验的 `exception_type: ReadTimeout` 改写成整句说明，绑定后保留过期 `reason`**（实测发现）。
+
+### 改动
+
+- 预算记录在发送前落盘 `create_requests: 1` 和由 `job_id` 派生的分配键；shim 用它作为 notebook hash。
+- 创建回复丢失且创建进程已返回（或超过 330 秒）后，守护运行只读查找：官方 `new` 加 `--launcher-lookup-only`，shim 拒绝 `_post_assignment`（`_issue_request` 层再挡一次 POST），核对平台列表中的同一 `assignment_id` 后才绑定。查不到时 `allocation_lookup.result: absent`，记录保持待确认，不转失败、不重建。
+- `exec` 只有 vendored exec 明确记录 `dispatched: false` 才算未发送；无证据时一律 `unknown`。
+- 渲染查询附 `execution_evidence`：ComfyUI 队列与保留历史中带该 request ID 的任务数和 `single_execution`。远端 `not_found` 明确 `terminal: false`、`resubmit_allowed: false`。
+- 成功列表先清除旧失败再判断恢复窗口；非首次接触写操作窗口 90 秒；准入等待在途协调最多 30 秒（仍受提交截止限制）；`collect`/`upload` 准入被拒报告 `not_submitted`、`resubmit_allowed: true`。
+- 已校验的诊断字段不再经字符串净化改写；绑定时更新 `reason`。
+
+### 离线测试
+
+```text
+python3 -m unittest discover -s tests -v
+Ran 963 tests
+OK (skipped=2)
+```
+
+新增 `tests/test_lost_responses.py`（15 项）两组故障注入回归：
+
+1. 分配：在官方 CLI 解释器内运行真实 0.7.4 `new`，伪造服务器接受 POST 后丢弃回复。确认 GET/POST 都带同一个键，结果为 `http_timeout` / `unknown`；只读查找返回同一 endpoint 且不 POST；未知键返回 `allocation_lookup_empty` / `none` 且不 POST；畸形选项在任何请求前被拒。预算层：被接受的分配按键绑定，`create_requests` 恒为 1，同 request ID 只回放；查不到时一小时内多次轮询与回放始终是 `allocation_unknown`，之后迟到的分配仍绑定同一 job；无法解释的 `?` 分配不会被绑定。
+2. 渲染：远端程序真实执行后返回 `connection_lost`，或 CLI 以 -9 退出且无诊断。两种情况均为 `submission_unknown`，同 ID 重跑只发 `job`，取回原 `prompt_id` 和成品，后续由本地回执回答；只有证明未发送（`kernel_busy` + `dispatched: false`）才是 `not_submitted`。渲染查询在回复丢失后报告 1 个服务器任务；人为加入第二个同 ID 任务时报告 2、`single_execution: false`。
+
+还新增守护“窗口内开始的重查在窗口后返回”回归，以及 `collect` 准入被拒的分类回归。变异检查：把 exec 规则改回旧行为、或关闭分配键与查找、或去掉列表恢复修复，对应回归均失败。
+
+`test_prepare_models` 的 `test_ephemeral_deadline_bounds_blocked_download_and_keeps_partial` 以 20 毫秒总期限与 `.partial` 创建前的落盘进度写入赛跑；加入新模块后完整运行连续 4 次失败，单独运行均通过，未改动的代码路径上没有行为变化。改为 0.3 秒期限、1 秒阻塞读，仍验证“期限在阻塞读中到期并保留 partial”，此后完整运行通过。Ruff 0.16.0 check/format、`bash -n scripts/bootstrap.sh`、Python 3.10 语法解析与 `git diff --check` 通过。
+
+### 真实 Colab（命名账号，已有授权；每实例预算上限 1 CU，保守费率 1 CU/h）
+
+故障注入使用仓库外的测试专用 `sitecustomize`，仅在官方 CLI 解释器中、且环境变量指定一次性标记文件时生效，不记录 URL、请求头、token 或 body。POST 计数取自该账号 CLI 日志中 `Request: POST …/tun/m/assign` 行，只统计数量。
+
+| 步骤 | 结果 |
+| --- | --- |
+| 未用过的键只读查找 | 5.1 秒返回“不存在”；1 次 GET、0 次 POST，平台无新会话。 |
+| 实例 1：分配回复丢失 | Colab 对 POST 返回 200 后丢弃回复。33.9 秒后 `new` 退出 0：`active`、`allocation_recovered_by: allocation_key_lookup`、`create_requests: 1`，绑定实例与查找结果一致。窗口内 POST 1 次、GET assign 2 次（创建与查找）。同 request ID 重放 9.7 秒：同一 `job_id` 与实例、`already_managed`，无 POST。 |
+| 实例 1：被守护误释放 | `deploy` 27.7 秒；`install` 因 45 秒窗口返回 `submission_unknown`，同 ID 查询确认远端已接收一次（`started`）。随后发生上文的单次列表失败误释放（平台核实已释放）。修复后改用实例 2。 |
+| 实例 2：分配回复丢失 | 同样注入；26.9 秒 `active`，`reason` 说明按分配键找回、没有第二次创建；`exception_type: ReadTimeout`；POST 1 次。 |
+| 实例 2：准备 | `deploy` 21.0 秒；`install`（90 秒窗口）15.4 秒提交，约 2.5 分钟就绪；`start --cpu --ephemeral --local-only` 36.0 秒，约 1 分钟后 HTTP 就绪。 |
+| 实例 2：渲染后断线 | 无模型 CPU 工作流（EmptyImage → SaveImage，96×64）。远端 `LAUNCHER_RESULT` 帧到达本机时杀死 CLI：24.4 秒退出 1，`submission_unknown`、`this_call_dispatched: null`、`resubmit_allowed: false`（修复前同情况为 `not_submitted` 且允许重发）。同 ID 重跑 19.6 秒只查询：`succeeded`、原 `prompt_id`，`execution_evidence` 为 `comfyui_jobs: 1`、`single_execution: true`；之后 `job` 0.2 秒由本地回执回答。 |
+| 实例 2：取回与核对 | 第一次 `collect` 遇到在途协调被拒（触发上文修复）；修复后 `collect --job` 60.3 秒 `verified`，本地 SHA256 与原记录一致，PNG 为 96×64。远端只读核对：ComfyUI 全部历史 1 条且带该 ID，队列为空，只有 `probe_00001_.png`，请求记录与渲染日志各 1 份。 |
+| 释放与费用 | 实例 2 `release` 14.5 秒，平台核实 `released, verified: true`；实例 1 已由守护释放并核实。官方列表无会话，无剩余守护进程。实例 1 约 5 分钟、实例 2 约 8.4 分钟；账号余额 2496.01 → 2496.00（约 0.01 CU，账号级观测，精度 0.01）。实例 2 保守估算 0.14 CU。 |
+
+**结论：** 两项均实测通过。分配侧“查不到时保持待确认”的长期行为（回复丢失且服务器确实未创建）在真实 Colab 上只验证了“未知键查找返回不存在、不创建”，记录长期保持 `allocation_unknown` 的部分仅模拟通过。未覆盖：GPU 上的同类注入、ComfyUI 重启导致历史丢失后的证据（此时 `comfyui_jobs: 0` 不能证明未执行）、旧 `default` 账号（没有 shim，不支持按键查找）。
+
+## 2026-11-19 Provider 失败分类、vendored exec 与冷启动（离线 + 真实 Colab）
+
+### 起因与证据
+
+本机历史记录中的启动失败无法从结果判断原因：5 条 G4 预算记录停在 `allocation_unknown` / `command_failed`，提示让用户“使用官方交互登录”；对应 CLI 日志实际是 `POST /tun/m/assign` 返回 503（无 G4 容量），并非登录问题。另有 `deploy`、`start`、`prepare`、`render` 的 "Local Colab command timed out"，以及一条素材错误只显示了 CLI 升级提示。阅读官方 0.7.4 源码后确认：
+
+- `new` 只翻译 412 和 400，503 等其他状态以原始 traceback 退出；`Client._issue_request` 与运行时文件 API 没有自己的超时。
+- `exec --timeout` 只限制最后的 reply 等待。内核忙时 iopub 循环以零超时空转，进程既不结束也不报错，最终被外层期限杀死，无法区分“未发送”和“已发送”。
+- 无终端时缺少登录会先打印 OAuth 网址再因 EOF 退出，只剩 `Aborted.`。
+- 新分配 VM 第一次运行时请求或 websocket 连接实测约 23–40 秒（本机经本地代理），旧的 45 秒 `deploy` 窗口会被首次上传耗尽。
+- `install` 失败的 ERR trap 把阶段覆盖为 `failed`；启动失败阶段固定写成 `startup`。
+
+### 改动
+
+新增 `scripts/provider_errors.py` 统一分类，扩展 `scripts/account_cli.py`（在官方 CLI 解释器中加超时、非交互登录失败、分类输出，并为启动器 exec 复制官方执行路径，加入截止、内核就绪/忙碌检查与准确的 dispatched 记录）。provider、预算、`colabctl`、素材与 dashboard 使用分类结果；确证被拒且平台无新分配时预算进入终态 `allocation_failed`；只在确认未发送时自动重试；`deploy` 与 `start` 使用 120 秒首次接触窗口；`new` 等待守护协调结束；重复启动返回 `not_started` 和正在运行的 request ID；`status` 增加 `summary`；远端保留失败阶段和脱敏日志尾部。接口说明见[自动化接口](automation-api.md#provider-失败分类)。
+
+### 离线测试
+
+```text
+python3 -m unittest discover -s tests -v
+Ran 947 tests in 78.968s
+OK (skipped=2)
+```
+
+新增 27 项（`tests/test_provider_diagnostics.py`）及若干既有测试的契约更新。其中 shim 测试在官方 CLI 自己的解释器中加载真实 0.7.4 模块，用伪造 HTTP session 与伪造内核覆盖 503/412/连接超时/读超时分类、非交互登录、文件 API 错误不含 token 与 URL、vendored exec 的成功、忙碌（含“观察到 busy 后状态查询失败”回归）、发送前期限用尽（`predispatch_timeout`，不发送）、执行超时、远端异常、未就绪和 session 缺失；不访问网络、不读取凭据。两个跳过项仍是可选 PyAV 集成。Ruff 0.16.0 check/format、`bash -n scripts/bootstrap.sh`、Python 3.10 语法解析和 `git diff --check` 通过。
+
+四次完整运行中有一次 `test_budget_guard.BudgetTests.test_expired_release_retries_keep_regular_poll_interval` 失败，其余三次及该模块单独 8 次运行均通过。该测试全局替换 `time.sleep` 并断言只调用一次，前序测试残留的线程睡眠可能干扰它；新代码不在其路径上（`watch()` 以 `wait=0` 调用 `tick()`），但未捕获失败信息，记为未解决的间歇性失败。
+
+### 真实 Colab 端到端（同一命名账号，用户授权使用 CU）
+
+| 步骤 | 结果 |
+| --- | --- |
+| CPU 分配与部署 | 修复前首次 `deploy`：上传冷 VM 用去约 38 秒，exec 只剩约 2 秒，返回 `kernel_connect_failed` / `not_dispatched`。分类正确，但暴露了窗口问题；改为 120 秒后 `deploy` 69.8 秒成功。 |
+| CPU 启动与生成 | install 就绪；`start --cpu --ephemeral --local-only` 约 40 秒 HTTP 就绪；PNG smoke 10.4 秒成功（64×64，421 字节，存储校验一致）。 |
+| 忙碌内核注入 | 用官方 exec 占住内核 150–170 秒。第一次运行发现 busy 门控缺陷：慢状态查询被当成空闲，结果为 `execution_timeout` / `dispatched: true`（诊断准确但门控失败）。修复并加回归测试后，两次 `kernel_busy`（未发送）自动重试；最终报告 `kernel_busy`，`attempt_codes` 列出三次尝试。 |
+| 其他注入 | 远端 `ValueError` → `remote_exception`（17.5 秒）；15 秒期限内 25 秒程序 → `execution_timeout`，13.6 秒报告且早于外层终止；不存在的 session → `session_not_found`；隔离状态目录下无登录的命名账号 `new` → 约 1 秒 `auth_required`，stderr 无网址、未生成 token。 |
+| CPU 释放 | `release` 平台核实 `released`；账号余额变化约 0.02 CU。 |
+| G4 分配 | `new` 16.6 秒直接返回 `active`、退出 0（修复前同类调用曾返回 `allocation_pending`/退出 1）。实际为 NVIDIA RTX PRO 6000 Blackwell Server Edition。 |
+| G4 准备 | deploy 16.4 秒；install 后台就绪；`prepare --ephemeral --mode download_missing` 约 16 分钟完成 8 个清单文件的下载与 SHA 校验，`models_ready: true`。 |
+| G4 生成 | 默认 I2V：57.1 秒，640×640、24 fps、解码 124 帧、5.17 秒，H.264 + AAC 立体声，`collect` 后本地 SHA 一致。T2V：42.3 秒，864×480、124 帧、5.17 秒、有音轨。上传 621,689 字节自制 PNG，并以映射参数（新 seed、自定义 prompt、`seconds=4`）加 `--export-frames` 渲染：36.5 秒，640×640、107 帧、4.46 秒、有音轨，首尾帧与视频均收集校验。同 request ID 重放只返回本地回执。 |
+| 重复启动 | 全量 re-hash 的 `prepare` 运行时提交第二个 `prepare`：`ok: false`、`not_started`、`running_request_id` 指向原请求、`terminal: true`，本地回执一致。修复前同类 render 返回 `ok: true / running` 并绑定到别人的任务。 |
+| 最终代码复核 | 加入 `predispatch_timeout` 后重新在新 CPU 实例执行 `new`（20 秒，`active`）→ `deploy`（13 秒）→ `status`（`summary.state: not_installed`）→ `release`（平台核实），官方列表无剩余会话。 |
+| 访问与清理 | `ssh_forward.py` 本机 127.0.0.1 端口 HTTP 返回 ComfyUI 0.38.0 与该 GPU；停止转发和服务，`release` 平台核实；释放后 `status` 返回 `session_not_found`。G4 共 1,646 秒，账号余额变化 3.97 CU（约 8.7 CU/h，账号级观测，非精确单实例账单）。 |
+
+本轮未覆盖：Drive 挂载与授权、浏览器 UI 与画布任务、public/email 访问、TUI 交互、真实的 503/412 分配拒绝（由运行真实 0.7.4 client 代码的 fixture 覆盖，没有为制造拒绝而占满容量）。报告不记录账号、实例 ID、私人路径或凭证；生成的媒体保存在仓库外。
+
 ## 2026-10-31 启动前更新与可恢复代码快照（离线／本机验证）
 
 在指定仓库用本地 Git 配置显式启用 `launcher.updateBeforeStart` 后，实时 dashboard 启动先检查工作树、分支和上游，再执行 `git pull --ff-only`。更新失败、未知文件、源码修改、本地领先／分叉或版本正在使用均停止，不自动 stash、reset、切账号或继续旧代码。demo/help 不触发更新。TUI生成的 `models/extra-added-*.json` 作为本机运行配置原样保留并明确忽略；未知模型文件和源码仍触发 dirty 拦截。

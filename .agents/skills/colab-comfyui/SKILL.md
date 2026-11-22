@@ -57,6 +57,19 @@ For added models, read [docs/models.md](../../../docs/models.md). Edit `models/e
 
 Busy actions appear at the top and in the first right-hand status block; blue ABOUT THIS CHOICE text in the fixed footer is help, not execution evidence. Wait for verified ComfyUI and SSH status before claiming ready. Save / Save As writes workflows into the selected storage's `user/default/workflows`; persistent Drive workflows reopen from Workflows on a later run with the same storage directory. Export downloads a local JSON; unsaved browser drafts are not a persistence test.
 
+## Read failures before acting
+
+Every failed `colabctl.py` result is one JSON object. Read `provider_error.code`, `provider_error.outcome` and `provider_error.next` (see [automation API](../../../docs/automation-api.md#provider-失败分类)) instead of guessing from the exit code or stderr:
+
+- `not_created` / `not_dispatched` (`status: not_submitted`, `resubmit_allowed: true`): nothing happened; retry with a new request ID after addressing the cause. `capacity_unavailable` and `allocation_refused` mean wait or choose other hardware; `accelerator_not_entitled` will fail again with the same GPU; `auth_required` needs the user's interactive sign-in.
+- `unknown` (`submission_unknown`, `execution_timeout`, `connection_lost`, `local_timeout`, or `command_failed` with `dispatched: null` after the CLI died): the work may have run. Query the same request ID with `job` and never resend. Re-running the same command with the same `--request-id` also only queries. For a render, `job` returns the original `prompt_id`, outputs and `execution_evidence` (`comfyui_jobs: 1`, `single_execution: true` means ComfyUI ran it once); collect with `collect --job <request-id>`.
+- `not_started` with `running_request_id`: another task of the same kind is running on that VM; wait for that request, then submit with a new ID.
+- `not_submitted` from `new` (`allocation_submitted: false`, `create_requests: 0`): preflight stopped before anything was created or recorded; with `resubmit_allowed: true` retry with the same request ID.
+- `allocation_failed` from `new`/`budget` is terminal and explains why; a new request ID may allocate again. `allocation_pending` / `allocation_unknown` stay nonterminal: poll `budget`, do not repeat `new`. When the creation reply was lost, the guard looks the runtime up by the budget job's allocation key (never a second creation); `allocation_recovered_by: allocation_key_lookup` with the original `request_id` / `job_id` and `create_requests: 1` means the same request was bound. `allocation_lookup.result: absent` keeps it pending, not failed.
+- `status` returns `summary.state`, `summary.problems` (component, phase, error, redacted log tail) and `summary.next`; use them to pick the next step, then verify the underlying fields.
+
+Report the classified cause to the user in plain words. Pre-dispatch kernel failures are retried automatically up to three times; do not add your own resend loop on top.
+
 ## CLI: allocate a runtime
 
 Read [docs/accounts.md](../../../docs/accounts.md) for the current account layout. Fresh installations name the first account before Google authorization. After an update, the wizard automatically asks users to name an existing legacy default account and migrate its dedicated CLI cache plus budgets, requests and SSH state. Escape postpones this without changing login. Existing authorization is reused; only a missing/unverified login that actually requires authorization enters the provider flow. Do not force Google reauthorization merely because storage moved.
@@ -107,6 +120,10 @@ python3 scripts/colabctl.py -s "$SESSION" status
 Wait for `model_prepare.running: false`, `model_prepare.status: succeeded`, `model_prepare.result.ok: true`, and `models_ready: true`. Per-file download/copy/hash progress appears in `model_prepare.progress`. Existing legacy Drive models are verified during copy without a separate initial Drive hash. Within the same VM, verified receipts and unchanged metadata avoid reading all model bytes again. These metadata receipts are a trusted private-cache optimization, not fresh content hashing or protection against a same-account attacker. A new VM still copies and verifies the complete current manifest (approximately 42.03 GB by default). Add `--verify-cache` only when an explicit extra Drive content audit is needed. No cross-VM distributed writer lock is provided: use one writer per Drive cache.
 
 For explicitly selected temporary GPU storage, skip Drive and use `prepare --ephemeral --download-missing --max-seconds 1800` without `--cache-root`. It streams downloads directly into the VM model directory, checks size/SHA256 before publishing each file, and avoids a second full-manifest copy. A verified metadata receipt is reusable only on the same VM boot; metadata reuse is not a new SHA. Wait for all models_ready gates, then start with `--ephemeral --local-only`. Models and outputs are lost when the VM is released.
+
+Upload several inputs in one call (`upload a.png b.png ref.mp4`): one staged bundle sent in resendable parts, published only when every file's SHA256 matches (`assets`, `parts`, `part_attempts`). It avoids ~1.5 minutes of fixed overhead per file through slow links; one failed part is resent, never the whole set.
+
+To prepare only the models a workflow actually loads, pass `--only FILE` (repeatable) to `prepare` instead of editing `models/*.json`; unknown names fail before any transfer. `start` and `models_ready` then require exactly that selection (`status.models_selection`); a later full prepare clears it.
 
 CPU `--ephemeral --cpu` network/PNG tests do not require H3 preparation or Drive. Code, dependencies, model loading and progress records remain on VM disk. Persistent runs save output files under the selected Drive storage root; ephemeral output survives only while that VM is retained.
 

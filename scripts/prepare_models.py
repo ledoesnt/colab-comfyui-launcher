@@ -39,14 +39,72 @@ def local_models_root(path=None):
     return cache.models_root(selected, True)
 
 
-def local_cache_ready(root, manifest_path, extra_manifest_paths=()):
-    """Small metadata checks only; intended for the service's pre-start guard."""
+# Written by a successful `prepare --only`; the pre-start guard then requires
+# exactly these pinned files. A full prepare removes it.
+SELECTION_NAME = ".launcher-model-selection.json"
+
+
+def select_files(manifest, names):
+    """Restrict a merged manifest to named pinned files (path or file name)."""
+    chosen = []
+    for name in dict.fromkeys(names):
+        matches = [
+            item
+            for item in manifest["files"]
+            if name in (item["path"], Path(item["path"]).name)
+        ]
+        if len(matches) != 1:
+            raise cache.DownloadError(
+                f"--only {name!r} matches {len(matches)} enabled pinned model files; "
+                "name exactly one file from the manifests"
+            )
+        if matches[0] not in chosen:
+            chosen.append(matches[0])
+    return dict(
+        manifest,
+        files=chosen,
+        total_size_bytes=sum(item["size_bytes"] for item in chosen),
+    )
+
+
+def read_selection(root):
+    """Selected paths, or None for the full manifest; malformed means none ready."""
+    path = Path(root) / SELECTION_NAME
+    cache.check_path(path, Path(root))
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    paths = value.get("paths") if isinstance(value, dict) else None
+    if not paths or not all(isinstance(item, str) for item in paths):
+        raise ValueError("Model selection record is malformed")
+    return paths
+
+
+def write_selection(root, paths):
+    path = Path(root) / SELECTION_NAME
+    if paths is None:
+        cache.check_path(path, Path(root))
+        path.unlink(missing_ok=True)
+        return
+    cache.atomic_json(path, {"version": 1, "paths": list(paths)}, Path(root))
+
+
+def local_cache_ready(root, manifest_path, extra_manifest_paths=(), selection=False):
+    """Small metadata checks only; intended for the service's pre-start guard.
+
+    ``selection`` False reads the recorded `prepare --only` selection; None
+    checks the full manifest; a list checks exactly those paths.
+    """
     try:
         expected = cache.CONTENT_ROOT / "colab-comfyui-runtime" / "models"
         if Path(root) != expected or not expected.is_dir():
             return False
         cache.check_path(expected, expected.parent)
         manifest = cache.load_manifests(manifest_path, extra_manifest_paths)
+        if selection is False:
+            selection = read_selection(expected)
+        if selection is not None:
+            manifest = select_files(manifest, selection)
         receipts = cache.Receipts(
             expected, manifest["repo_id"], manifest["revision"], boot_id()
         )
@@ -258,6 +316,10 @@ def run(args):
     with cache.time_budget(args.max_seconds) as deadline:
         extra_manifests = getattr(args, "extra_manifest", ())
         manifest = cache.load_manifests(args.manifest, extra_manifests)
+        only = getattr(args, "only", None) or None
+        if only:
+            manifest = select_files(manifest, only)
+        selection = [item["path"] for item in manifest["files"]] if only else None
         ephemeral = getattr(args, "ephemeral", False)
         if ephemeral and args.cache_root is not None:
             raise cache.DownloadError(
@@ -275,8 +337,11 @@ def run(args):
                 results = prepare_drive(
                     args, manifest, source, local, deadline, progress
                 )
-            if not local_cache_ready(local, args.manifest, extra_manifests):
+            if not local_cache_ready(
+                local, args.manifest, extra_manifests, selection=selection
+            ):
                 raise cache.DownloadError("Prepared local model receipts are not ready")
+            write_selection(local, selection)
             progress.finish(True)
         except BaseException:
             progress.finish(False)
@@ -292,6 +357,7 @@ def run(args):
             "workers": workers,
             "copy_workers": 1,
             "models_ready": True,
+            "models_selection": selection,
             "files": results,
             "total_size_bytes": sum(item["size_bytes"] for item in manifest["files"]),
         }
@@ -388,6 +454,16 @@ def main(argv=None):
         "--mode",
         choices=("verify_only", "download_missing"),
         help="verify_only prepares existing pinned files without network downloads; download_missing also fetches missing files",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help=(
+            "Prepare only this enabled pinned file (path or file name; repeat). "
+            "The service start guard then requires exactly the selected files"
+        ),
     )
     parser.add_argument(
         "--progress-file",

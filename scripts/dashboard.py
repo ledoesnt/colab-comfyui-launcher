@@ -35,6 +35,7 @@ from typing import Any, ClassVar
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
+import provider_errors
 from accounts import (
     AccountStore,
     account_context,
@@ -437,6 +438,9 @@ class Backend:
         except OSError as exc:
             raise DashboardError(safe_error(exc)) from exc
         if completed.returncode:
+            diagnostic, _ = provider_errors.parse(completed.stderr or "")
+            if diagnostic is not None:
+                raise DashboardError(provider_errors.describe(diagnostic))
             raise DashboardError(safe_error(completed.stderr or completed.stdout))
         return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", completed.stdout)
 

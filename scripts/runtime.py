@@ -35,6 +35,32 @@ def read_json(path):
     return json.loads(path.read_text()) if path.exists() else {}
 
 
+def log_tail(name, lines=20):
+    """Last lines of an owned log, redacted, so callers need no shell access."""
+    path = BASE / "logs" / name
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 16384))
+            text = stream.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"https?://[^\s\"'<>]+", "[redacted URL]", text)
+    text = re.sub(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b", "[redacted email]", text)
+    text = re.sub(
+        r"(?i)([\"']?\b(?:[\w-]*(?:token|secret|password|passphrase)|"
+        r"api[_-]?key|authorization[_-]?code)\b[\"']?\s*[=:]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        r"\1[redacted]",
+        text,
+    )
+    kept = [line for line in text.splitlines() if line.strip()][-lines:]
+    return [line[-300:] for line in kept] or None
+
+
 def process_stamp(pid):
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
@@ -138,19 +164,33 @@ def storage_root(args):
     return root
 
 
+def _prepare_module():
+    helper = Path(__file__).with_name("prepare_models.py")
+    if not helper.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("launcher_prepare", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def local_models_ready():
     """Check local verification receipts without rereading multi-GB weights."""
-    helper = Path(__file__).with_name("prepare_models.py")
     manifest = Path(__file__).resolve().parents[1] / "models/h3.json"
-    if not helper.is_file():
-        return False
     try:
-        spec = importlib.util.spec_from_file_location("launcher_prepare", helper)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return bool(module.local_cache_ready(BASE / "models", manifest))
+        module = _prepare_module()
+        return bool(module and module.local_cache_ready(BASE / "models", manifest))
     except (OSError, ValueError, RuntimeError, AttributeError):
         return False
+
+
+def models_selection():
+    """Paths chosen by `prepare --only`, or None when the full manifest applies."""
+    try:
+        module = _prepare_module()
+        return module.read_selection(BASE / "models") if module else None
+    except (OSError, ValueError, RuntimeError, AttributeError):
+        return None
 
 
 def hardware_info():
@@ -246,8 +286,9 @@ def start(args):
         "startup_request_id": getattr(args, "request_id", None) or uuid.uuid4().hex,
     }
     progress = BASE / "startup-progress.json"
+    phase = "comfyui"
     write_json(
-        progress, {"status": "starting", "phase": "comfyui", "updated_at": time.time()}
+        progress, {"status": "starting", "phase": phase, "updated_at": time.time()}
     )
     comfy = [
         str(BASE / ".venv/bin/python"),
@@ -297,9 +338,10 @@ def start(args):
                 "local_models_root": str(model_root),
                 "access_mode": "local",
             }
+        phase = "cloudflare"
         write_json(
             progress,
-            {"status": "starting", "phase": "cloudflare", "updated_at": time.time()},
+            {"status": "starting", "phase": phase, "updated_at": time.time()},
         )
         log = BASE / "logs/cloudflared.log"
         log.write_text("")
@@ -348,14 +390,27 @@ def start(args):
             if time.monotonic() > deadline:
                 raise TimeoutError("Tunnel URL timed out")
             time.sleep(1)
-    except BaseException:
+    except BaseException as exc:
         kill_owned(state.get("cloudflared"))
         kill_owned(state.get("comfyui"))
         state["status"] = "failed"
         write_json(STATE, state)
         write_json(
             progress,
-            {"status": "failed", "phase": "startup", "updated_at": time.time()},
+            {
+                "status": "failed",
+                "phase": phase,
+                "error": type(exc).__name__ + ": " + str(exc)[:300],
+                "log": str(
+                    BASE
+                    / "logs"
+                    / ("comfyui.log" if phase == "comfyui" else "cloudflared.log")
+                ),
+                "log_tail": log_tail(
+                    "comfyui.log" if phase == "comfyui" else "cloudflared.log"
+                ),
+                "updated_at": time.time(),
+            },
         )
         raise
 
@@ -383,9 +438,12 @@ def status(_args):
     state = read_json(STATE)
     drive_mounted = os.path.ismount("/content/drive")
     mydrive = Path("/content/drive/MyDrive")
+    installation = read_json(BASE / "install.json")
+    if installation.get("status") in ("failed", "interrupted"):
+        installation["log_tail"] = log_tail("install.log")
     return {
         "ok": True,
-        "installation": read_json(BASE / "install.json"),
+        "installation": installation,
         "comfyui_alive": alive(state.get("comfyui")),
         "tunnel_alive": alive(state.get("cloudflared")),
         "http_ready": healthy(),
@@ -395,6 +453,7 @@ def status(_args):
         "configuration": recorded_configuration(state),
         "local_models_root": state.get("local_models_root", str(BASE / "models")),
         "models_ready": local_models_ready(),
+        "models_selection": models_selection(),
         "model_loading": state.get("model_loading"),
         "model_search_categories": state.get("model_search_categories"),
         "runtime": hardware_info(),

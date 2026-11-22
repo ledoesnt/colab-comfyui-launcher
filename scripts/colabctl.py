@@ -26,11 +26,15 @@ REMOTE_ROOT = "/content/colab-comfyui-launcher"
 REMOTE_STATE = "/content/colab-comfyui-runtime"
 RESULT_PREFIX = "LAUNCHER_RESULT="
 REMOTE_EXEC_TIMEOUT = 60
+# Pre-dispatch failures (connect, busy kernel, network) cannot duplicate work.
+EXEC_ATTEMPTS = 3
+RETRY_MIN_SECONDS = 15.0
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 if str(PROJECT_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import operation_deadline as submission
+import provider_errors
 from accounts import (
     account_context,
     account_id,
@@ -75,8 +79,66 @@ def sanitize_failure(value: str) -> str:
     return "\n".join(value.strip().splitlines()[-8:])[-2000:]
 
 
+UPGRADE_NOTICE = re.compile(
+    r"^\[colab\] (?:A new version of Colab CLI|You can run 'colab update|Run '"
+    r"(?:colab update|uv tool install|pip install)|To silence this check).*$",
+    re.MULTILINE,
+)
+
+
 def _failure_summary(completed: subprocess.CompletedProcess[str]) -> str:
-    return sanitize_failure(completed.stderr + "\n" + completed.stdout)
+    _, stderr = provider_errors.parse(completed.stderr or "")
+    text = UPGRADE_NOTICE.sub("", stderr + "\n" + (completed.stdout or ""))
+    # The shim's human line repeats the classified message callers already show.
+    text = re.sub(r"^\[colab-launcher\] .*$", "", text, flags=re.MULTILINE)
+    return sanitize_failure(text)
+
+
+def provider_failure(
+    completed: subprocess.CompletedProcess[str], command: str, session: str
+) -> dict[str, Any]:
+    """The shim's classified diagnostic, else a fixed-message fallback."""
+    diagnostic, stderr = provider_errors.parse(completed.stderr or "")
+    return diagnostic or provider_errors.fallback(
+        command,
+        completed.stdout or "",
+        stderr,
+        completed.returncode,
+        session=session,
+    )
+
+
+def bridge_result(diagnostic: dict[str, Any], attempts: int = 1) -> dict[str, Any]:
+    """Map a provider diagnostic to the request protocol fields agents read."""
+    outcome = diagnostic["outcome"]
+    status = {
+        "not_dispatched": "not_submitted",
+        "not_created": "not_submitted",
+        "failed": "failed",
+        "none": "failed",
+    }.get(outcome, "submission_unknown")
+    result: dict[str, Any] = {
+        "status": status,
+        "provider_error": provider_errors.public(diagnostic),
+        "this_call_dispatched": diagnostic["dispatched"],
+        "attempts": attempts,
+    }
+    if status == "not_submitted":
+        result.update(
+            terminal=True,
+            job_may_still_be_running=False,
+            resubmit_allowed=True,
+            this_call_dispatched=False,
+        )
+    elif status == "submission_unknown":
+        result.update(
+            terminal=False, job_may_still_be_running=True, resubmit_allowed=False
+        )
+    else:
+        result.update(
+            terminal=True, job_may_still_be_running=False, resubmit_allowed=False
+        )
+    return result
 
 
 def _run_colab(
@@ -84,22 +146,39 @@ def _run_colab(
 ) -> subprocess.CompletedProcess[str]:
     executable = shutil.which("colab")
     if not executable:
-        raise BridgeError("Official colab CLI was not found on PATH.")
+        diagnostic = dict(
+            provider_errors.classify({"command": arguments[0] if arguments else None}),
+            code="cli_unavailable",
+            outcome="not_dispatched",
+            retryable=False,
+        )
+        raise BridgeError(
+            "Official colab CLI was not found on PATH.",
+            result=bridge_result(diagnostic),
+        )
+    seconds = submission.timeout(timeout)
     try:
         completed = subprocess.run(
-            colab_command(arguments, executable=executable),
+            colab_command(arguments, executable=executable, deadline=seconds),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=submission.timeout(timeout),
+            timeout=seconds,
             check=False,
         )
         if "[colab] A new version of Colab CLI is available:" in completed.stdout:
             print("Colab CLI reported an available upgrade.", file=sys.stderr)
         return completed
     except subprocess.TimeoutExpired as exc:
+        diagnostic = dict(
+            provider_errors.classify({"command": arguments[0] if arguments else None}),
+            code="local_timeout",
+            outcome="unknown",
+            retryable=False,
+        )
         raise BridgeError(
-            "Local Colab command timed out. Check status before repeating an operation."
+            provider_errors.describe(diagnostic, seconds=round(seconds)),
+            result=bridge_result(diagnostic),
         ) from exc
     except submission.DeadlineExceeded:
         raise
@@ -156,6 +235,23 @@ def redact(text):
     )
     return "\\n".join(text.strip().splitlines()[-6:])[-1200:]
 
+def not_started(task, record_path):
+    # A duplicate launch started nothing; name the request that is running.
+    # Returning ok/running here would bind this request ID to someone else's
+    # task, and its job record would then report "running" forever.
+    try:
+        holder = json.loads(record_path.read_text()).get('request_id')
+    except (OSError, ValueError, AttributeError):
+        holder = None
+    owner = ' (request ' + holder + ')' if isinstance(holder, str) else ''
+    return {'ok': False, 'status': 'not_started', 'reason': task + '_already_running',
+            'already_running': True, 'running_request_id': holder, 'task': task,
+            'terminal': True, 'job_may_still_be_running': False, 'resubmit_allowed': True,
+            'this_request_started': False,
+            'error': 'Another ' + task + ' task' + owner + ' is already running on this '
+                     'runtime; this request was not started. Wait for it to finish, then '
+                     'submit again with a new request ID.'}
+
 def atomic_json(path, data):
     temporary = path.with_name(path.name + '.tmp-' + uuid.uuid4().hex)
     descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
@@ -205,12 +301,12 @@ def install(payload):
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return {'ok': True, 'status': 'installing', 'already_running': True, 'installed': False}
+            return dict(not_started('install', state / 'install-launch.json'), installed=False)
         with (state / 'install.lock').open('a') as bootstrap_lock:
             try:
                 fcntl.flock(bootstrap_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return {'ok': True, 'status': 'installing', 'already_running': True, 'installed': False}
+                return dict(not_started('install', state / 'install-launch.json'), installed=False)
         script = Path('/content/colab-comfyui-launcher/scripts/bootstrap.sh')
         if not script.is_file():
             raise RuntimeError('Deploy the launcher before installing dependencies.')
@@ -391,6 +487,8 @@ def background_arguments(payload):
             arguments.append('--verify-cache')
         if payload.get('download_missing'):
             arguments.append('--download-missing')
+        for name in payload.get('only') or []:
+            arguments.extend(['--only', name])
     else:
         workflow = payload.get('workflow', 'h3-i2v-api.json')
         if payload.get('workflow_data') is not None:
@@ -426,8 +524,7 @@ def run_background(payload):
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return {'ok': True, 'status': 'running', 'already_running': True,
-                    'task': payload['action']}
+            return not_started(payload['action'], process_path)
         background_arguments(payload)
         atomic_json(result_path, {'ok': True, 'status': 'starting', 'deadline_seconds': payload['max_seconds'],
                                  'request_id': payload.get('request_id')})
@@ -481,7 +578,7 @@ def start_service(payload):
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return {'ok': True, 'status': 'starting', 'already_running': True}
+            return not_started('start', state / 'start-result.json')
         if not (state / '.venv/bin/python').is_file():
             raise RuntimeError('Installation must be ready before starting services.')
         payload = dict(payload, request_id=payload.get('request_id') or uuid.uuid4().hex)
@@ -581,6 +678,7 @@ def job_status(identifier):
     path = request_path(identifier)
     if not path.exists():
         return {'ok': False, 'status': 'not_found', 'request_id': identifier, 'job_id': identifier,
+                'terminal': False, 'resubmit_allowed': False,
                 'error': 'No remote request record; an earlier uncertain submission must not be repeated automatically.'}
     record = json.loads(path.read_text())
     result = record.get('result')
@@ -606,6 +704,8 @@ def job_status(identifier):
                         raise ValueError('Invalid render query response')
                     render_record = safe_result(queried['result'])
                     response['query_state'] = queried.get('query_state', 'verified')
+                    if isinstance(queried.get('execution_evidence'), dict):
+                        response['execution_evidence'] = safe_result(queried['execution_evidence'])
                     if queried.get('ok') is not True:
                         response['query_error'] = safe_result(queried.get('error', 'Render query unavailable.'))
                 except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -727,7 +827,8 @@ try:
     try:
         result = json.loads(completed.stdout.strip())
     except (ValueError, TypeError):
-        raise RuntimeError('Task did not return a single valid JSON result.')
+        raise RuntimeError('Task did not return a single valid JSON result. stderr: '
+                           + redact(completed.stderr or 'empty'))
     if not isinstance(result, dict) or not isinstance(result.get('ok'), bool):
         raise RuntimeError('Task result must contain a boolean ok field.')
     if completed.returncode != 0 and result['ok'] is True:
@@ -779,22 +880,60 @@ print({RESULT_PREFIX!r} + json.dumps(result, ensure_ascii=True))
 def execute_remote(
     session: str, payload: dict[str, Any], timeout: float
 ) -> dict[str, Any]:
+    """Run one launcher program; retry only while the shim proves nothing was sent."""
+    cutoff = time.monotonic() + submission.timeout(timeout)
+    attempts = 0
+    seen: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="colab-launcher-exec-") as temporary:
         path = Path(temporary) / "remote_operation.py"
         path.write_text(remote_program(payload), encoding="utf-8")
         path.chmod(0o600)
-        completed = _run_colab(
-            [
-                "exec",
-                "-s",
-                session,
-                "-f",
-                str(path),
-                "--timeout",
-                str(REMOTE_EXEC_TIMEOUT),
-            ],
-            timeout,
-        )
+        while True:
+            attempts += 1
+            completed = _run_colab(
+                [
+                    "exec",
+                    "-s",
+                    session,
+                    "-f",
+                    str(path),
+                    "--timeout",
+                    str(REMOTE_EXEC_TIMEOUT),
+                ],
+                max(1.0, cutoff - time.monotonic()),
+            )
+            if completed.returncode == 0 or RESULT_PREFIX in (completed.stdout or ""):
+                break
+            diagnostic = provider_failure(completed, "exec", session)
+            seen.append(diagnostic)
+            left = cutoff - time.monotonic()
+            if (
+                diagnostic["outcome"] == "not_dispatched"
+                and diagnostic["code"] in provider_errors.PREDISPATCH_RETRY
+                and attempts < EXEC_ATTEMPTS
+                and left > RETRY_MIN_SECONDS
+            ):
+                print(
+                    f"Retrying remote operation after {diagnostic['code']} "
+                    "(nothing was sent).",
+                    file=sys.stderr,
+                )
+                time.sleep(min(2.0 * attempts, left - RETRY_MIN_SECONDS))
+                continue
+            if diagnostic["code"] == "kernel_connect_failed":
+                # A final attempt cut short by the deadline is less telling
+                # than an earlier busy kernel; both mean nothing was sent.
+                diagnostic = next(
+                    (item for item in seen if item["code"] == "kernel_busy"),
+                    diagnostic,
+                )
+            detail = _failure_summary(completed)
+            message = provider_errors.describe(diagnostic)
+            result = bridge_result(diagnostic, attempts)
+            result["attempt_codes"] = [item["code"] for item in seen]
+            raise BridgeError(
+                f"{message}\n{detail}" if detail else message, result=result
+            )
     try:
         result = parse_result(completed.stdout)
     except BridgeError as exc:
@@ -806,6 +945,8 @@ def execute_remote(
         raise BridgeError(
             "Colab command exited unsuccessfully. " + _failure_summary(completed)
         )
+    if attempts > 1:
+        result["attempts"] = attempts
     return result
 
 
@@ -885,8 +1026,15 @@ def deploy(session: str, timeout: float, payload: dict | None = None) -> dict[st
             timeout,
         )
         if completed.returncode != 0:
+            diagnostic = provider_failure(completed, "upload", session)
+            # The deploy program itself was never sent.
+            diagnostic = dict(diagnostic, outcome="not_dispatched")
             raise BridgeError(
-                "Deployment upload failed. " + _failure_summary(completed)
+                "Deployment upload failed. "
+                + provider_errors.describe(diagnostic)
+                + " "
+                + _failure_summary(completed),
+                result=bridge_result(diagnostic),
             )
         return execute_remote(
             session,
@@ -1007,7 +1155,15 @@ def parser() -> argparse.ArgumentParser:
             "per step. CU work_deadline and any hold_deadline can shorten it."
         ),
     )
-    upload.add_argument("source", type=Path)
+    upload.add_argument(
+        "source",
+        type=Path,
+        nargs="+",
+        help=(
+            "Input file; several files are sent as one staged bundle in "
+            "resendable parts and published only after every SHA256 matches"
+        ),
+    )
     collect = actions.add_parser(
         "collect",
         help="Collect and verify outputs into an instance/job directory",
@@ -1105,6 +1261,17 @@ def parser() -> argparse.ArgumentParser:
         choices=("verify_only", "download_missing"),
         help="Explicit preparation policy; default verify_only",
     )
+    prepare.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help=(
+            "Prepare only this pinned model file (name or manifest path; repeat), "
+            "for example the models one workflow loads. Manifests are not edited; "
+            "start then requires exactly the selected files"
+        ),
+    )
     render = actions.add_parser(
         "render", help="Start bounded execution of the deployed H3 API workflow"
     )
@@ -1191,12 +1358,19 @@ def command_payload(arguments) -> dict[str, Any]:
                 raise ValueError("--ephemeral cannot be combined with --cache-root.")
             if arguments.cache_root and not arguments.cache_root.startswith("/"):
                 raise ValueError("Cache root must be an absolute runtime path.")
+            for name in arguments.only:
+                if not re.fullmatch(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*", name) or (
+                    ".." in name.split("/")
+                ):
+                    raise ValueError("--only must name a model file or manifest path.")
             payload.update(
                 cache_root=arguments.cache_root,
                 ephemeral=arguments.ephemeral,
                 verify_cache=arguments.verify_cache,
                 download_missing=arguments.download_missing,
             )
+            if arguments.only:
+                payload["only"] = list(dict.fromkeys(arguments.only))
     elif arguments.action == "start":
         if arguments.allowed_email and not re.fullmatch(
             r"[^\s@]+@[^\s@]+\.[^\s@]+", arguments.allowed_email
@@ -1242,9 +1416,112 @@ def assignment(session: str) -> dict:
     return dict(matches[0], account_scope=scope)
 
 
+def status_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """One agent-readable verdict derived only from fields status returned.
+
+    ``problems`` lists failed components with their phase, error and a
+    redacted log tail; ``next`` is the single recommended action. It never
+    replaces the underlying fields, and it never proves browser access.
+    """
+    problems: list[dict[str, Any]] = []
+
+    def problem(component, record, **extra):
+        record = record if isinstance(record, dict) else {}
+        nested = record.get("result") if isinstance(record.get("result"), dict) else {}
+        progress = (
+            record.get("progress") if isinstance(record.get("progress"), dict) else {}
+        )
+        entry = {
+            "component": component,
+            "status": record.get("status"),
+            "phase": record.get("phase") or progress.get("phase"),
+            "error": record.get("error")
+            or nested.get("error")
+            or progress.get("error"),
+            "log_tail": record.get("log_tail") or progress.get("log_tail"),
+            **extra,
+        }
+        problems.append({key: value for key, value in entry.items() if value})
+
+    installation = result.get("installation") or {}
+    install_status = installation.get("status")
+    if install_status in ("failed", "interrupted"):
+        problem("installation", installation, exit_code=installation.get("exit_code"))
+    for name in ("model_prepare", "model_download", "render"):
+        task = result.get(name) or {}
+        if task.get("status") in ("failed", "interrupted", "stopped"):
+            problem(name, task)
+    startup = result.get("startup") or {}
+    progress = startup.get("progress") or {}
+    if startup.get("status") == "failed" or progress.get("status") == "failed":
+        problem("startup", startup)
+    services_up = bool(result.get("comfyui_alive") and result.get("http_ready"))
+    cpu = (result.get("configuration") or {}).get("cpu")
+    gpu = bool((result.get("runtime") or {}).get("gpu_name"))
+    budget = result.get("budget") or {}
+
+    if budget.get("managed") and budget.get("status") not in (
+        "active",
+        "holding",
+        "collect_only",
+    ):
+        state, step = (
+            "budget_blocked",
+            (
+                f"Budget status is {budget.get('status')}; new work is blocked. "
+                "Inspect 'budget' before any action."
+            ),
+        )
+    elif not result.get("deployed"):
+        state, step = "not_deployed", "Run deploy."
+    elif install_status in ("failed", "interrupted"):
+        state, step = (
+            "install_failed",
+            ("Read problems[installation]; fix the cause, then run install again."),
+        )
+    elif install_status == "installing":
+        state, step = (
+            "installing",
+            "Wait, then poll status until installation is ready.",
+        )
+    elif install_status != "ready":
+        state, step = "not_installed", "Run install."
+    elif services_up:
+        state, step = (
+            "ready",
+            (
+                "ComfyUI is running; local-only access needs ssh_forward.py start."
+                if result.get("access_mode") == "local"
+                else "ComfyUI is running."
+            ),
+        )
+    elif startup.get("status") == "starting" or progress.get("status") == "starting":
+        state, step = "starting", "Wait, then poll status until http_ready is true."
+    elif (result.get("model_prepare") or {}).get("running"):
+        state, step = "preparing_models", "Wait for model_prepare to finish."
+    elif gpu and cpu is not True and not result.get("models_ready"):
+        state, step = "models_missing", "Run prepare before starting GPU services."
+    elif any(item["component"] == "startup" for item in problems):
+        state, step = (
+            "start_failed",
+            ("Read problems[startup]; run stop, fix the cause, then start again."),
+        )
+    else:
+        state, step = "installed", "Run start with one explicit access mode."
+    return {"state": state, "problems": problems, "next": step}
+
+
 def safe_structure(value):
     if isinstance(value, dict):
-        return {key: safe_structure(item) for key, item in value.items()}
+        sanitized = {key: safe_structure(item) for key, item in value.items()}
+        if value.get("code") in provider_errors.CODES and "outcome" in value:
+            # Classified fields are validated one by one; string sanitizing
+            # would rewrite an exception class name such as ReadTimeout as prose.
+            checked = provider_errors.validate(dict(value, v=provider_errors.VERSION))
+            sanitized.update(
+                (key, item) for key, item in (checked or {}).items() if key in value
+            )
+        return sanitized
     if isinstance(value, list):
         return [safe_structure(item) for item in value]
     return sanitize_failure(value) if isinstance(value, str) else value
@@ -1309,7 +1586,9 @@ def submit_command(arguments, payload: dict) -> dict:
     now = manager.clock()
     snapshot = manager.status(arguments.session)
     work_not_after = now + seconds if seconds is not None else None
-    send_seconds = min(arguments.timeout, 45)
+    send_seconds = min(
+        arguments.timeout, submission.submission_window(payload["action"])
+    )
     if snapshot.get("managed"):
         work = (
             snapshot["release_deadline"]
@@ -1581,7 +1860,22 @@ def run_command(arguments, payload: dict) -> dict:
                     nested = manifest[key]
                     if nested.get("status") == "succeeded":
                         manifest = {**manifest, **nested}
-        allowed = budget_manager().authorize(session, action, arguments.timeout)
+        from budget_guard import BudgetError
+
+        try:
+            allowed = budget_manager().authorize(session, action, arguments.timeout)
+        except BudgetError as error:
+            # Refused before any transfer: nothing was sent, a retry is safe.
+            raise BridgeError(
+                str(error),
+                result={
+                    "status": "not_submitted",
+                    "terminal": True,
+                    "resubmit_allowed": True,
+                    "this_call_dispatched": False,
+                    "reason": "budget_admission",
+                },
+            ) from error
         seconds = (
             min(arguments.timeout, allowed)
             if allowed is not None
@@ -1617,12 +1911,48 @@ def run_command(arguments, payload: dict) -> dict:
             checked_identity,
             timeout=seconds,
         )
-        if action == "upload":
-            return client.upload(arguments.source)
-        return client.collect(manifest, arguments.destination, job_id=arguments.job)
+        from assets import AssetsError
+
+        try:
+            if action == "upload":
+                if len(arguments.source) == 1:
+                    return client.upload(arguments.source[0])
+                return client.upload_many(arguments.source)
+            return client.collect(manifest, arguments.destination, job_id=arguments.job)
+        except BudgetError as error:
+            # Refused at an identity check between steps: inputs are published
+            # only by the final commit, outputs only after verification.
+            raise BridgeError(
+                str(error),
+                result={
+                    "status": "not_published"
+                    if action == "upload"
+                    else "not_completed",
+                    "terminal": True,
+                    "resubmit_allowed": True,
+                    "reason": "budget_admission",
+                    "next": "Nothing was published; check 'budget', then repeat the "
+                    "same transfer (inputs are content-addressed).",
+                },
+            ) from error
+        except (AssetsError, BridgeError) as error:
+            if allowed is None or allowed >= arguments.timeout:
+                raise
+            # Say why the window was short: the CU budget's protection point,
+            # which also counts other instances' spend on the same account.
+            limited = round(allowed)
+            raise BridgeError(
+                f"{error}\nThe CU budget allowed only {limited}s for this transfer "
+                "(work or release deadline at the conservative account rate); "
+                "check 'budget' before retrying.",
+                result=dict(
+                    getattr(error, "result", None) or {}, budget_limited_seconds=limited
+                ),
+            ) from error
     if action == "status":
         result = execute_remote(session, payload, arguments.timeout)
         result["budget"] = budget_manager().status(session)
+        result["summary"] = status_summary(result)
         result["recent_requests"] = [
             {
                 key: row.get(key)
@@ -1658,6 +1988,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - always emit structured errors at the CLI boundary.
         result = dict(getattr(exc, "result", None) or {})
         result.update(ok=False)
+        diagnostic = getattr(exc, "diagnostic", None)
+        if isinstance(diagnostic, dict) and "provider_error" not in result:
+            result["provider_error"] = provider_errors.public(diagnostic)
         result.setdefault(
             "status", "invalid_arguments" if isinstance(exc, ValueError) else "failed"
         )
