@@ -1135,9 +1135,13 @@ def parser() -> argparse.ArgumentParser:
         "hold", help="Retain a managed idle VM for a bounded period"
     )
     hold.add_argument("--seconds", type=positive_seconds, required=True)
-    actions.add_parser(
+    release = actions.add_parser(
         "release",
         help="Release only this allocation and verify absence on the platform",
+    )
+    release.add_argument(
+        "--if-assignment-sha256",
+        help="Require the same allocation as the selected session list entry",
     )
     job = actions.add_parser(
         "job", help="Query a durable request after any client restart"
@@ -1742,7 +1746,7 @@ def _submit_command_under_lease(
         raise BridgeError(result["error"], result=result) from exc
 
 
-def release_unmanaged(arguments) -> dict:
+def release_unmanaged(arguments, selected: dict | None = None) -> dict:
     """Persist explicit release identity so a timeout can be retried safely."""
     receipts = ClientRequests(arguments.session)
     identifier = arguments.request_id
@@ -1753,7 +1757,12 @@ def release_unmanaged(arguments) -> dict:
             (
                 row
                 for row in receipts.list()
-                if row["action"] == "release" and row.get("status") != "released"
+                if row["action"] == "release"
+                and row.get("status") != "released"
+                and (
+                    selected is None
+                    or row.get("assignment_id") == selected["assignment_id"]
+                )
             ),
             {},
         )
@@ -1761,6 +1770,8 @@ def release_unmanaged(arguments) -> dict:
     if previous:
         if previous["action"] != "release":
             raise ValueError("request_id belongs to a different action.")
+        if selected and previous["assignment_id"] != selected["assignment_id"]:
+            raise BridgeError("Release request belongs to another allocation.")
         identifier = previous["request_id"]
         if previous.get("status") == "released":
             return dict(previous["result"], source="local_receipt")
@@ -1770,7 +1781,7 @@ def release_unmanaged(arguments) -> dict:
             "account_scope": previous["account_scope"],
         }
     else:
-        current = assignment(arguments.session)
+        current = selected or assignment(arguments.session)
         identifier = identifier or uuid.uuid4().hex
         payload = {
             "action": "release",
@@ -1832,9 +1843,23 @@ def run_command(arguments, payload: dict) -> dict:
     if action == "hold":
         return budget_manager().hold(session, arguments.seconds)
     if action == "release":
-        managed = budget_manager().status(session)
+        manager = budget_manager()
+        managed = manager.status(session)
+        if arguments.if_assignment_sha256 is not None:
+            selected = assignment(session)
+            identity = selected["assignment_id"]
+            if (
+                hashlib.sha256(identity.encode()).hexdigest()
+                != arguments.if_assignment_sha256
+            ):
+                raise BridgeError(
+                    "The listed allocation changed. Refresh the runtime list and select it again."
+                )
+            if managed.get("managed") and not managed.get("terminal"):
+                return manager.release(session, expected_assignment=identity)
+            return release_unmanaged(arguments, selected)
         if managed.get("managed"):
-            return budget_manager().release(session)
+            return manager.release(session)
         return release_unmanaged(arguments)
     if action == "jobs":
         return {

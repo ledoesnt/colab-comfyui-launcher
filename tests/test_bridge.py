@@ -2,6 +2,7 @@
 
 import ast
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -21,6 +22,53 @@ spec = importlib.util.spec_from_file_location(
 bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
 import budget_guard as budget
+
+
+class ListedReleaseTests(unittest.TestCase):
+    def test_list_release_ignores_an_old_receipt_for_the_same_name(self):
+        selected = {"assignment_id": "current-id", "account_scope": "fixture-scope"}
+        digest = hashlib.sha256(b"current-id").hexdigest()
+        args = bridge.parser().parse_args(
+            ["-s", "target", "release", "--if-assignment-sha256", digest]
+        )
+        with (
+            mock.patch.object(bridge, "assignment", return_value=selected),
+            mock.patch.object(bridge, "budget_manager") as manager,
+            mock.patch.object(bridge, "ClientRequests") as receipts,
+            mock.patch.object(bridge, "provider") as api,
+        ):
+            manager.return_value.status.return_value = {
+                "managed": True,
+                "terminal": True,
+            }
+            receipts.return_value.list.return_value = [
+                {"action": "release", "status": "pending", "assignment_id": "old-id"}
+            ]
+            api.return_value.verified_release.return_value = {
+                "status": "released",
+                "verified": True,
+            }
+            self.assertTrue(bridge.run_command(args, {})["verified"])
+            api.return_value.verified_release.assert_called_once_with(
+                "target", "current-id", expected_scope="fixture-scope"
+            )
+            manager.return_value.release.assert_not_called()
+
+    def test_changed_allocation_under_the_same_name_is_kept(self):
+        args = bridge.parser().parse_args(
+            ["-s", "target", "release", "--if-assignment-sha256", "b" * 64]
+        )
+        with (
+            mock.patch.object(
+                bridge, "assignment", return_value={"assignment_id": "replacement"}
+            ),
+            mock.patch.object(bridge, "budget_manager") as manager,
+            mock.patch.object(bridge, "release_unmanaged") as unmanaged,
+        ):
+            with self.assertRaisesRegex(bridge.BridgeError, "allocation changed"):
+                bridge.run_command(args, {})
+            manager.return_value.release.assert_not_called()
+            unmanaged.assert_not_called()
 
 
 class BackgroundBridgeTests(unittest.TestCase):

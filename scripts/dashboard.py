@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import curses
+import hashlib
 import importlib.util
 import json
 import math
@@ -47,6 +48,7 @@ from accounts import (
     launcher_arguments,
     resolve_account,
 )
+from colab_provider import ASSIGNMENT
 
 DEFAULT_STORAGE = "/content/drive/MyDrive/colab-comfyui-launcher-test"
 DEFAULT_IDENTITY = Path.home() / ".ssh/colab_comfyui_launcher"
@@ -136,6 +138,7 @@ class Config:
     account: str = "default"
     fallback_accounts: tuple[str, ...] = ()
     profile_name: str = ""
+    release_fingerprint: str = ""
 
 
 def config_account(operation):
@@ -386,6 +389,8 @@ class Backend:
                     "H3 rendering requires a GPU. Use PNG smoke for CPU testing."
                 )
             argv.extend(["--max-seconds", "900"])
+        elif action == "release" and config.release_fingerprint:
+            argv.extend(["--if-assignment-sha256", config.release_fingerprint])
         elif action == "hold":
             argv.extend(["--seconds", str(config.hold_seconds)])
         return self.json_command(argv)
@@ -445,13 +450,21 @@ class Backend:
         return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", completed.stdout)
 
     @staticmethod
-    def session_rows(output: str) -> list[dict[str, str]]:
+    def session_rows(
+        output: str, *, release_targets: bool = False
+    ) -> list[dict[str, str]]:
         rows = []
         for line in output.splitlines():
             match = re.match(r"^\[([^\]\s]+)\].+\|\s*Hardware:\s*([^|]+)", line)
             if not match or match[1] == "?":
                 continue
             row = {"name": match[1], "hardware": match[2].strip()}
+            if release_targets:
+                identity = line.split("|", 1)[0].split()
+                if len(identity) == 2 and ASSIGNMENT.fullmatch(identity[1]):
+                    row["release_fingerprint"] = hashlib.sha256(
+                        identity[1].encode()
+                    ).hexdigest()
             for part in line.split("|")[2:]:
                 key, separator, value = part.strip().partition(":")
                 if separator and key in ("Shape", "Variant", "Status"):
@@ -461,7 +474,7 @@ class Backend:
 
     def sessions(self) -> list[dict[str, str]]:
         output = self.official(["sessions"])
-        rows = self.session_rows(output)
+        rows = self.session_rows(output, release_targets=True)
         if not rows and "No active sessions" not in output:
             raise DashboardError(
                 "Provider session list could not be verified; no action was retried."
@@ -1635,6 +1648,24 @@ class Worker:
                     )
                     self.events.put(("session", (config, provider)))
                     self._status(config)
+                elif action == "release_listed":
+                    if not config.release_fingerprint:
+                        raise DashboardError(
+                            "Refresh the runtime list before releasing this VM."
+                        )
+                    # Terminating the VM stops its services even if its kernel is unreachable.
+                    self.backend.release(config)
+                    warning = ""
+                    try:
+                        forward = self.backend.ssh(config, "discover")
+                        if forward.get("found"):
+                            self.backend.ssh(
+                                replace(config, local_port=forward["local_port"]),
+                                "stop",
+                            )
+                    except DashboardError as exc:
+                        warning = safe_error(exc)
+                    self.events.put(("released", (config, warning)))
                 elif action == "release":
                     cleanup_error = ""
                     try:
