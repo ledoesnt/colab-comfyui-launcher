@@ -79,11 +79,11 @@ colab --auth=oauth2 sessions
 6. 自动部署、安装、准备 GPU 模型并启动 ComfyUI。右侧显示每个文件的下载、复制或校验进度，保留实心块 + 浅纹理进度条：进行中橙色，明确验证或 receipt 复用后变绿；100% 但未完成验证仍显示等待校验；CPU 跳过 H3。下载和复制同步计算 SHA256，已有同 VM 验证记录复用会明确标注没有新计算 SHA。
 7. 自动建立 SSH 转发并验证本机 HTTP；出现 **ComfyUI is ready** 后选择 **Open ComfyUI in browser**。
 
-**View existing runtimes** 会先核对真实状态、恢复已有配置，再显示概览或继续缺少的步骤。查询期间显示不可执行的 **Loading...** 和可用的 **Back**；Back 返回，保留已有实例与任务。不会因为 CLI 超时自动重复新建。配置未知时重新选择存储；已有运行服务的存储和访问模式不能直接覆盖。更改已运行 SSH 的端口或 key 前，先到 Advanced actions 停止旧转发。
+**View existing runtimes** 中选择实例名会检查状态、恢复配置。选择实例名下方的 **End <实例名>** 可直接释放该台 VM，即使 ComfyUI 还没启动。确认页默认选中取消，Colab 核实释放后列表才移除该实例。查询期间显示不可执行的 **Loading...** 和可用的 **Back**；Back 返回，保留已有实例与任务。不会因为 CLI 超时自动重复新建。配置未知时重新选择存储；已有运行服务的存储和访问模式不能直接覆盖。更改已运行 SSH 的端口或 key 前，先到 Advanced actions 停止旧转发。
 
 同一实例的唯一有效 owned SSH 转发会恢复实际端口和 key 路径，再检查本机 HTTP；不会静默回到 8188。多个转发或旧版本缺少配置的活跃记录需明确处理：用已知端口停止旧转发，再继续向导。只读状态查询遇到连接关闭或本机命令超时最多尝试三次；创建、安装、准备等写操作不因此重复提交。
 
-Ready 页面可以打开浏览器、**Exit and keep resources**、**End this VM** 或查看其他实例。Exit 保留 VM、已运行服务、转发和远端任务；End this VM 有独立确认，默认选中 **Cancel and keep it running**，且只清理选中的实例。启动期间请求释放会取消后续协调并串行清理原实例。挂载、启动失败或状态未知时停在错误页，先 Inspect 再处理，不自动重试未知结果。
+Ready 页面可以打开浏览器、**Exit and keep resources**、**End this VM** 或查看其他实例。Exit 保留 VM、已运行服务、转发和远端任务；End this VM 有独立确认，默认选中 **Cancel and keep it running**，且只清理选中的实例。启动期间请求释放会取消后续协调并串行清理原实例。创建遇到 503 或其他操作失败时，选择 **Back to home** 或按 **Esc** 即可回首页；返回不会重试。创建结果未知时，先查看实例列表核实。
 
 离线预览不创建 Colab、不访问凭据、不打开浏览器：
 

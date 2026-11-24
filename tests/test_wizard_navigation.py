@@ -157,6 +157,66 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(self.ui.page, "ready")
         self.assertEqual([action for action, _ in self.worker.submitted], ["sessions"])
 
+    def test_allocation_error_returns_home_without_repeating_create(self):
+        for key in ("\n", "\x1b"):
+            with self.subTest(key=repr(key)):
+                self.ui._page("pipeline")
+                self.ui.config.session = "requested-g4"
+                self.ui.last_operation = "wizard_create"
+                self.emit("error", "Colab allocation failed (HTTP 503)")
+                self.finish("wizard_create")
+                self.assertEqual(self.ui.page, "failure")
+                self.assertIn("503", self.ui.error)
+                self.assertEqual(
+                    self.ui._choices()[self.ui.selected].label, "Back to home"
+                )
+                self.ui._key(key)
+                self.assertEqual(self.ui.page, "home")
+                self.assertFalse(self.ui.quitting)
+                self.assertEqual(self.ui.error, "")
+                self.assertEqual(self.worker.submitted, [])
+
+    def test_list_release_without_inspection_preserves_other_runtime(self):
+        self.ui.config.session = "keep"
+        self.ui.config.account = "fixture-account"
+        self.ui._page("ready")
+        self.choose("existing")
+        self.emit(
+            "sessions",
+            [
+                {"name": "keep", "hardware": "G4", "release_fingerprint": "a" * 64},
+                {"name": "target", "hardware": "L4", "release_fingerprint": "b" * 64},
+            ],
+        )
+        self.finish("sessions")
+        for cancel in ("\n", "\x1b"):
+            self.choose("end:target")
+            self.assertEqual(self.ui._choices()[self.ui.selected].key, "cancel_release")
+            self.assertIn("Runtime: target", self.ui.snapshot())
+            self.assertNotIn("Runtime: keep", self.ui.snapshot())
+            self.ui._key(cancel)
+            self.assertEqual(self.ui.page, "sessions")
+            self.assertEqual(self.ui.config.session, "keep")
+        self.choose("end:target")
+        self.choose("confirm_release")
+        self.ui._key("\n")
+        self.assertEqual(
+            [action for action, _ in self.worker.submitted],
+            ["sessions", "release_listed"],
+        )
+        target = self.worker.submitted[-1][1]
+        self.assertEqual(
+            (target.session, target.account, target.release_fingerprint),
+            ("target", "fixture-account", "b" * 64),
+        )
+        self.emit("released", (target, ""))
+        self.finish("release_listed")
+        self.assertEqual(self.ui.page, "sessions")
+        self.assertEqual([r["name"] for r in self.ui.sessions], ["keep"])
+        self.choose("back")
+        self.assertEqual(self.ui.page, "ready")
+        self.assertEqual(self.ui.config.session, "keep")
+
     def test_completed_session_list_back_returns_to_its_real_origin(self):
         self.ui._page("ready")
         self.choose("existing")

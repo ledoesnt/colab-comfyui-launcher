@@ -1,5 +1,6 @@
 """Dashboard semantics using mocks only; never connect to a provider."""
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -275,6 +276,9 @@ class BackendTests(unittest.TestCase):
             [
                 {
                     "name": "cpu-one",
+                    "release_fingerprint": hashlib.sha256(
+                        b"hidden-endpoint"
+                    ).hexdigest(),
                     "hardware": "CPU",
                     "shape": "Standard",
                     "variant": "DEFAULT",
@@ -753,6 +757,33 @@ class WorkerTests(unittest.TestCase):
         )
         self.backend.create.assert_called_once()
         self.backend.interactive.assert_not_called()
+
+    def test_list_release_does_not_need_a_working_kernel_and_discovers_the_forward(
+        self,
+    ):
+        self.config.release_fingerprint = "a" * 64
+        self.backend.ssh.side_effect = [
+            {"found": True, "local_port": 8277},
+            {"stopped": True},
+        ]
+        self.worker.submit("release_listed", self.config)
+        self.finish()
+        self.backend.release.assert_called_once_with(self.config)
+        self.backend.bridge.assert_not_called()
+        self.assertEqual(
+            [
+                (c.args[1], c.args[0].local_port)
+                for c in self.backend.ssh.call_args_list
+            ],
+            [("discover", 8188), ("stop", 8277)],
+        )
+        self.assertTrue(any(k == "released" for k, v in self.events()))
+
+    def test_list_release_requires_the_selected_identity(self):
+        self.worker.submit("release_listed", self.config)
+        self.finish()
+        self.backend.release.assert_not_called()
+        self.assertTrue(any(k == "error" and "Refresh" in v for k, v in self.events()))
 
     def test_failed_release_retains_session_and_is_not_retried(self):
         self.backend.release.side_effect = dashboard.DashboardError("release unknown")

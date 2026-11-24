@@ -129,6 +129,15 @@ class BudgetTests(unittest.TestCase):
         self.assertIsNone(result["estimate"]["actual_instance_cu"])
         self.assertEqual(result["observed_account"]["scope"], "account")
 
+    def test_list_release_rejects_a_different_budget_allocation(self):
+        self.create()
+        with self.assertRaisesRegex(budget.BudgetError, "does not match"):
+            self.manager.release(
+                "session-test", expected_assignment="previous-allocation"
+            )
+        self.assertEqual(self.provider.released, [])
+        self.assertFalse(self.manager.status("session-test")["release_requested"])
+
     def test_guard_must_be_ready_before_new(self):
         self.manager.ensure_guard.side_effect = budget.BudgetError(
             "fixture startup failure"

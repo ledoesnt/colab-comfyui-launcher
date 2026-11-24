@@ -93,6 +93,7 @@ class Wizard:
         self.ssh: dict[str, Any] = {}
         self.provider: dict[str, Any] = {}
         self.sessions: list[dict[str, str]] = []
+        self.listed_release: Config | None = None
         self.stage = "Choose how to start"
         self.notice = "Choose a new runtime, or inspect an existing one."
         self.error = ""
@@ -647,14 +648,24 @@ class Wizard:
                 Choice("back", "Back"),
             ]
         if self.page == "sessions":
-            choices = [
-                Choice(
-                    "session:" + row["name"],
-                    row["name"],
-                    f"{row['hardware']} · {row.get('status', 'provider status')} · Enter inspects this runtime; it does not stop the current runtime.",
+            choices = []
+            for row in self.sessions:
+                name = row["name"]
+                choices.append(
+                    Choice(
+                        "session:" + name,
+                        name,
+                        f"{row['hardware']} · Enter inspects this runtime.",
+                    )
                 )
-                for row in self.sessions
-            ]
+                if row.get("release_fingerprint") and not self.demo:
+                    choices.append(
+                        Choice(
+                            "end:" + name,
+                            "End " + name,
+                            f"Review and confirm release of this {row['hardware']} runtime.",
+                        )
+                    )
             choices.extend(
                 [
                     Choice("refresh_list", "Refresh runtime list"),
@@ -700,11 +711,13 @@ class Wizard:
                     ),
                 )
             return choices
+        if self.page == "releasing_listed":
+            return [Choice("loading", "Releasing…", enabled=False)]
         if self.page == "release_confirm":
             return [
                 Choice(
                     "confirm_release",
-                    "Confirm: end the selected VM",
+                    "Confirm: end " + (self.listed_release or self.config).session,
                     "Stop its owned SSH and services, release this VM, and verify the result. Drive cache and the SSH key remain.",
                 ),
                 Choice("cancel_release", "Cancel and keep it running"),
@@ -782,7 +795,13 @@ class Wizard:
                 Choice("back", "Back"),
             ]
         if self.page == "failure":
-            choices = []
+            choices = [
+                Choice(
+                    "back",
+                    "Back to home",
+                    "Return to the start page without retrying the operation.",
+                )
+            ]
             if self.config.session:
                 choices.append(
                     Choice(
@@ -1123,6 +1142,17 @@ class Wizard:
             self.notice = "Review the selected settings before confirming startup."
             self._page("summary")
             self.notice = "Storage selected. Review the configuration, then continue the missing steps."
+        elif self.page == "sessions" and key.startswith("end:"):
+            row = next(row for row in self.sessions if row["name"] == key[4:])
+            self.listed_release = Config(
+                account=self.config.account,
+                session=row["name"],
+                cpu=row["hardware"] == "CPU",
+                gpu=row["hardware"],
+                release_fingerprint=row["release_fingerprint"],
+            )
+            self.input_return = "sessions"
+            self._page("release_confirm", 1)
         elif self.page == "sessions" and key.startswith("session:"):
             name = key.removeprefix("session:")
             row = next(row for row in self.sessions if row["name"] == name)
@@ -1281,12 +1311,21 @@ class Wizard:
                 self.notice = self.account["message"]
                 self._page("account")
         elif key == "release":
+            self.listed_release = None
             self.input_return = self.page
             self._page("release_confirm", 1)
         elif key == "cancel_release":
-            self._page(self.input_return)
+            self._back()
         elif key == "confirm_release":
-            if self._submit("release"):
+            if self.listed_release is not None:
+                if self._submit("release_listed", self.listed_release):
+                    self.runtime_events_allowed = True
+                    self._page("releasing_listed")
+                    self.notice = (
+                        "Waiting for Colab to verify release of "
+                        + self.listed_release.session
+                    )
+            elif self._submit("release"):
                 self._page("pipeline")
                 self.notice = (
                     "Releasing only the selected runtime and its owned resources."
@@ -1395,6 +1434,12 @@ class Wizard:
                 else "home"
             )
             return
+        if self.page == "releasing_listed":
+            return
+        if self.page == "failure":
+            self.error = ""
+            self._page("home")
+            return
         if self.page == "listing":
             self.listing_dismissed = True
             self._page(self.listing_return_page)
@@ -1454,6 +1499,8 @@ class Wizard:
             if self.page == "input" and self.input_field == "model_url":
                 self.config.model_url = ""
                 self.config.model_path = ""
+            if self.page == "release_confirm":
+                self.listed_release = None
             self._page(target)
         elif self.demo and self.page in ("pipeline", "ready", "failure"):
             self._page("home")
@@ -1481,6 +1528,7 @@ class Wizard:
         )
         self.status, self.ssh, self.provider = {}, {}, {}
         self.sessions = []
+        self.listed_release = None
         self.confirmed_steps.clear()
         self.required_model_categories = None
         self.model_paths_need_restart = False
@@ -1711,6 +1759,12 @@ class Wizard:
                         else "pipeline"
                     )
             elif kind == "error":
+                if self.page == "releasing_listed":
+                    self.listed_release = None
+                    self.error = safe_error(value)
+                    self.notice = "Refresh the runtime list to check the selected VM."
+                    self._page("sessions")
+                    continue
                 if self.last_operation == "model_add" and self.model_adding_dismissed:
                     if self.page == "models":
                         self.error = safe_error(value)
@@ -1744,6 +1798,14 @@ class Wizard:
                 self.notice = "Local SSH status: " + safe_error(value)
             elif kind == "released":
                 released, warning = value
+                if released.account != self.config.account:
+                    continue
+                from_list = self.page == "releasing_listed"
+                if from_list:
+                    self.listed_release = None
+                    self.sessions = [
+                        row for row in self.sessions if row["name"] != released.session
+                    ]
                 if released.session == self.config.session:
                     self.cleanup_warning = (
                         "Released " + released.session + ": " + safe_error(warning)
@@ -1768,6 +1830,13 @@ class Wizard:
                     self.observe_runtime = False
                     self._page("home")
                     self.notice = "Selected VM released and verified." + (
+                        " Cleanup warning: " + safe_error(warning) if warning else ""
+                    )
+                if from_list:
+                    if not self.config.session:
+                        self.sessions_return_page = "home"
+                    self._page("sessions")
+                    self.notice = f"Release verified for {released.session}." + (
                         " Cleanup warning: " + safe_error(warning) if warning else ""
                     )
             elif kind == "done":
@@ -1890,6 +1959,7 @@ class Wizard:
             "ssh_start": "Connecting local SSH",
             "ssh_stop": "Stopping local SSH forwarding",
             "release": "Releasing selected VM",
+            "release_listed": "Releasing selected VM",
             "hold": "Setting the instance's hold deadline",
             "mount": "Checking Google Drive authorization",
             "prepare_refresh": "Preparing updated model lists",
@@ -1923,6 +1993,7 @@ class Wizard:
             "ready": "ComfyUI is ready",
             "failure": "An operation needs attention",
             "release_confirm": "Confirm VM release",
+            "releasing_listed": "Verifying VM release",
             "budget": "This allocation's CU budget",
             "advanced": "Advanced runtime actions",
             "models": "Saved model download list",
@@ -2260,7 +2331,20 @@ class Wizard:
                     ("", "normal"),
                 )
             )
-        if self.page in (
+        if self.listed_release is not None and self.page in (
+            "release_confirm",
+            "releasing_listed",
+        ):
+            target = self.listed_release
+            rows.extend(
+                [
+                    ("Runtime: " + target.session, "field"),
+                    ("Account: " + target.account, "field"),
+                    ("Compute: " + target.gpu, "field"),
+                    ("Releasing this VM discards its temporary disk.", "warn"),
+                ]
+            )
+        elif self.page in (
             "summary",
             "settings",
             "budget",

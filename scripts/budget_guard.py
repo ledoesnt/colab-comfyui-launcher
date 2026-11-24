@@ -1223,11 +1223,20 @@ class BudgetManager:
         self._mutate(session, original["job_id"], update)
         return self.status(session)
 
-    def release(self, session: str) -> dict[str, Any]:
+    def release(
+        self, session: str, *, expected_assignment: str | None = None
+    ) -> dict[str, Any]:
         record = self._read(self._path(session))
         if not record:
             raise BudgetError(
                 "This allocation is not managed; explicitly adopt it or release its exact provider identity."
+            )
+        if (
+            expected_assignment is not None
+            and record.get("assignment_id") != expected_assignment
+        ):
+            raise BudgetError(
+                "The budget does not match the selected allocation. Refresh its status before release."
             )
         if record["status"] in TERMINAL:
             return self._public(record)
